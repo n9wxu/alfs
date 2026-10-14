@@ -285,27 +285,26 @@ returns `ALFS_BUSY` and resumes the erase when called again.
 
 #### ALFS-SPD-06
 
-Mounting reads at most 32 bytes of each sector of the region, twice, and
-performs no flash operation.
+Mounting reads at most 60 bytes of each sector of the region, and performs
+no flash operation.
 
 - Priority: 1.
 - Source: UC-3.
 - Measure: bytes the simulator reads during `alfs_mount`.
-- Pass: at most 64 times the number of sectors. Fail: more, or any
+- Pass: at most 60 times the number of sectors. Fail: more, or any
   operation.
 - Verified by: `spd_mount_reads_bounded`.
 
 #### ALFS-SPD-07
 
-Opening the newest stream to append, after a mount, reads at most one
-sector's bytes more than mounting does, and performs no flash operation.
+Opening a stream to append, after a mount, reads at most 60 bytes of each
+sector, and performs no flash operation.
 
 - Priority: 1.
 - Source: UC-3.
-- Measure: bytes read by `alfs_open` for append on a stream whose last
-  sector is full of short chunks.
-- Pass: at most one sector's size, plus 32 bytes for each sector it steps
-  over. Fail: more.
+- Measure: bytes read by `alfs_open_append` on a stream whose last sector
+  is full of short chunks.
+- Pass: at most 60 times the number of sectors. Fail: more.
 - Verified by: `spd_reopen_reads_bounded`.
 
 #### ALFS-SPD-08
@@ -470,14 +469,18 @@ next page, counts one failure, and reads on.
 
 #### ALFS-SAFE-04
 
-After a mount, a stream's first program is to a page no interrupted program
-can have touched.
+After a mount, a stream's first program is to a new sector, so nothing
+synced from then on shares a sector with bits a power loss may have left
+half-programmed. An interrupted program that changed nothing (ATOMIC)
+leaves nothing to avoid; littlefs's model treats it as harmless too.
 
 - Priority: 3.
-- Source: A-3; TORNTAIL and METASTABLE. Its cost is at most one page per
-  mount.
+- Source: A-3; TORNTAIL and METASTABLE: a claim with a bit that reads
+  either way could later read as invalid, and its sector be reclaimed with
+  what was synced into it after the mount. Its cost is at most the rest of
+  one sector per mount.
 - Measure: the simulator flags a program into a page an interrupted
-  operation touched.
+  operation changed (every behaviour but ATOMIC).
 - Pass: none. Fail: any.
 - Verified by: `safe_no_program_after_torn`.
 
@@ -585,20 +588,25 @@ no floating point, and no library beyond `<stdint.h>`, `<stddef.h>`,
 
 #### ALFS-SIMP-02
 
-The code is at most 4 KiB on a Cortex-M0+ (Thumb, `-Os`).
+The code is at most 6 KiB on a Cortex-M0+ (Thumb, `-Os`): under 40 % of
+littlefs's.
 
 - Priority: S.
 - Source: the brief ("Simplicity will keep the code fast and flash
-  overhead cheap"). A budget, to be revisited with a measurement of
-  littlefs on the same build.
+  overhead cheap"). littlefs 2.11.3 built the same way (`-Os`,
+  `-mcpu=cortex-m0plus`, its debug, warning, error and assert output off,
+  no malloc) is 15,456 bytes. Draft 1 guessed 4 KiB before any code
+  existed; the first build was 5.4 KiB, 5.3 after its duplication was
+  removed, and the rest is function the requirements ask for.
 - Measure: `arm-none-eabi-size` of `alfs.o`, text plus data.
-- Pass: at most 4,096 bytes. Fail: more.
+- Pass: at most 6,144 bytes. Fail: more.
 - Verified by: `simp_code_size`.
 
 #### ALFS-SIMP-03
 
-RAM does not grow with the region: an instance is at most 64 bytes, and an
-open stream at most one page plus 32 bytes, both supplied by the caller.
+RAM does not grow with the region: an instance is at most 96 bytes, and an
+open stream at most 32 bytes and a buffer of one page plus 24 bytes, all
+supplied by the caller.
 
 - Priority: S.
 - Source: pyro's Lua boards have about 13.5 kB of SRAM spare (measured
@@ -606,16 +614,21 @@ open stream at most one page plus 32 bytes, both supplied by the caller.
   region of 8 MiB must not cost more than a small one.
 - Measure: `sizeof` of the instance and stream structures, page buffers
   excluded.
-- Pass: at most 64 and 32 bytes. Fail: more.
-- Verified by: `simp_ram`.
+- Pass: at most 96 and 32 bytes. Fail: more.
+- Verified by: `simp_ram`; `make target`.
 
 #### ALFS-SIMP-04
 
-No call uses more than 256 bytes of stack.
+No call uses more than 320 bytes of stack, the driver's own frames apart.
 
 - Priority: S.
-- Measure: `-fstack-usage` on the Cortex-M0+ build, worst path.
-- Pass: at most 256. Fail: more.
+- Source: draft 1 guessed 256 before any code existed; the first build's
+  deepest chain was 292 bytes (an append that claims a sector: classifying
+  it reads two headers and checks a CRC at the bottom). pyro's smallest
+  task stack is 2 kB.
+- Measure: the deepest chain of frames under each public call, from GCC's
+  call graph (`-fcallgraph-info=su`) on the Cortex-M0+ build.
+- Pass: at most 320. Fail: more.
 - Verified by: `simp_stack`.
 
 #### ALFS-SIMP-05

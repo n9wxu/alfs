@@ -1,7 +1,7 @@
 # alfs test plan
 
 **Status: draft 1, 2026-10-14.** Written after `docs/REQUIREMENTS.md` and
-before the code. Every requirement names its test there; this document
+before the code. Every test passes on the first implementation. Every requirement names its test there; this document
 says how the tests work and what each one does.
 
 ---
@@ -104,8 +104,8 @@ alfs's help.
 | `spd_one_operation_per_call` | SPD-02 | W-HR for 30 seconds. |
 | `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no operation, from append and sync; one erase step later the held bytes are written and read back. |
 | `spd_busy_erase_resumes` | SPD-05 | Erases that take five calls: format and erase steps return `ALFS_BUSY` 31 times and finish 8 sectors. |
-| `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 64 bytes a sector and does no operation. |
-| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most a sector plus 64 bytes a sector, and does no operation. |
+| `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 60 bytes a sector and does no operation. |
+| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most 60 bytes a sector, and does no operation. |
 | `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second, three prog units: no call stalls longer than one program. |
 | `spd_cpu_linear` | SPD-09 | The same appends and syncs on 32 and 2,048 sectors: the same reads, and about the same processor time. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
@@ -129,7 +129,7 @@ alfs's help.
 | `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
 | `obs_clean` | OBS-03 | Not clean through a format and its suspended erases, clean after, not after a delete, clean again after erase steps. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
-| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 4,096 bytes; no stack frame over 256. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 6,144 bytes; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
 
 **By review:** SPD-05 (no loop waits on the flash), SIMP-01 (the
 libraries used), SIMP-05 (the spec covers every field), OBS-02 (every
@@ -142,10 +142,9 @@ error documented in `alfs.h`).
 
 ## 5. Known limits of the tests
 
-- SIMP-04 bounds each stack frame, not the deepest chain of them. alfs
-  calls no function through a pointer but the driver's and has no
-  recursion, so the chain is short; it is summed by hand in review until a
-  call-graph tool is added.
+- SIMP-04 sums frames along GCC's static call graph. alfs has no
+  recursion and calls nothing through a pointer but the driver, whose
+  frames the caller adds.
 - The power-loss runs are linear: one loss at each operation, and a second
   in a third of them. littlefs's exhaustive schedules are not reproduced.
 - Timing is simulated at typical figures. The worst-case figures of

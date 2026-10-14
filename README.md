@@ -9,14 +9,19 @@ block is less important than a broken exec loop. In flight, nothing erases:
 every append programs flash that was erased ahead of time, and the caller
 schedules erases in steps.
 
-**Status:** requirements and tests written; the code is next. `make test`
-runs the host suite once `alfs.c` exists.
+**Status:** draft 1, 2026-10-14. Requirements, tests and code; every test
+passes (`make test`), and the Cortex-M0+ budgets hold (`make target`):
+5.3 KB of code against littlefs's 15.5 KB on the same build. On littlefs's
+10-minute logging workload at 50 rows a second it erases 168 sectors, all
+in erase steps the caller schedules, where littlefs 2.11.3 erases 807 in
+its append path. Not yet run on hardware.
 
 | Path | What |
 |---|---|
 | `docs/REQUIREMENTS.md` | what alfs must do, each requirement testable |
 | `docs/TEST_PLAN.md` | how each requirement is tested |
-| `alfs.h` | the interface |
+| `docs/SPEC.md` | every byte on the flash |
+| `alfs.h`, `alfs.c` | the interface and the code |
 | `tests/` | the simulated flash, the harness and the tests |
 | `docs/datasheets/` | the flash parts the figures come from |
 

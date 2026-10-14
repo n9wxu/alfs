@@ -28,8 +28,8 @@
  */
 enum {
     ALFS_OK = 0,
-    /* alfs_erase_step, alfs_format: the erase goes on. Nothing else
-     * changed; call alfs_erase_step again. */
+    /* alfs_erase_step, alfs_format: the erase goes on; call
+     * alfs_erase_step again. alfs_sync: bytes remain; call it again. */
     ALFS_BUSY = 1,
     /* alfs_erase_step: no dirty sector is left. */
     ALFS_CLEAN = 2,
@@ -94,31 +94,38 @@ typedef struct alfs_counters {
     uint32_t bytes_lost;     /* dropped after max_prog_retries failures    */
 } alfs_counters_t;
 
+#define ALFS_BAD_MAX 8
+
 /* An instance. Opaque: its fields are alfs's. */
 typedef struct alfs {
     const alfs_config_t *cfg;
     const alfs_driver_t *drv;
     uint32_t gen;      /* the region's format generation */
-    uint32_t next_seq; /* the next sector claim's sequence */
+    uint32_t next_seq; /* the next claim's sequence */
     uint32_t min_wear, max_wear;
+    uint32_t ewear;    /* the erase count the erase under way will stamp */
     alfs_counters_t n;
-    uint16_t sectors, ready, dirty, bad;
+    uint16_t sectors, ready, dirty, nbad;
     uint16_t alloc_cursor, erase_cursor;
-    uint16_t erasing; /* the sector or block an erase step is in, + 1 */
-    uint8_t estate;   /* the erase step's state */
-    uint8_t mounted;
+    uint16_t esector;  /* the sector, or a large block's first, being erased */
+    uint8_t estate;    /* the erase step's state */
+    uint8_t estamped;  /* a large block: sectors stamped so far */
+    uint16_t bad[ALFS_BAD_MAX]; /* sectors found bad this mount */
 } alfs_t;
 
-/* An open stream. The caller supplies it, and for appending a buffer of
- * page_size bytes. Opaque. */
+/* A stream's buffer: one page and the room for a claim and a header. */
+#define ALFS_BUF_SIZE(page_size) ((page_size) + 24u)
+
+/* An open stream. The caller supplies it and its buffer. Opaque. */
 typedef struct alfs_stream {
+    uint8_t *buf; /* append: the chunk being built; read: the chunk read */
     uint32_t id;  /* the stream's identity, unique in the region */
     uint32_t tag; /* the caller's */
     uint32_t seq; /* the current sector's claim sequence */
-    uint8_t *buf; /* append: the chunk being built */
     uint16_t sector;
-    uint16_t off;  /* append: where the next chunk goes; read: next byte */
-    uint16_t used; /* append: bytes buffered; read: bytes left in chunk */
+    uint16_t off;   /* where the next chunk is, in the sector */
+    uint16_t used;  /* append: bytes buffered; read: bytes left in buf */
+    uint16_t first; /* append: the first sector; read: the chunk's length */
     uint8_t mode;
     uint8_t page_progs;
     uint8_t fails;
@@ -148,7 +155,7 @@ typedef struct alfs_status {
 int alfs_format(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv);
 
 /*
- * Mounts a region alfs formatted. Reads at most 64 bytes of each sector
+ * Mounts a region alfs formatted. Reads at most 60 bytes of each sector
  * and writes nothing. ALFS_ENOFS: rebuild or fail. ALFS_EGEOMETRY: fail.
  * ALFS_EIO: retry.
  */
@@ -165,7 +172,8 @@ int alfs_erase_step(alfs_t *fs);
 
 /*
  * Starts a new stream with the caller's tag. Writes nothing until its
- * first chunk. buf: page_size bytes, the stream's until it is closed.
+ * first chunk. buf: ALFS_BUF_SIZE(page_size) bytes, the stream's until it
+ * is closed.
  */
 int alfs_create(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t tag);
 
@@ -175,8 +183,12 @@ int alfs_create(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t tag);
  */
 int alfs_open_append(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id);
 
-/* Opens a stream to read it from the start. ALFS_ENOENT, ALFS_EIO. */
-int alfs_open_read(alfs_t *fs, alfs_stream_t *s, uint32_t id);
+/*
+ * Opens a stream to read it from the start. buf: ALFS_BUF_SIZE(page_size)
+ * bytes; each chunk is read into it and checked whole before any of it is
+ * returned. ALFS_ENOENT, ALFS_EIO.
+ */
+int alfs_open_read(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id);
 
 /*
  * Appends up to len bytes and returns how many it took, >= 0. When the
@@ -187,11 +199,13 @@ int32_t alfs_append(alfs_t *fs, alfs_stream_t *s, const void *data, uint32_t len
 
 /*
  * Makes every byte appended so far durable: programs the chunk being built.
- * One program at most. ALFS_OK, or as alfs_append.
+ * One program at most. ALFS_OK; ALFS_BUSY when bytes remain, which happens
+ * only after a failed program moved the stream to a new sector with less
+ * room in its first page: call again. Errors as alfs_append.
  */
 int alfs_sync(alfs_t *fs, alfs_stream_t *s);
 
-/* Syncs and releases the stream. On an error it stays open. */
+/* Syncs and releases the stream. On ALFS_BUSY or an error it stays open. */
 int alfs_close(alfs_t *fs, alfs_stream_t *s);
 
 /*

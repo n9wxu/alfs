@@ -49,7 +49,7 @@ typedef struct sim {
     uint8_t *mem;
     uint8_t *unit_done;  /* per prog unit: programmed since its erase   */
     uint8_t *page_progs; /* per page: programs since its erase          */
-    uint8_t *torn;       /* per page: an interrupted operation touched it */
+    uint8_t *torn;       /* per page: an interrupted operation changed it */
     uint32_t *wear;      /* per sector: completed erases                */
     uint32_t *sector_progs;       /* per sector: programs since its erase  */
     uint64_t *sector_progs_total; /* per sector: programs ever             */

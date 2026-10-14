@@ -27,10 +27,10 @@ tests-compile: | build
 	$(CC) $(CFLAGS) -c tests/tf.c -o build/tf.o
 
 target: | build
-	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -fstack-usage -I. -c alfs.c -o build/alfs_m0.o
+	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su -I. -c alfs.c -o build/alfs_m0.o
 	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -I. -c tests/target_sizes.c -o build/target_sizes.o
 	$(ARMSIZE) build/alfs_m0.o
-	sh tests/check_target.sh build/alfs_m0.o build/alfs_m0.su
+	sh tests/check_target.sh build/alfs_m0.o build/alfs_m0.ci
 
 clean:
 	rm -rf build

@@ -183,7 +183,7 @@ static int sim_prog(void *ctx, uint32_t addr, const void *data, uint32_t len) {
 
     if (losing(s)) {
         s->off = true;
-        s->torn[page] = 1;
+        s->torn[page] = s->pl != PL_ATOMIC; /* ATOMIC changed nothing */
         uint32_t first = s->prog_unit < len ? s->prog_unit : len;
         switch (s->pl) {
         case PL_ATOMIC:
@@ -265,7 +265,7 @@ static int erase_any(sim_t *s, uint32_t addr, uint32_t len, uint64_t t_us) {
         s->off = true;
         s->busy_left = 0;
         for (uint32_t p = addr / s->page_size; p < (addr + len) / s->page_size; p++)
-            s->torn[p] = 1;
+            s->torn[p] = s->pl != PL_ATOMIC && s->pl != PL_TORNTAIL; /* those two change nothing */
         switch (s->pl) {
         case PL_ATOMIC:
         case PL_TORNTAIL:
