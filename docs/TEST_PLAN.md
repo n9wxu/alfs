@@ -1,0 +1,153 @@
+# alfs test plan
+
+**Status: draft 1, 2026-10-14.** Written after `docs/REQUIREMENTS.md` and
+before the code. Every requirement names its test there; this document
+says how the tests work and what each one does.
+
+---
+
+## 1. How to run
+
+| Command | What |
+|---|---|
+| `make test` | the host suite, under the address and undefined-behaviour sanitizers |
+| `make test T=safe_` | the tests whose names contain `safe_` |
+| `make target` | the Cortex-M0+ budgets: code size (SIMP-02), structure sizes (SIMP-03), stack frames (SIMP-04) |
+| `make tests-compile` | the tests compiled alone, before the code exists |
+
+A run passes when every test passes, no sanitizer reports, and the
+target checks pass.
+
+---
+
+## 2. The simulated flash (`tests/sim.c`)
+
+A serial NOR chip held in RAM, with the geometry of the W25Q128JV by
+default: 4,096-byte sectors, 256-byte pages, an optional 64 KB large erase,
+erase value 0xFF. Its contents start random, as a used chip's are.
+
+**It enforces the rules alfs lives by.** Each break is counted as a
+violation, and every test fails on any:
+
+- a program that crosses a page (SPD-03);
+- a prog unit programmed twice between erases (IF-02, the rulings);
+- a program into a page that an interrupted operation touched (SAFE-04);
+- a second erase started while one is suspended (SPD-05).
+
+**It injects the faults of requirements section 4.4:**
+
+- **Power loss.** `sim_power_after(n, behaviour)` interrupts the (n+1)th
+  operation from now with one of ATOMIC, SOMEBITS, MOSTBITS, METASTABLE and
+  TORNTAIL, as the littlefs fork's emulated device defines them, and then
+  turns the chip off: every later operation fails until `sim_reboot`.
+  Metastable bits read randomly until their sector is erased.
+- **Bad sectors.** `sim_mkbad(sector, mode)`: PROGERROR, ERASEERROR,
+  READERROR, PROGNOOP, ERASENOOP, PROGFLIP, READFLIP.
+- **Wear-out.** `wear_limit`: a sector erased that often fails its next
+  erase.
+- **A read that fails once,** then succeeds (A-7): `read_fail_once`.
+- **A suspended erase.** `busy_calls`: each erase takes that many calls,
+  answering `ALFS_BUSY` until the last.
+- **Bit flips** at any address: `sim_flip`.
+
+**It measures.** Totals and per-call counts of operations, programs,
+erases and bytes read; the simulated time of each call at the typical
+times of requirements 4.3 (0.4 ms a program, 45 ms an erase, 150 ms a
+large erase); programs per page; erases per sector; programs per sector;
+and erases of a sector that held only its stamp (LIFE-01).
+
+---
+
+## 3. The rig (`tests/test_alfs.c`)
+
+Every alfs call goes through one of three wrappers, which hold it to the
+speed requirements as it runs:
+
+| Wrapper | For | Holds it to |
+|---|---|---|
+| `CALL` | every call but an erase step | at most one operation, and no erase (SPD-01, SPD-02); records the longest stall (SPD-08) |
+| `ESTEP`, `FORMAT` | `alfs_erase_step`, `alfs_format` | at most one erase and one program (SPD-02) |
+
+`DONE` ends every test: it fails the test on any flash violation or any
+call that broke its bound. So SPD-01 to SPD-03 and IF-02 are checked by
+every test, not only the ones named for them.
+
+The region starts one sector into the chip (one large block, where large
+erases are tested), so that no address is ever taken as an offset.
+
+**Rows.** A 22-byte row carries its sequence number and a CRC-32, like
+littlefs's W-LOG rows, so a test can tell good data from bad without
+alfs's help.
+
+**Workloads** (requirements 4.5):
+
+- `log_run`: W-LOG. Rows at 1 or 50 a second, appended every 200 ms,
+  synced every second, and an erase step every 20 ms when asked. It records
+  every byte alfs took and how many a successful sync covered.
+- W-HR: 480 bytes every 20 ms, synced every second.
+- `ring`: W-RING. W-LOG at 50 rows a second, a new stream every `every`
+  rows, the oldest deleted while fewer than two streams' worth of sectors
+  are ready, an erase step every 20 ms, until every sector has been erased
+  a number of times. Run on a 32-sector region so it cycles quickly.
+
+---
+
+## 4. The tests
+
+| Test | Requirement | What it does |
+|---|---|---|
+| `if_geometry` | IF-02 | Formats and mounts with prog units 1, 16 and 256; refuses eight bad geometries and a bad erase value with no operation; refuses to mount with a prog unit or region size other than the format's. |
+| `if_endian` | IF-03, SIMP-05 | Checks the stamp's bytes against `docs/SPEC.md`: the magic, the geometry, the generation and erase count as little-endian words, the CRC. |
+| `if_list_streams` | IF-04 | Five streams, one deleted: listed in growing identity, the deleted one missing, the same after a remount. |
+| `basic_round_trip` | (all) | Seven sizes, 1 byte to 20,000, three prog units: written, read, remounted, read. |
+| `spd_no_erase_outside_erase_step` | SPD-01 | W-LOG at both rates and three prog units, two minutes, with erase steps. |
+| `spd_one_operation_per_call` | SPD-02 | W-HR for 30 seconds. |
+| `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no operation, from append and sync; one erase step later the held bytes are written and read back. |
+| `spd_busy_erase_resumes` | SPD-05 | Erases that take five calls: format and erase steps return `ALFS_BUSY` 31 times and finish 8 sectors. |
+| `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 64 bytes a sector and does no operation. |
+| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most a sector plus 64 bytes a sector, and does no operation. |
+| `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second, three prog units: no call stalls longer than one program. |
+| `spd_cpu_linear` | SPD-09 | The same appends and syncs on 32 and 2,048 sectors: the same reads, and about the same processor time. |
+| `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
+| `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates and three prog units, against the bound computed from the simulator's own counts. |
+| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, deleted and cleaned: erases at most the sectors the log filled, plus one. Prints the count beside littlefs v2.11.3's 807. |
+| `life_wear_level` | LIFE-04 | W-RING until every sector is erased ten times: counts within 2. |
+| `life_erase_count_persists` | LIFE-05 | W-RING, a remount: the least and greatest counts alfs reports equal the simulator's. |
+| `life_partial_program_cap` | LIFE-06 | 1,000 three-byte syncs: at most 16 programs a page, and at most 4 when configured so. |
+| `life_large_erase` | LIFE-07 | Four 64 KB blocks, all dirty but the formatted sector: three large erases and 16 sector erases. |
+| `safe_powerloss_durable` | SAFE-01 | For each behaviour and prog units 1 and 16, power lost at every operation of a 20-second W-LOG with erase steps; remount; every synced byte reads back, nothing beyond what was appended; resume and read again. |
+| `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss during the resume in every third case. |
+| `safe_no_program_after_torn` | SAFE-04 | The same runs, for the simulator's check that nothing programs a page a power loss touched. |
+| `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a chunk: what reads back is the stream with at most one run cut out, and one failure counted when one was. |
+| `safe_append_only_verified_ready` | SAFE-05 | An ERASENOOP sector is found out by its erase step and never programmed. Power lost in erase steps is covered by the power-loss runs. |
+| `safe_prog_failure` | SAFE-06 | The sector being written goes PROGERROR, PROGNOOP or PROGFLIP: every row reads back once, none lost. With no sector that programs: two retries, then `ALFS_ELOST` and the bytes counted. |
+| `safe_bad_sector` | SAFE-07 | ERASEERROR and ERASENOOP sectors are counted bad, found bad again after a remount, never programmed. Wear-out under W-RING: logging goes on until the flash is worn. |
+| `safe_read_retry` | SAFE-08 | Reads that fail once, in mount, open and read: each retried call gets the right bytes. |
+| `safe_foreign_region` | SAFE-09 | Random and blank regions: `ALFS_ENOFS`. Another sector size, and a region past the chip: `ALFS_EGEOMETRY`. No operation in any. |
+| `safe_fuzz_mount_read` | SAFE-10 | 400 images with bits flipped, headers randomised, headers copied, or everything random but one stamp: mount, list and read every stream, under the sanitizers. |
+| `safe_delete_atomic` | SAFE-11 | Power lost in a delete, each behaviour: the stream whole or gone. A delete that returned survives a remount; its sectors are dirty. |
+| `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
+| `obs_clean` | OBS-03 | Not clean through a format and its suspended erases, clean after, not after a delete, clean again after erase steps. |
+| `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 4,096 bytes; no stack frame over 256. |
+
+**By review:** SPD-05 (no loop waits on the flash), SIMP-01 (the
+libraries used), SIMP-05 (the spec covers every field), OBS-02 (every
+error documented in `alfs.h`).
+
+**Deferred until a target build exists:** SPD-09's 100 us on an RP2040
+(`target_append_256`), and IF-03's big-endian build.
+
+---
+
+## 5. Known limits of the tests
+
+- SIMP-04 bounds each stack frame, not the deepest chain of them. alfs
+  calls no function through a pointer but the driver's and has no
+  recursion, so the chain is short; it is summed by hand in review until a
+  call-graph tool is added.
+- The power-loss runs are linear: one loss at each operation, and a second
+  in a third of them. littlefs's exhaustive schedules are not reproduced.
+- Timing is simulated at typical figures. The worst-case figures of
+  requirements 4.3 scale every stall by the same factor and change no
+  pass or fail.

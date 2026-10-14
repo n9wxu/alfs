@@ -9,12 +9,15 @@ block is less important than a broken exec loop. In flight, nothing erases:
 every append programs flash that was erased ahead of time, and the caller
 schedules erases in steps.
 
-**Status:** requirements, draft 1 (`docs/REQUIREMENTS.md`). Tests come next
-(`docs/TEST_PLAN.md`), then the code.
+**Status:** requirements and tests written; the code is next. `make test`
+runs the host suite once `alfs.c` exists.
 
 | Path | What |
 |---|---|
 | `docs/REQUIREMENTS.md` | what alfs must do, each requirement testable |
+| `docs/TEST_PLAN.md` | how each requirement is tested |
+| `alfs.h` | the interface |
+| `tests/` | the simulated flash, the harness and the tests |
 | `docs/datasheets/` | the flash parts the figures come from |
 
 The use cases come from the pyro flight computer

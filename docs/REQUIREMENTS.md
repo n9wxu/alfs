@@ -105,8 +105,13 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
   here).
 - **page:** the most one program operation writes; a program never
   crosses a page boundary (256 bytes here).
-- **prog unit:** the smallest aligned unit the driver programs, 1 byte to
-  a page.
+- **prog unit:** the smallest aligned unit the flash programs on its own,
+  1 byte to a page. alfs programs each prog unit at most once between
+  erases: the rulings' "only write to erased sectors", at the finest grain
+  the flash allows. A part with error correction over 16-byte units has a
+  prog unit of 16; the four parts here, 1 (A-2), since a driver that must
+  program whole pages pads them with the erase value, which leaves
+  programmed bits as they are (A-1).
 - **flash operation:** one call to the driver's program or erase. Reads are
   not operations: they do not take the chip out of execute-in-place.
 - **call:** one call of an alfs function.
@@ -345,14 +350,17 @@ alfs erases a sector only when it is dirty, never one that is ready.
 
 #### ALFS-LIFE-02
 
-The bytes programmed per byte appended are at most (n + 12) / n for syncs
-of n bytes, plus 32 bytes a sector.
+The bytes programmed are at most the bytes appended, plus 12 bytes a
+program with each program rounded up to the prog unit, plus 64 bytes or
+three prog units a sector, whichever is more. For syncs of n bytes, n no
+more than a page, that is (n + 12) / n.
 
 - Priority: 2.
 - Source: the brief; littlefs v3 programs about 768 bytes of metadata for a
   16-byte append and sync with prog unit 256 (the fork's Appendix B.2).
-- Measure: bytes the simulator programs, over bytes appended, under W-LOG
-  (n = 22 at 1 row a second, 1,100 at 50) and W-HR (n = 24,000).
+- Measure: bytes the simulator programs, against the bound computed from
+  its own counts of programs and sectors used, under W-LOG (22 bytes a
+  sync at 1 row a second, 1,100 at 50) and W-HR (24,000).
 - Pass: within the bound, with the prog unit rounding of each chunk added.
   Fail: above it.
 - Verified by: `life_write_amplification`.
@@ -389,8 +397,10 @@ number of reboots.
 - Source: UC-10.
 - Measure: erase counts reported after W-RING and a remount, against the
   simulator's own counts.
-- Pass: equal, except a sector whose count a power loss interrupted, which
-  reads at least its true count minus one. Fail: otherwise.
+- Pass: equal, except a sector whose erase a power loss separated from the
+  recording of its count, which takes the largest count in the region: at
+  least its true count minus one while wear is level (LIFE-04). Fail:
+  otherwise.
 - Verified by: `life_erase_count_persists`.
 
 #### ALFS-LIFE-06
@@ -446,15 +456,16 @@ sync.
 
 #### ALFS-SAFE-03
 
-A read never returns a byte from a chunk whose check failed; it skips the
-chunk, counts it, and reads on.
+A read never returns a byte from a chunk whose check failed. A failed
+check makes the chunk's length untrustworthy too, so the read skips to the
+next page, counts one failure, and reads on.
 
 - Priority: 3.
 - Source: UC-7; METASTABLE and the FLIP behaviours.
 - Measure: streams with bits flipped in chunk headers, payloads and
   checks.
-- Pass: no damaged byte returned; each damaged chunk counted once. Fail:
-  otherwise.
+- Pass: no damaged byte returned; one failure counted for each page
+  skipped; the chunks of the pages after it read. Fail: otherwise.
 - Verified by: `safe_no_false_data`.
 
 #### ALFS-SAFE-04
@@ -485,8 +496,9 @@ whose erased state it verified on the ground.
 #### ALFS-SAFE-06
 
 A failed program loses none of the bytes it carried: they are written to
-the next page in a later call. After a configured number of failures in a
-row (default 3) they are dropped and counted.
+a fresh sector in a later call, since a page that fails is a sector that is
+failing. After a configured number of failures in a row (default 3) they
+are dropped and counted. A program is checked by reading it back.
 
 - Priority: 3.
 - Source: UC-9.
@@ -503,8 +515,10 @@ and the region's capacity shrinks by it.
 - Priority: 3.
 - Source: UC-10.
 - Measure: ERASEERROR and ERASENOOP sectors, and wear-out, under W-RING.
-- Pass: excluded, counted, and still excluded after a remount. Fail:
-  otherwise.
+- Pass: excluded and counted; after a remount it is dirty again, and its
+  next erase step finds it bad again before anything is written to it.
+  Marking it on the flash would mean programming bytes already programmed.
+  Fail: an append or a stamp lands in it.
 - Verified by: `safe_bad_sector`.
 
 #### ALFS-SAFE-08
@@ -630,10 +644,12 @@ erase.
 The geometry is configured: sector and page size (powers of two, sector at
 least four pages), prog unit (a power of two up to a page), the region's
 start and length (sector-aligned), the chip's size, and the erase value.
+alfs never programs a prog unit twice between erases.
 
 - Priority: S.
 - Verified by: `if_geometry` (every combination the tests use is
-  accepted; misaligned or oversized ones are refused).
+  accepted; misaligned or oversized ones are refused); every test (the
+  simulator refuses a program into a prog unit already programmed).
 
 #### ALFS-IF-03
 
