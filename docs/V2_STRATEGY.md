@@ -5,6 +5,24 @@
 test." So changes 1 to 4 go ahead, no catalog is built, chunks stay up to
 a page (at most 0.46 ms measured), and P8 and P9 run before changes 3 and
 4 rely on A-9.
+
+**Built, 2026-10-14** (`docs/SPEC.md` version 2). P8 found A-9 holds on the
+W25Q128JV and both XT25F128F; the BY25Q64ES could not be torn by command.
+Building it, with the simulator's torn bits made to behave as the probe
+found, showed four things the proposal missed, each now a rule in SAFE-04,
+SAFE-11 or IF-04:
+
+- a torn claim could later read valid, reuse a sequence or put old bytes
+  after new: each stamp records a sequence floor, and a resumed stream
+  clears ahead;
+- a stamp an erase step left half programmed could decay: every claim
+  program writes the stamp again;
+- a claim torn at its start leaves a sector that reads ready: after a
+  mount, the sector where the allocation cursor stood is not used;
+- an erase step that chose a sector by one read and judged its stream
+  deleted by another deleted a live stream: it now decides from one read.
+
+The code grew from 5,301 to 6,845 bytes; SIMP-02 was raised to 7 KiB.
 It follows `docs/FLASH_PROBE.md` and revises the recommendation of
 `docs/CATALOG_EVALUATION.md`.
 

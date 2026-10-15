@@ -314,19 +314,20 @@ returns `ALFS_BUSY` and resumes the erase when called again.
 
 #### ALFS-SPD-06
 
-Mounting reads at most 60 bytes of each sector of the region, and performs
+Mounting reads at most 68 bytes of each sector of the region, and performs
 no flash operation.
 
 - Priority: 1.
 - Source: UC-3.
 - Measure: bytes the simulator reads during `alfs_mount`.
-- Pass: at most 60 times the number of sectors. Fail: more, or any
-  operation.
+- Pass: at most 68 times the number of sectors. Fail: more, or any
+  operation. Amended 2026-10-14 from 60: version 2's stamp floor and
+  sector number add 6 bytes to a sector's header and its first claim.
 - Verified by: `spd_mount_reads_bounded`.
 
 #### ALFS-SPD-07
 
-Opening a stream to append, after a mount, reads at most 60 bytes of each
+Opening a stream to append, after a mount, reads at most 68 bytes of each
 sector and the chunks of the stream's last sector, and performs no flash
 operation.
 
@@ -334,7 +335,7 @@ operation.
 - Source: UC-3.
 - Measure: bytes read by `alfs_open_append` on a stream whose last sector
   is full of short chunks.
-- Pass: at most 60 times the number of sectors, plus one sector. Fail:
+- Pass: at most 68 times the number of sectors, plus one sector. Fail:
   more. Amended 2026-10-14: resuming in the last sector (SAFE-04) must find
   its last good chunk.
 - Verified by: `spd_reopen_reads_bounded`.
@@ -552,7 +553,9 @@ reclaiming what was synced. With a prog unit of 1:
    tag, first sector and next number are erased.
 4. Every program of a claim starts at the sector's first byte and programs
    the stamp again with the bytes it reads.
-5. The first ready sector an allocation finds after a mount is not used:
+5. After a mount, the first sector after the sector of the newest valid
+   claim whose stamp is current and whose claim is neither valid nor zero,
+   as the mount found them, is not used: when an allocation reaches it,
    alfs programs 00h over its claim, and erase steps reclaim it.
 
 With a prog unit over 1 the part takes no second program; a resumed
@@ -572,11 +575,16 @@ stream goes on in a new sector, and rules 3 to 5 do not apply.
   read valid at one mount and invalid at a later one. Rule 5: a claim
   program torn at its start leaves a sector that reads ready but holds a
   bit that reads either way; it is the first ready sector from where the
-  allocation cursor stood.
-- Measure: the simulator flags a program into a page an interrupted
-  operation changed (every behaviour but ATOMIC), unless every byte is
-  what the programs before it meant, or 00h; the power-loss runs remount
-  and read again after the resume, with erase steps between.
+  allocation cursor stood, after the newest claim. First written as "the
+  first ready sector an allocation finds", which erase steps between the
+  mount and the allocation could make a different one
+  (`safe_powerloss_bound`); then as "the first ready sector", which a
+  torn claim reading torn at the mount and erased at the allocation
+  escaped (`safe_resume_torn_claim`).
+- Measure: the simulator flags a program of a byte an interrupted
+  operation changed (every behaviour but ATOMIC), unless it is given what
+  the programs before it meant, or 00h; the power-loss runs remount and
+  read again after the resume, with erase steps between.
 - Pass: no flag, and every read as SAFE-01 requires. Fail: otherwise.
 - Verified by: `safe_no_program_after_torn`, `safe_powerloss_durable`,
   `safe_resume_torn_claim`.
@@ -665,15 +673,20 @@ Mount and read finish, without a crash, on any content of the region.
 #### ALFS-SAFE-11
 
 A delete is atomic: once it returns, the stream is gone after any power
-loss; before it returns, the stream is whole. With a prog unit of 1,
-before an erase step erases any sector of a deleted stream, it programs the
-stream's dead mark again with 00h (A-9), so a mark a power loss left half
-programmed cannot read as live once the reclaim has begun.
+loss; before it returns, the stream is whole. With a prog unit of 1, an
+erase step reads each sector again just before erasing it, deciding from
+one read of the stream's dead mark: a sector that now reads live is left
+for later, and before any sector of a deleted stream is erased the
+stream's dead mark is programmed again with 00h (A-9), so a mark a power
+loss left half programmed cannot read as live once the reclaim has begun.
 
 - Priority: 3.
 - Source: UC-4; METASTABLE: a half-programmed mark could read deleted at
   one mount and live at the next, after some sectors were erased. Amended
-  2026-10-14 (`docs/V2_STRATEGY.md` 4.4).
+  2026-10-14 (`docs/V2_STRATEGY.md` 4.4). The second read: a torn claim
+  that read invalid when the erase step chose its sector, and valid when it
+  read again, made a live stream look deleted, and the mark programmed
+  deleted it (found by `safe_powerloss_bound`).
 - Measure: power loss at every operation of a delete; remount; then power
   loss at every operation of the erase steps that reclaim it; remount.
 - Pass: the stream is whole or gone, never partial. Fail: partial.
@@ -709,7 +722,7 @@ no floating point, and no library beyond `<stdint.h>`, `<stddef.h>`,
 
 #### ALFS-SIMP-02
 
-The code is at most 6 KiB on a Cortex-M0+ (Thumb, `-Os`): under 40 % of
+The code is at most 7 KiB on a Cortex-M0+ (Thumb, `-Os`): under half of
 littlefs's.
 
 - Priority: S.
@@ -718,9 +731,13 @@ littlefs's.
   `-mcpu=cortex-m0plus`, its debug, warning, error and assert output off,
   no malloc) is 15,456 bytes. Draft 1 guessed 4 KiB before any code
   existed; the first build was 5.4 KiB, 5.3 after its duplication was
-  removed, and the rest is function the requirements ask for.
+  removed, and the rest is function the requirements ask for. Amended
+  2026-10-14 from 6 KiB: version 2 is 6,845 bytes, 1,544 more than
+  version 1, for the rules that settle what a power loss half programmed
+  (SAFE-04, SAFE-11) and the sector numbers (SPD-10, SAFE-12). Fitting
+  6 KiB again means dropping one of those or the large erase (LIFE-07).
 - Measure: `arm-none-eabi-size` of `alfs.o`, text plus data.
-- Pass: at most 6,144 bytes. Fail: more.
+- Pass: at most 7,168 bytes. Fail: more.
 - Verified by: `simp_code_size`.
 
 #### ALFS-SIMP-03

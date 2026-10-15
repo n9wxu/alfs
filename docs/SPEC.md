@@ -107,7 +107,7 @@ before, or at the start of a later page.
 
 ## 2. What a sector is
 
-Decided from at most 60 bytes: the stamp, the dead mark and the claim, and
+Decided from at most 68 bytes: the stamp, the dead mark and the claim, and
 for a sector that is not its stream's first, the first sector's dead mark
 and claim.
 
@@ -133,9 +133,9 @@ counted dirty and the next ready one is tried.
 **A sector's chunks**, from D, at position x:
 
 1. Read the six header bytes at x.
-2. If they are erased: when x is a page start and the whole page is
-   erased, the sector's chunks end here. Otherwise go to the next page
-   start and continue.
+2. If they are erased: go to the next page start and continue. A blank
+   page does not end the sector, since a resumed stream leaves two pages
+   unwritten (section 4); its chunks end at the sector's end.
 3. If the length is 0, or the chunk would cross its page, or its CRC fails:
    count one failed check (when reading for the caller), go to the next
    page start, and continue. The length cannot be trusted, so nothing else
@@ -161,12 +161,15 @@ a larger number, the stream ends.
   again, with the bytes it reads, and the dead mark erased, so that a stamp
   an erase step left half programmed is completed (A-9). Its sector number
   is one more than the stream's last.
-- **The first allocation after a mount**, with U = 1, does not use the
-  ready sector it finds: it programs zero over that sector's claim, which
-  makes it dirty, and takes the next. A claim program torn at its start
-  leaves a sector that reads ready but holds a bit that reads either way
-  (the probe's FLICKER), and it is that sector: the first ready one from
-  where the allocation cursor stood.
+- **A sector not used after a mount**, with U = 1: the first sector, as
+  the mount finds them, after the sector of the newest valid claim of any
+  stream, wrapping round, whose stamp is current and whose claim is not
+  valid and not zero: erased or torn, however its bits happen to read. That is where the allocation cursor stood
+  when the power was lost, so it is the sector a torn claim program would
+  have taken, and such a program torn at its start leaves a sector that
+  reads ready but holds a bit that reads either way (the probe's FLICKER).
+  When an allocation reaches it, alfs programs zero over its claim, which
+  makes it dirty, and takes the next.
 - **The next chunk:** at RU of the last one's end, in the same page while
   it fits and the page has had fewer than `max_page_programs` programs;
   otherwise at the next page's start; past the sector's end, in a new
@@ -216,12 +219,14 @@ The erase step scans forward, circularly, from where it last stopped, for
 a dirty sector that is not bad. With a driver that has `erase_large` and a
 whole aligned block of dirty sectors, it takes the block.
 
-With U = 1, before erasing, it looks at each sector to be erased: one that
-belongs to a deleted stream, and is not that stream's first, has the
-stream's dead mark programmed with ~E again, one mark a call, unless that
-mark was the last one programmed this mount. A dead mark a power loss left
-half programmed then cannot read erased once some of its stream's sectors
-are gone.
+With U = 1, before erasing, it reads each sector to be erased again,
+deciding from one read of its stream's dead mark. One that now reads live
+is left for later: a bit that reads either way can make a sector read
+dirty when chosen and live a moment after. One that belongs to a deleted
+stream, and is not that stream's first, has the stream's dead mark
+programmed with ~E again, one mark a call, unless that mark was the last
+one programmed this mount. A dead mark a power loss left half programmed
+then cannot read erased once some of its stream's sectors are gone.
 
 It erases the sector or block, reads every byte back as erased, programs
 the stamp and reads the stamp back. Any failure makes the sector bad for

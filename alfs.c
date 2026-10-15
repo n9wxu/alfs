@@ -7,17 +7,25 @@
 
 #include <string.h>
 
-#define VERSION 1u
-#define STAMP_LEN 22u
-#define CLAIM_LEN 18u
+#define VERSION 2u
+#define STAMP_LEN 26u
+#define CLAIM_LEN 20u
 #define HDR_LEN 6u
-#define BUF_HEAD 24u /* a claim and a chunk header, ahead of the payload */
-#define PIECE 16u    /* the most read onto the stack at once */
+#define PIECE 16u /* the most read onto the stack at once */
+
+/* A stream's buffer: a sector's first bytes with prog unit 1, then the
+ * payload. A claim program writes it from byte 0 (prog unit 1) or B_CLAIM. */
+#define B_CLAIM (STAMP_LEN + 1u)
+#define B_HDR (B_CLAIM + CLAIM_LEN)
+#define BUF_HEAD (B_HDR + HDR_LEN)
+
+#define AGAIN 100 /* a program settled something and wrote no chunk: call again */
 
 enum { M_CLOSED, M_APPEND, M_READ };
-enum { F_NEW = 1, F_FIRST = 2 };            /* stream flags */
-enum { E_IDLE, E_ERASE, E_LARGE, E_STAMP }; /* erase step states */
-#define E_NO_LARGE 0x80u                    /* large erases failed this mount */
+enum { F_NEW = 1, F_FIRST = 2, F_FIRM = 4, F_CLEAR = 8 }; /* stream flags */
+#define NONE 0xFFFFu
+enum { E_IDLE, E_ERASE, E_LARGE, E_STAMP, E_FIRM };       /* erase step states */
+#define E_NO_LARGE 0x80u                                  /* large erases failed this mount */
 enum { S_READY, S_LIVE, S_DIRTY };
 
 /* ---- bytes ------------------------------------------------------------ */
@@ -181,7 +189,7 @@ static int read_hdr(alfs_t *fs, uint32_t k, hdr_t *h) {
 }
 
 static bool stamp_valid(const uint8_t *st) {
-    return !memcmp(st, "alfs", 4) && st[4] == VERSION && get32(st + 18) == crc(st, 18);
+    return !memcmp(st, "alfs", 4) && st[4] == VERSION && get32(st + 22) == crc(st, 22);
 }
 
 static bool stamp_matches(const alfs_t *fs, const uint8_t *st) {
@@ -190,28 +198,42 @@ static bool stamp_matches(const alfs_t *fs, const uint8_t *st) {
            st[7] == lg2(c->prog_unit) && get16(st + 8) == fs->sectors;
 }
 
-static bool claim_valid(const alfs_t *fs, const uint8_t *cl) {
-    return !is_erased(fs, cl, CLAIM_LEN) && get32(cl + 14) == crc(cl, 14);
+/* A claim alfs programmed zero over (SAFE-04): no torn claim reads so, since
+ * it reads erased wherever its own value is (A-9). */
+static bool zeroed(const alfs_t *fs, const uint8_t *cl) {
+    for (uint32_t i = 0; i < CLAIM_LEN; i++)
+        if (cl[i] != (uint8_t)~fs->cfg->erase_value)
+            return false;
+    return true;
 }
 
-/* A stream's first sector: its claim's sequence is its identity. */
-static bool first_claim(const alfs_t *fs, const uint8_t *claim, uint8_t dead, uint32_t k) {
+static bool claim_valid(const alfs_t *fs, const uint8_t *cl) {
+    return !is_erased(fs, cl, CLAIM_LEN) && get32(cl + 16) == crc(cl, 16);
+}
+
+/* A stream's first claim, whatever its dead mark: its sequence is its
+ * identity, and its sector number 0. */
+static bool first_of(const alfs_t *fs, const uint8_t *claim, uint32_t k) {
     return claim_valid(fs, claim) && get32(claim) == get32(claim + 4) && get16(claim + 12) == k &&
-           dead == fs->cfg->erase_value;
+           get16(claim + 14) == 0;
+}
+
+static bool first_claim(const alfs_t *fs, const uint8_t *claim, uint8_t dead, uint32_t k) {
+    return first_of(fs, claim, k) && dead == fs->cfg->erase_value;
 }
 
 static bool is_first(const alfs_t *fs, const hdr_t *h, uint32_t k) {
     return first_claim(fs, h->claim, h->dead, k);
 }
 
-static bool current(const alfs_t *fs, const hdr_t *h) {
-    return stamp_valid(h->stamp) && stamp_matches(fs, h->stamp) && get32(h->stamp + 10) == fs->gen;
+static bool current(const alfs_t *fs, const uint8_t *st) {
+    return stamp_valid(st) && stamp_matches(fs, st) && get32(st + 10) == fs->gen;
 }
 
 /* SPEC section 2, on a header already read: at most 19 bytes more. */
 static int classify_hdr(alfs_t *fs, uint32_t k, const hdr_t *h, int *state) {
     *state = S_DIRTY;
-    if (!current(fs, h))
+    if (!current(fs, h->stamp))
         return ALFS_OK;
     if (h->dead == fs->cfg->erase_value && is_erased(fs, h->claim, CLAIM_LEN)) {
         *state = S_READY;
@@ -257,6 +279,8 @@ static void init(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv)
     fs->sectors = (uint16_t)(cfg->region_size / cfg->sector_size);
     fs->min_wear = UINT32_MAX;
     fs->next_seq = 1;
+    fs->firmed = NONE;
+    fs->fresh = NONE;
 }
 
 static void see_wear(alfs_t *fs, uint32_t w) {
@@ -276,8 +300,9 @@ static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv
     if (rc)
         return rc;
     init(fs, cfg, drv);
-    bool any = false, mismatch = false, live_any = false;
+    bool any = false, mismatch = false, live_any = false, newest_any = false;
     uint32_t ready = 0, live = 0, dirty = 0, last_seq = 0, last_k = 0, seq_max = 0;
+    uint32_t newest = 0, fresh_after = NONE, fresh_any = NONE; /* SAFE-04 rule 5 */
     for (uint32_t k = 0; k < fs->sectors; k++) {
         hdr_t h;
         int st = S_DIRTY;
@@ -290,15 +315,31 @@ static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv
         if (stamp_valid(h.stamp) && stamp_matches(fs, h.stamp)) {
             uint32_t g = get32(h.stamp + 10);
             see_wear(fs, get32(h.stamp + 14));
+            if (get32(h.stamp + 18) > seq_max)
+                seq_max = get32(h.stamp + 18);
             if (!any || g > fs->gen) { /* a newer generation: all before it is dirty */
                 dirty += ready + live;
                 ready = live = 0;
-                live_any = false;
+                live_any = newest_any = false;
+                fresh_after = fresh_any = NONE;
                 fs->gen = g;
                 any = true;
             }
             if (classify_hdr(fs, k, &h, &st))
                 return ALFS_EIO;
+            if (g == fs->gen && claim_valid(fs, h.claim) && (!newest_any || get32(h.claim + 4) > newest)) {
+                newest = get32(h.claim + 4);
+                newest_any = true;
+                fresh_after = NONE;
+            }
+            /* a sector a claim program could have been taking: erased or torn,
+             * however its bits read now, and not one alfs zeroed */
+            if (g == fs->gen && !claim_valid(fs, h.claim) && !zeroed(fs, h.claim)) {
+                if (fresh_any == NONE)
+                    fresh_any = k;
+                if (fresh_after == NONE && newest_any)
+                    fresh_after = k;
+            }
         }
         if (st == S_READY) {
             ready++;
@@ -313,7 +354,9 @@ static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv
             dirty++;
         }
     }
-    fs->next_seq = seq_max + 1u;
+    fs->next_seq = seq_max + 2u; /* past a torn claim's: SPEC 1.1 */
+    if (cfg->prog_unit == 1u) /* where the allocation cursor stood: SAFE-04 rule 5 */
+        fs->fresh = (uint16_t)(fresh_after != NONE ? fresh_after : fresh_any);
     fs->ready = (uint16_t)ready;
     fs->dirty = (uint16_t)dirty;
     fs->alloc_cursor = (uint16_t)(live_any ? (last_k + 1u) % fs->sectors : 0u);
@@ -351,6 +394,7 @@ int alfs_format(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv) 
     if (wear_for(fs, 0, 1, &fs->ewear))
         return ALFS_EIO;
     fs->gen++;
+    fs->fresh = NONE;
     fs->min_wear = UINT32_MAX;
     fs->ready = 0;
     fs->dirty = fs->sectors;
@@ -408,7 +452,8 @@ static int stamp_next(alfs_t *fs) {
         put16(st + 8, fs->sectors);
         put32(st + 10, fs->gen);
         put32(st + 14, fs->ewear);
-        put32(st + 18, crc(st, 18));
+        put32(st + 18, fs->next_seq);
+        put32(st + 22, crc(st, 22));
         ok = prog(fs, a, st, STAMP_LEN) == ALFS_OK;
     }
     if (ok) {
@@ -424,10 +469,76 @@ static int stamp_next(alfs_t *fs) {
     return ALFS_OK;
 }
 
+/*
+ * What sector k is now, from one read of its stream's dead mark: 2 when it
+ * reads live, 1 when it belongs to a deleted stream and is not its first
+ * (*first set), 0 when it is dirty otherwise. A bit that reads either way
+ * can make a sector read dirty when chosen and live a moment later.
+ */
+static int reclaim_kind(alfs_t *fs, uint32_t k, uint32_t *first) {
+    hdr_t h;
+    if (read_hdr(fs, k, &h))
+        return ALFS_EIO;
+    if (!current(fs, h.stamp) || !claim_valid(fs, h.claim))
+        return 0;
+    uint32_t id = get32(h.claim), f = get16(h.claim + 12);
+    if (get32(h.claim + 4) == id)
+        return first_claim(fs, h.claim, h.dead, k) ? 2 : 0;
+    if (f >= fs->sectors)
+        return 0;
+    uint8_t dead, claim[CLAIM_LEN];
+    uint32_t a = addr_of(fs, f);
+    if (rd(fs, a + off_dm(fs), &dead, 1) || rd(fs, a + off_claim(fs), claim, CLAIM_LEN))
+        return ALFS_EIO;
+    if (!first_of(fs, claim, f) || get32(claim) != id)
+        return 0;
+    if (dead == fs->cfg->erase_value)
+        return 2;
+    *first = f;
+    return 1;
+}
+
+/*
+ * SPEC 5: before an erase, each sector to be erased read again. One that
+ * reads live is left for later; a deleted stream's dead mark is programmed
+ * again, one a call. ALFS_OK after a program or when it gave up; 1 when the
+ * erase may go on.
+ */
+static int firm_marks(alfs_t *fs) {
+    uint32_t n = (fs->estamped & 0x80u) ? large_sectors(fs) : 1u;
+    while ((fs->estamped & 0x7Fu) < n) {
+        uint32_t first = 0;
+        int rc = reclaim_kind(fs, fs->esector + (fs->estamped & 0x7Fu), &first);
+        if (rc < 0)
+            return rc;
+        if (rc == 2) {
+            idle(fs, fs->esector + 1u);
+            return ALFS_OK;
+        }
+        fs->estamped++;
+        if (rc == 1 && first != fs->firmed) {
+            uint8_t mark = (uint8_t)~fs->cfg->erase_value;
+            fs->firmed = (uint16_t)first;
+            if (prog(fs, addr_of(fs, first) + off_dm(fs), &mark, 1))
+                fs->n.prog_failures++;
+            return ALFS_OK;
+        }
+    }
+    return 1;
+}
+
 static int erase_go(alfs_t *fs) {
     uint8_t st = fs->estate & 0x7Fu;
     if (st == E_STAMP)
         return stamp_next(fs);
+    if (st == E_FIRM) {
+        int rc = firm_marks(fs);
+        if (rc <= 0)
+            return rc;
+        st = (fs->estamped & 0x80u) ? E_LARGE : E_ERASE;
+        fs->estate = (uint8_t)((fs->estate & E_NO_LARGE) | st);
+        fs->estamped = 0;
+    }
     uint32_t a = addr_of(fs, fs->esector);
     int rc = st == E_LARGE ? fs->drv->erase_large(fs->drv->ctx, a) : fs->drv->erase(fs->drv->ctx, a);
     if (rc == ALFS_BUSY)
@@ -490,7 +601,12 @@ int alfs_erase_step(alfs_t *fs) {
         if (wear_for(fs, k, n, &fs->ewear))
             return ALFS_EIO;
         fs->esector = (uint16_t)k;
-        fs->estate = (uint8_t)((fs->estate & E_NO_LARGE) | (large ? E_LARGE : E_ERASE));
+        if (fs->cfg->prog_unit == 1u) {
+            fs->estate = (uint8_t)((fs->estate & E_NO_LARGE) | E_FIRM);
+            fs->estamped = large ? 0x80u : 0u;
+        } else {
+            fs->estate = (uint8_t)((fs->estate & E_NO_LARGE) | (large ? E_LARGE : E_ERASE));
+        }
         return erase_go(fs);
     }
     fs->dirty = 0;
@@ -503,7 +619,7 @@ int alfs_erase_step(alfs_t *fs) {
 static int claimed(alfs_t *fs, uint32_t k, hdr_t *h) {
     if (read_hdr(fs, k, h))
         return ALFS_EIO;
-    return current(fs, h) && claim_valid(fs, h->claim);
+    return current(fs, h->stamp) && claim_valid(fs, h->claim);
 }
 
 /* The stream's first sector, and with last, its newest. */
@@ -531,23 +647,27 @@ static int find_stream(alfs_t *fs, uint32_t id, uint32_t *first, uint32_t *last,
     return found ? ALFS_OK : ALFS_ENOENT;
 }
 
-/* The stream's sector with the least sequence greater than seq. */
-static int next_sector(alfs_t *fs, uint32_t id, uint32_t seq, uint32_t *k_out, uint32_t *seq_out) {
+/*
+ * SPEC 3: the stream's sector with the least number greater than n, found
+ * forward from *k_out; the scan stops at n + 1, usually a few sectors on.
+ */
+static int next_sector(alfs_t *fs, uint32_t id, uint32_t n, uint32_t *k_out, uint32_t *n_out) {
     bool found = false;
+    uint32_t from = *k_out;
     for (uint32_t i = 0; i < fs->sectors; i++) {
-        uint32_t k = (*k_out + 1u + i) % fs->sectors; /* usually the next one */
+        uint32_t k = (from + 1u + i) % fs->sectors;
         hdr_t h;
         int c = claimed(fs, k, &h);
         if (c < 0)
             return c;
-        uint32_t s = get32(h.claim + 4);
-        if (!c || get32(h.claim) != id || s <= seq)
+        uint32_t m = get16(h.claim + 14);
+        if (!c || get32(h.claim) != id || m <= n)
             continue;
-        if (!found || s < *seq_out) {
-            *seq_out = s;
+        if (!found || m < *n_out) {
+            *n_out = m;
             *k_out = k;
             found = true;
-            if (s == seq + 1u)
+            if (m == n + 1u)
                 break;
         }
     }
@@ -570,12 +690,7 @@ static int scan_chunk(alfs_t *fs, uint32_t k, uint32_t *pos, uint32_t *len, uint
         }
         if (rd(fs, base + x, h, HDR_LEN))
             return ALFS_EIO;
-        if (is_erased(fs, h, HDR_LEN)) {
-            bool end = false;
-            if (x % fs->cfg->page_size == 0 && blank(fs, base + x, fs->cfg->page_size, &end))
-                return ALFS_EIO;
-            if (end)
-                return 0;
+        if (is_erased(fs, h, HDR_LEN)) { /* a page a resume passed over, or the tail */
             x = np;
             continue;
         }
@@ -667,6 +782,14 @@ static uint32_t capacity(const alfs_t *fs, const alfs_stream_t *s) {
     return next_page(fs, s->off) - s->off - HDR_LEN;
 }
 
+/* Zero over sector k's claim, which makes it dirty for good (A-9). */
+static void zero_claim(alfs_t *fs, uint32_t k) {
+    static const uint8_t z[2][CLAIM_LEN] = {{0}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                                   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+    if (prog(fs, addr_of(fs, k) + off_claim(fs), z[fs->cfg->erase_value == 0x00u], CLAIM_LEN))
+        fs->n.prog_failures++;
+}
+
 /* A ready sector for a new claim, its claim page checked erased. */
 static int find_ready(alfs_t *fs, uint32_t *out) {
     uint32_t p = fs->cfg->page_size, c = off_claim(fs);
@@ -685,6 +808,13 @@ static int find_ready(alfs_t *fs, uint32_t *out) {
             continue;
         if (blank(fs, addr_of(fs, k) + from, next_page(fs, c) - from, &ok))
             return ALFS_EIO;
+        if (ok && k == fs->fresh) { /* SAFE-04 rule 5 */
+            fs->fresh = NONE;
+            fs->ready--;
+            fs->dirty++;
+            zero_claim(fs, k);
+            return AGAIN;
+        }
         if (ok) {
             *out = k;
             return ALFS_OK;
@@ -707,13 +837,93 @@ static int failed(alfs_t *fs, alfs_stream_t *s) {
     return ALFS_ELOST;
 }
 
+/* The claim of the stream's sector numbered n, built at buf + B_CLAIM. */
+static void build_claim(alfs_stream_t *s, uint32_t seq, uint32_t first, uint32_t n) {
+    uint8_t *c = s->buf + B_CLAIM;
+    put32(c, s->id);
+    put32(c + 4, seq);
+    put32(c + 8, s->tag);
+    put16(c + 12, first);
+    put16(c + 14, n);
+    put32(c + 16, crc(c, 16));
+}
+
+/* Sector k's stamp, which must be valid, and an erased dead mark, at buf. */
+static int head_of(alfs_t *fs, uint32_t k, uint8_t *buf) {
+    if (rd(fs, addr_of(fs, k), buf, STAMP_LEN))
+        return ALFS_EIO;
+    if (!stamp_valid(buf) || !stamp_matches(fs, buf) || get32(buf + 10) != fs->gen)
+        return ALFS_EIO; /* a bit that reads either way: read again */
+    buf[STAMP_LEN] = fs->cfg->erase_value;
+    return ALFS_OK;
+}
+
+/* SAFE-04 rule 1: the last sector's stamp and claim, programmed again. */
+static int firm(alfs_t *fs, alfs_stream_t *s) {
+    if (head_of(fs, s->sector, s->buf))
+        return ALFS_EIO;
+    build_claim(s, s->seq, s->first, s->index);
+    s->flags &= (uint8_t)~F_FIRM;
+    if (prog(fs, addr_of(fs, s->sector), s->buf, B_HDR))
+        return failed(fs, s);
+    return AGAIN;
+}
+
+/* A torn claim's fields read erased wherever the stream's own are (A-9). */
+static bool could_be(const alfs_t *fs, const uint8_t *cl, const alfs_stream_t *s) {
+    uint8_t want[16];
+    put32(want, s->id);
+    put32(want + 8, s->tag);
+    put16(want + 12, s->first);
+    put16(want + 14, s->index + 1u);
+    for (uint32_t i = 0; i < 16; i++) {
+        if (i >= 4 && i < 8)
+            continue; /* the sequence is unknown */
+        uint8_t ew = (uint8_t)~(want[i] ^ fs->cfg->erase_value); /* erased in want */
+        uint8_t ec = (uint8_t)~(cl[i] ^ fs->cfg->erase_value);
+        if (ew & (uint8_t)~ec)
+            return false;
+    }
+    return true;
+}
+
+/* SAFE-04 rule 3: zero over one claim that could stand after the stream's
+ * last sector. AGAIN after a program; 0 when none is left. */
+static int clear_ahead(alfs_t *fs, alfs_stream_t *s) {
+    uint8_t *st = s->buf, *cl = s->buf + B_CLAIM; /* scratch until the claim is built */
+    for (uint32_t k = 0; k < fs->sectors; k++) {
+        uint32_t a = addr_of(fs, k);
+        if (k == s->sector || is_bad(fs, k))
+            continue;
+        if (rd(fs, a, st, STAMP_LEN) || rd(fs, a + off_claim(fs), cl, CLAIM_LEN))
+            return ALFS_EIO;
+        if (!current(fs, st) || is_erased(fs, cl, CLAIM_LEN))
+            continue;
+        bool valid = claim_valid(fs, cl);
+        if (valid ? get32(cl) != s->id || get16(cl + 14) <= s->index : !could_be(fs, cl, s))
+            continue;
+        fs->dirty = (uint16_t)(fs->dirty + valid);
+        zero_claim(fs, k);
+        return AGAIN;
+    }
+    s->flags &= (uint8_t)~F_CLEAR;
+    return ALFS_OK;
+}
+
 /*
  * Programs the chunk being built: one program. After a failure moved the
  * stream to a new sector, less may fit than was held; the rest stays for
- * the next call.
+ * the next call. AGAIN: the program settled something instead.
  */
 static int put_chunk(alfs_t *fs, alfs_stream_t *s) {
-    uint8_t *h = s->buf + CLAIM_LEN;
+    if (s->flags & F_FIRM)
+        return firm(fs, s);
+    if (s->flags & F_CLEAR) {
+        int rc = clear_ahead(fs, s);
+        if (rc)
+            return rc;
+    }
+    uint8_t *h = s->buf + B_HDR;
     uint32_t n = capacity(fs, s) < s->used ? capacity(fs, s) : s->used;
     put16(h, n);
     put32(h + 2, ~crc32(crc32(0xFFFFFFFFu, h, 2), s->buf + BUF_HEAD, n));
@@ -730,16 +940,18 @@ static int put_chunk(alfs_t *fs, alfs_stream_t *s) {
         int rc = find_ready(fs, &k);
         if (rc)
             return rc;
+        bool whole = fs->cfg->prog_unit == 1u; /* SAFE-04 rule 4: from byte 0 */
+        if (whole && head_of(fs, k, s->buf))
+            return ALFS_EIO;
         uint32_t seq = (s->flags & F_FIRST) ? s->id : fs->next_seq++;
         uint32_t first = (s->flags & F_FIRST) ? k : s->first;
-        put32(s->buf, s->id);
-        put32(s->buf + 4, seq);
-        put32(s->buf + 8, s->tag);
-        put16(s->buf + 12, first);
-        put32(s->buf + 14, crc(s->buf, 14));
+        uint32_t num = (s->flags & F_FIRST) ? 0u : s->index + 1u;
+        build_claim(s, seq, first, num);
         fs->ready--;
         fs->alloc_cursor = (uint16_t)((k + 1u) % fs->sectors);
-        if (prog(fs, addr_of(fs, k) + c, s->buf, BUF_HEAD + n)) {
+        int bad = whole ? prog(fs, addr_of(fs, k), s->buf, BUF_HEAD + n)
+                        : prog(fs, addr_of(fs, k) + c, s->buf + B_CLAIM, CLAIM_LEN + HDR_LEN + n);
+        if (bad) {
             fs->dirty++;
             if (s->flags & F_FIRST)
                 s->id = fs->next_seq++; /* the failed sector may hold a first claim */
@@ -748,8 +960,9 @@ static int put_chunk(alfs_t *fs, alfs_stream_t *s) {
         s->sector = (uint16_t)k;
         s->seq = seq;
         s->first = (uint16_t)first;
+        s->index = (uint16_t)num;
         s->flags = 0;
-        s->off = (uint16_t)ru(fs, c + BUF_HEAD + n);
+        s->off = (uint16_t)ru(fs, c + CLAIM_LEN + HDR_LEN + n);
         s->page_progs = s->off / p == c / p ? (uint8_t)(c / p == 0 ? 2u : 1u) : 0u;
     }
     memmove(s->buf + BUF_HEAD, s->buf + BUF_HEAD + n, s->used - n);
@@ -772,11 +985,11 @@ int alfs_create(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t tag) {
 }
 
 /*
- * SAFE-04: the stream goes on in a new sector. The power loss that preceded
- * the mount may have left bits that read either way in the last sector's
- * claim or chunks; only synced bytes were promised, and a new sector keeps
- * those synced from now on clear of them. It costs the rest of one sector a
- * mount.
+ * SAFE-04 (SPEC 4): the power loss before the mount interrupted at most the
+ * next chunk in the last good chunk's page, the first of the next page, or
+ * a new sector's claim. Neither page takes new data, and the first chunk is
+ * preceded by the claim programmed again and the claims cleared ahead. A
+ * unit over 1 takes no second program: a new sector.
  */
 int alfs_open_append(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id) {
     uint32_t first, last, count;
@@ -792,11 +1005,30 @@ int alfs_open_append(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id) {
     s->id = id;
     s->tag = get32(h.claim + 8);
     s->seq = get32(h.claim + 4);
+    s->index = (uint16_t)get16(h.claim + 14);
     s->buf = buf;
     s->sector = (uint16_t)last;
     s->first = (uint16_t)first;
     s->mode = M_APPEND;
     s->flags = F_NEW;
+    if (fs->cfg->prog_unit != 1u)
+        return ALFS_OK;
+    uint32_t p = fs->cfg->page_size, x = off_data(fs), l = 0, page = off_claim(fs) / p;
+    for (;;) {
+        rc = scan_chunk(fs, last, &x, &l, NULL, false);
+        if (rc < 0)
+            return rc;
+        if (!rc)
+            break;
+        page = x / p;
+        x = ru(fs, x + HDR_LEN + l);
+    }
+    uint32_t at = (page + 2u) * p;
+    s->flags = F_NEW | F_CLEAR;
+    if (at + HDR_LEN + 1u <= fs->cfg->sector_size) {
+        s->off = (uint16_t)at;
+        s->flags = F_FIRM | F_CLEAR;
+    }
     return ALFS_OK;
 }
 
@@ -808,6 +1040,8 @@ int32_t alfs_append(alfs_t *fs, alfs_stream_t *s, const void *data, uint32_t len
     uint32_t cap = capacity(fs, s);
     if (s->used >= cap) {
         int rc = put_chunk(fs, s);
+        if (rc == AGAIN)
+            return 0;
         if (rc)
             return rc;
         cap = capacity(fs, s);
@@ -824,6 +1058,8 @@ int alfs_sync(alfs_t *fs, alfs_stream_t *s) {
     if (!s->used)
         return ALFS_OK;
     int rc = put_chunk(fs, s);
+    if (rc == AGAIN)
+        return ALFS_BUSY;
     return rc ? rc : s->used ? ALFS_BUSY : ALFS_OK;
 }
 
@@ -846,6 +1082,7 @@ int alfs_open_read(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id) {
     memset(s, 0, sizeof(*s));
     s->id = id;
     s->seq = id;
+    s->index = 0;
     s->buf = buf;
     s->sector = (uint16_t)first;
     s->off = (uint16_t)off_data(fs);
@@ -874,14 +1111,16 @@ int32_t alfs_read(alfs_t *fs, alfs_stream_t *s, void *out, uint32_t len) {
             guard--;
             continue;
         }
-        uint32_t k = s->sector, seq = 0;
-        rc = next_sector(fs, s->id, s->seq, &k, &seq);
+        uint32_t k = s->sector, n = 0;
+        rc = next_sector(fs, s->id, s->index, &k, &n);
         if (rc == ALFS_ENOENT)
             return 0;
         if (rc)
             return rc;
+        if (n != s->index + 1u)
+            fs->n.check_failures++; /* SAFE-12: a sector missing */
         s->sector = (uint16_t)k;
-        s->seq = seq;
+        s->index = (uint16_t)n;
         s->off = (uint16_t)off_data(fs);
     }
     return 0;

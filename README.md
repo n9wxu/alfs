@@ -9,12 +9,14 @@ block is less important than a broken exec loop. In flight, nothing erases:
 every append programs flash that was erased ahead of time, and the caller
 schedules erases in steps.
 
-**Status:** draft 1, 2026-10-14. Requirements, tests and code; every test
-passes (`make test`), and the Cortex-M0+ budgets hold (`make target`):
-5.3 KB of code against littlefs's 15.5 KB on the same build. On littlefs's
-10-minute logging workload at 50 rows a second it erases 168 sectors, all
-in erase steps the caller schedules, where littlefs 2.11.3 erases 807 in
-its append path. Not yet run on hardware.
+**Status:** format version 2, 2026-10-14. Requirements, tests and code;
+all 39 tests pass under the sanitizers (`make test`), and the Cortex-M0+
+budgets hold (`make target`): 6.8 KB of code against littlefs's 15.5 KB on
+the same build. On littlefs's 10-minute logging workload at 50 rows a
+second it erases 168 sectors, all in erase steps the caller schedules,
+where littlefs 2.11.3 erases 807 in its append path. The flash assumptions
+it rests on were measured on the chips of pyro's boards
+(`docs/FLASH_PROBE.md`); alfs itself has not yet run on hardware.
 
 | Path | What |
 |---|---|
