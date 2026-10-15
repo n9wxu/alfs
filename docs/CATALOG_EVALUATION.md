@@ -1,7 +1,9 @@
 # A file catalog: evaluation
 
 **Status: options for a decision, 2026-10-14.** Nothing here is built. The
-v1 format (`docs/SPEC.md`) is unchanged.
+v1 format (`docs/SPEC.md`) is unchanged. **Revised by `docs/V2_STRATEGY.md`:**
+judged by "minimize writes", D0+ (the claim's sector number) is
+recommended over D2, since every catalog adds programs and erases.
 
 ---
 

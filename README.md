@@ -26,6 +26,7 @@ its append path. Not yet run on hardware.
 | `docs/datasheets/` | the flash parts the figures come from |
 | `probe/`, `docs/FLASH_PROBE.md` | the flash probe, which measures the chips themselves, and what it found |
 | `docs/CATALOG_EVALUATION.md` | a file catalog: options and their costs, for a decision |
+| `docs/V2_STRATEGY.md` | what the probe changes: the proposed v2, for a decision |
 
 The use cases come from the pyro flight computer
 (github.com/n9wxu/pyro_fw); the flash fault model from the littlefs v3 work
