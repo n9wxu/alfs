@@ -7,6 +7,7 @@ docs/probe_results/, and reboots the board into its own firmware.
 
     run_probe.py --list
     run_probe.py [--board KIND|SERIAL] [--all] [--cycles N] [--selftest]
+    run_probe.py [--board KIND|SERIAL] [--all] --torn
 
 Boards are found on USB, never named in this file: only the flash layout of
 each board kind is, mirrored from pyro's boards/<kind>/board.cmake.
@@ -161,7 +162,10 @@ def run_board(board, args):
         try:
             probe.send("id")
             ident = probe.answer(10)
-            command = f"run {addr:#x} {args.sectors} {args.cycles} {seed}" + (" selftest" if args.selftest else "")
+            if args.torn:
+                command = f"torn {addr:#x} {args.sectors} {seed}"
+            else:
+                command = f"run {addr:#x} {args.sectors} {args.cycles} {seed}" + (" selftest" if args.selftest else "")
             probe.send(command)
             while True:
                 a = probe.answer(600)
@@ -172,6 +176,8 @@ def run_board(board, args):
                           f"{a['mismatches']} mismatches, {a['seconds']} s")
                 if "mismatch" in a or "blank_failure" in a or "error" in a:
                     print(f"  {a}")
+                if "p8_summary" in a or "p9_summary" in a:
+                    print(f"  {a}")
                 if a.get("done"):
                     done = a
                     break
@@ -179,13 +185,14 @@ def run_board(board, args):
             probe.send("reboot")
             probe.port.close()
 
-    name = f"{ident['jedec']}_{kind}_{ident['uid'][-6:]}_{when[:10]}" + ("_selftest" if args.selftest else "")
+    name = f"{ident['jedec']}_{kind}_{ident['uid'][-6:]}_{when[:10]}"
+    name += "_torn" if args.torn else "_selftest" if args.selftest else ""
     path = RESULTS / f"{name}.jsonl"
     tmp.rename(path)
     wait_for(f"{board['product']} back in its firmware", lambda: at_location(board["location"], PYRO_PID), 60)
     verdict = "PASS" if done["pass"] else "FAIL"
     print(f"  {verdict}: {done['mismatches']} mismatches, {done['programs']} programs, "
-          f"{done['erases']} erases, {done['seconds']} s; {path.relative_to(ROOT)}")
+          f"{done['erases']} erases, {done['seconds']} s; {path.relative_to(ROOT)}", flush=True)
     return done["pass"]
 
 
@@ -199,6 +206,7 @@ def main():
     ap.add_argument("--seed", type=lambda s: int(s, 0))
     ap.add_argument("--addr", type=lambda s: int(s, 0), help="test sectors' address, overriding the layout")
     ap.add_argument("--selftest", action="store_true", help="plant one mismatch; the run must report it")
+    ap.add_argument("--torn", action="store_true", help="P8 and P9: abort programs and erases with a chip reset")
     args = ap.parse_args()
 
     found = boards()

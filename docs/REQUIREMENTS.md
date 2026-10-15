@@ -143,7 +143,7 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | A-6 | The erase value is known and fixed: 0xFF on every part here. | The datasheets |
 | A-7 | A read can fail, as at low supply voltage, and succeed when retried. | The littlefs work's error-handling principle |
 | A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 2,048 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe on 2026-10-14 (`docs/FLASH_PROBE.md`): it held on the W25Q128JV, two XT25F128F and two BY25Q64ES; the W25Q16JV is not yet tested |
-| A-9 | A program that a power cut interrupts never clears a bit its data left 1. Programming the intended bytes again over it leaves them reading as intended on every later read, and changes no other byte. | No datasheet states it. Measured by the probe's P8, which interrupts programs with the chips' software reset (66h then 99h; W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30) as a stand-in for a power cut (`docs/FLASH_PROBE.md`). Assumed until P8 passes |
+| A-9 | A program that a power cut interrupts never clears a bit its data left 1. Programming the intended bytes again over it leaves them reading as intended on every later read, and changes no other byte. | No datasheet states it. Measured by the probe's P8, which interrupts programs with the chips' software reset (66h then 99h; W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30) as a stand-in for a power cut (`docs/FLASH_PROBE.md` section 4). Held on the W25Q128JV and two XT25F128F, 2026-10-14, including bits torn into reading either way; the BY25Q64ES finishes an operation despite the reset, so is untested, as is the W25Q16JV |
 
 A-8 is measured, not read. A part with error correction inside the chip
 breaks it, so a new part is probed before anything relies on A-8. The v1
@@ -545,7 +545,11 @@ alfs appends only into a sector whose erase is known to have completed and
 whose erased state it verified on the ground.
 
 - Priority: 3.
-- Source: the rulings; A-4; ERASENOOP.
+- Source: the rulings; A-4; ERASENOOP. The probe's P9: an erase aborted at
+  a tenth (W25Q128JV) or half (XT25F128F) of its time already reads blank,
+  so a blank check alone cannot show an erase completed; the stamp,
+  programmed after the erase returns done, does (`docs/FLASH_PROBE.md`
+  section 4).
 - Measure: power loss during erase steps, and ERASENOOP sectors.
 - Pass: no append lands in a sector whose erase was interrupted or did
   nothing. Fail: any.

@@ -105,14 +105,68 @@ What the times say:
 
 ---
 
-## 4. Limits
+## 4. Torn programs and erases (P8, P9)
+
+P8 and P9 (`run_probe.py --torn`, `docs/TEST_PLAN.md` section 6) abort a
+program or erase with the chips' software reset, Enable Reset (66h) then
+Reset (99h), at delays swept across the operation's time. Files
+`*_torn.jsonl`, one line a trial.
+
+**A-9 holds wherever a program could be torn.** No torn program ever
+cleared a bit its data left 1, and programming the same data again left
+every byte reading as intended on 16 reads, on every trial.
+
+| Part | Board | Torn 256 B / 18 B (of 128 each) | Trials with bits reading both ways | Stray bits | Wrong after programming again | Verdict |
+|---|---|---|---|---|---|---|
+| W25Q128JV | MK1A | 97 / 27 | 0 | 0 | 0 | holds |
+| XT25F128F | MK1C | 37 / 10 | 25 / 4 (49 / 4 bits) | 0 | 0 | holds |
+| XT25F128F | MK1C_SD | 35 / 13 | 27 / 1 (63 / 3 bits) | 0 | 0 | holds |
+| BY25Q64ES | MK1B_8MB (both) | 0 / 0 | | | | untested: the chip finished every program and erase |
+| W25Q16JV | MK1B | | | | | untested: not attached |
+
+What the trials show:
+
+- **A torn program clears its bits in proportion to the time it ran.** On
+  the W25Q128JV a 256-byte program aborted at 33 us had cleared 55 of 989
+  bits, at 189 us 452, at 377 us 967; the program of the same data again
+  took less time the more had been done (383 us down to 85 us).
+- **The XT25F128F leaves bits that read either way**, littlefs's
+  METASTABLE: a program aborted 17 to 52 us in left a page that read
+  erased but for one or two bits that read 0 on some reads and 1 on others.
+  Such a page passes a single blank check. Programming the intended data
+  again settled every one. This is why a resumed stream skips the page
+  after its last good chunk too (SAFE-04), and why it programs its claim
+  again (A-9).
+- **The BY25Q64ES ignores the reset while busy**, in effect: even 2 us
+  in, every program completed and every erase finished, though its
+  datasheet says a reset terminates "any on-going internal operations"
+  (p. 30). Tearing it needs a power cut, which these boards cannot make.
+
+**An aborted erase reads blank long before it is done (P9).**
+
+| Part | Erase time | Aborted erase reads all 00h until | Reads blank from | Read blank, then not, within 16 reads |
+|---|---|---|---|---|
+| W25Q128JV | 47 ms | about 1 ms | about 4.7 ms | 0 of 64 |
+| XT25F128F (two) | 15 ms | about 6.6 ms | about 8.4 ms | 0 of 128 |
+| BY25Q64ES (two) | 26 ms | not torn | not torn | |
+
+Between those, a few trials read partly erased, with bits reading either
+way. So a blank check cannot tell a finished erase from one cut short at
+a tenth (W25Q128JV) or half (XT25F128F) of its time. alfs does not rely on
+it: a sector is ready only once its stamp is programmed, after the erase
+has returned done (SPEC section 5), and a power cut between leaves no
+stamp, so the sector stays dirty and is erased again.
+
+---
+
+## 5. Limits
 
 - **One chip of each part**, or two where two boards carry it. A-8 says
   nothing about other lots, and nothing about a part not listed here.
 - **Read back at once.** Whether bits cleared by a reprogram keep as well
   as bits programmed once (retention) is not tested.
-- **No power cut during a reprogram.** What a byte holds after one is not
-  known; a format that relies on case 2 must treat such a byte as it
-  treats any torn program.
+- **No real power cut.** P8 and P9 abort by command with the supply
+  steady, a stand-in for a supply collapsing. The BY25Q64ES could not be
+  torn that way at all.
 - **The probe reads with 03h at clk_sys / 6** (20.8 MHz), which is not how
   pyro reads in flight (execute-in-place).
