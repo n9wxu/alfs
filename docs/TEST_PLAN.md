@@ -1,7 +1,7 @@
 # alfs test plan
 
-**Status: draft 1, 2026-10-14.** Written after `docs/REQUIREMENTS.md` and
-before the code. Every test passes on the first implementation. Every requirement names its test there; this document
+**Status: draft 2, 2026-10-14.** Written after `docs/REQUIREMENTS.md` and
+before the code. Draft 2 adds the tests of requirements draft 2. Every test passes on the first implementation. Every requirement names its test there; this document
 says how the tests work and what each one does.
 
 ---
@@ -32,8 +32,13 @@ erase value 0xFF. Its contents start random, as a used chip's are.
 violation, and every test fails on any:
 
 - a program that crosses a page (SPD-03);
-- a prog unit programmed twice between erases (IF-02, the rulings);
-- a program into a page that an interrupted operation touched (SAFE-04);
+- a prog unit programmed twice between erases (IF-02, the rulings),
+  unless every byte of the second program is the byte its first program
+  meant (completing a torn program, A-9);
+- a program into a page that an interrupted operation touched (SAFE-04),
+  with the same exception;
+- data programmed after a claim whose bits read either way, in that
+  sector, with no program of the claim between (SAFE-04);
 - a second erase started while one is suspended (SPD-05).
 
 **It injects the faults of requirements section 4.4:**
@@ -51,6 +56,10 @@ violation, and every test fails on any:
 - **A suspended erase.** `busy_calls`: each erase takes that many calls,
   answering `ALFS_BUSY` until the last.
 - **Bit flips** at any address: `sim_flip`.
+
+**A program is an AND** (A-8): each byte becomes its old value AND the
+data. A bit that reads either way (METASTABLE) settles at 0 when a program
+gives it 0 (A-9), and stays unsettled when given 1.
 
 **It measures.** Totals and per-call counts of operations, programs,
 erases and bytes read; the simulated time of each call at the typical
@@ -128,6 +137,10 @@ alfs's help.
 | `safe_foreign_region` | SAFE-09 | Random and blank regions: `ALFS_ENOFS`. Another sector size, and a region past the chip: `ALFS_EGEOMETRY`. No operation in any. |
 | `safe_fuzz_mount_read` | SAFE-10 | 400 images with bits flipped, headers randomised, headers copied, or everything random but one stamp: mount, list and read every stream, under the sanitizers. |
 | `safe_delete_atomic` | SAFE-11 | Power lost in a delete, each behaviour: the stream whole or gone. A delete that returned survives a remount; its sectors are dirty. |
+| `spd_read_next_bounded` | SPD-10 | Two streams written together and one alone, 600 sectors each way on 2,048: every sector change while reading reads at most the headers between, plus one. |
+| `life_resume_waste` | LIFE-08 | A stream reopened after its last chunk ends at each of 40 positions across a sector: bytes lost under two pages, and one program (the claim) before the first chunk. |
+| `safe_delete_reclaim` | SAFE-11 | Power lost in a delete under METASTABLE, a remount, then power lost at every operation of the erase steps that reclaim it, and a remount: the stream whole or gone. The dead mark is programmed again before the first of its sectors is erased. |
+| `safe_missing_sector` | SAFE-12 | The third of five sectors of a stream made dirty: the other four read in order, one failure counted. |
 | `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
 | `obs_clean` | OBS-03 | Not clean through a format and its suspended erases, clean after, not after a delete, clean again after erase steps. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
@@ -204,8 +217,35 @@ already programmed, as count, minimum, mean and maximum.
 bit of its model after the first P2 program. That run must report exactly
 that mismatch.
 
-**What it does not test:** whether case-2 data keeps (retention), a power
-cut during a reprogram, or more than one chip of each part.
+**P8, torn programs (A-9).** `run_probe.py --torn`. The chips abort a
+program or erase under way when sent Enable Reset (66h) then Reset (99h)
+(W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30), which tears it as a
+power cut would. In each test sector, pages 0-7 take 256-byte programs and
+pages 8-15 18-byte programs (a claim's length) of random data. Each is
+aborted after a delay swept across the program's time: 0 to 500 us for 256
+bytes, 0 to 120 us for 18, in 32 steps a cycle, offset by a quarter step
+each cycle over 4 cycles. After each abort the probe waits 1 ms, reads the
+page 16 times, and records whether the program had finished, not started,
+or been torn; the bits that read both ways; and any bit the data left 1
+that reads 0. Then it programs the same data again and reads the page 16
+times more.
+
+**Pass:** after the second program every read is the data, on every
+trial; no bit the data left 1 ever read 0; the rest of the sector is as
+the model says; and at least one program was torn, or the test proved
+nothing.
+
+**P9, torn erases (A-4, SAFE-05).** Each test sector is programmed 00h
+throughout, then erased, and the erase aborted after a delay swept from
+0 to 60 ms (64 trials). The probe reads the sector 16 times and counts the
+trials whose sector read blank on the first read and not on some later
+one: the hazard an erase step's single blank check is exposed to. Then it
+erases the sector again and checks it blank. P9 measures; it passes when
+every sector comes back blank.
+
+**What it does not test:** whether case-2 data keeps (retention), a real
+power cut (P8 and P9 abort by command, with the supply steady), or more
+than one chip of each part.
 
 Results go to `docs/probe_results/`, and `docs/FLASH_PROBE.md` summarises
 them part by part.

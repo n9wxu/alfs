@@ -3,8 +3,10 @@
 alfs, the append-log flash store: a small filesystem for append-only logs
 on serial NOR flash.
 
-**Status: draft 1, 2026-10-14.** Requirements come first, then the tests
-that verify them (`docs/TEST_PLAN.md`), then the code. No code exists yet.
+**Status: draft 2, 2026-10-14.** Requirements come first, then the tests
+that verify them (`docs/TEST_PLAN.md`), then the code. Draft 2 adds what
+the flash probe found and the changes of `docs/V2_STRATEGY.md`, accepted
+by the user on 2026-10-14.
 
 ---
 
@@ -141,11 +143,16 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | A-6 | The erase value is known and fixed: 0xFF on every part here. | The datasheets |
 | A-7 | A read can fail, as at low supply voltage, and succeed when retried. | The littlefs work's error-handling principle |
 | A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 2,048 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe on 2026-10-14 (`docs/FLASH_PROBE.md`): it held on the W25Q128JV, two XT25F128F and two BY25Q64ES; the W25Q16JV is not yet tested |
+| A-9 | A program that a power cut interrupts never clears a bit its data left 1. Programming the intended bytes again over it leaves them reading as intended on every later read, and changes no other byte. | No datasheet states it. Measured by the probe's P8, which interrupts programs with the chips' software reset (66h then 99h; W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30) as a stand-in for a power cut (`docs/FLASH_PROBE.md`). Assumed until P8 passes |
 
 A-8 is measured, not read. A part with error correction inside the chip
 breaks it, so a new part is probed before anything relies on A-8. The v1
 format does not rely on it: alfs still programs each prog unit once
 (IF-02). It is recorded so that a later format may.
+
+A-9 lets alfs complete a program a power cut may have left half done, by
+programming the same bytes again: a claim when a stream resumes (SAFE-04),
+a dead mark before its stream is reclaimed (SAFE-11).
 
 ### 4.3 Timing and endurance
 
@@ -325,7 +332,11 @@ On W-LOG and W-HR the longest stall of any call is one page program.
 
 - Priority: 1.
 - Source: UC-1, UC-2; littlefs v2.11.3's 96.6 ms and v3's 49.6 to 53.9 ms
-  on W-LOG (the fork's `REQUIREMENTS.md`, Appendix B.1).
+  on W-LOG (the fork's `REQUIREMENTS.md`, Appendix B.1). The user,
+  2026-10-14: "≤1ms writes is OK so the chunk size can be larger". A page
+  program measured at most 0.46 ms on the chips (`docs/FLASH_PROBE.md`),
+  so chunks stay up to a page; the datasheets' maximums (2 to 3 ms) are
+  above 1 ms.
 - Measure: simulated time of each call's operations, at the typical times
   of 4.3.
 - Pass: at most 0.4 ms (one W25Q128JV page program). Fail: more.
@@ -345,6 +356,20 @@ with the bytes the call passes, plus a constant.
   in bytes with no term in region size. Fail: otherwise.
 - Verified by: `spd_cpu_linear` (host); `target_append_256` (RP2040,
   deferred until a target build exists).
+
+#### ALFS-SPD-10
+
+Reading on from one sector of a stream to its next reads the headers of
+at most the sectors between them, in the direction alfs allocates, and
+the next one's.
+
+- Priority: 1.
+- Source: UC-6; v1 read every header in the region at each sector change
+  of a stream written alongside another (`docs/V2_STRATEGY.md` 4.2).
+- Measure: headers read by `alfs_read` at each sector change, reading back
+  one of two streams written together, and of one stream written alone.
+- Pass: at most the sectors between, plus one. Fail: more.
+- Verified by: `spd_read_next_bounded`.
 
 ### 6.2 Flash life (LIFE)
 
@@ -439,6 +464,20 @@ run of dirty sectors that fills one aligned block.
 - Pass: one large erase per aligned block. Fail: sector erases there.
 - Verified by: `life_large_erase`.
 
+#### ALFS-LIFE-08
+
+Resuming a stream after a mount costs at most the rest of the page of its
+last good chunk, the page after it, and one program of the claim.
+
+- Priority: 2.
+- Source: v1 cost up to a sector per resume (SAFE-04 as first written);
+  A-9 makes the rest of that sector usable (`docs/V2_STRATEGY.md` 4.3).
+- Measure: bytes between the end of the last chunk before the mount and
+  the first chunk after it, and programs before that chunk, for every
+  position of the last chunk in its sector.
+- Pass: under two pages, and one program of the claim. Fail: more.
+- Verified by: `life_resume_waste`.
+
 ### 6.3 Safety (SAFE)
 
 #### ALFS-SAFE-01
@@ -481,20 +520,24 @@ next page, counts one failure, and reads on.
 
 #### ALFS-SAFE-04
 
-After a mount, a stream's first program is to a new sector, so nothing
-synced from then on shares a sector with bits a power loss may have left
-half-programmed. An interrupted program that changed nothing (ATOMIC)
-leaves nothing to avoid; littlefs's model treats it as harmless too.
+After a mount, nothing synced shares a page with bits a power loss may
+have left half programmed, and no claim can decay into reclaiming what was
+synced after the mount. A resumed stream's first program is its last
+sector's claim, programmed again with the bytes it reads (A-9). Its next
+chunk starts two pages past the page of its last good chunk, or in a new
+sector when the sector has no such page.
 
 - Priority: 3.
-- Source: A-3; TORNTAIL and METASTABLE: a claim with a bit that reads
-  either way could later read as invalid, and its sector be reclaimed with
-  what was synced into it after the mount. Its cost is at most the rest of
-  one sector per mount.
+- Source: A-3, A-9; TORNTAIL and METASTABLE: the interrupted program was
+  the next chunk in the last good chunk's page, the first chunk of the next
+  page, or a claim. Amended 2026-10-14 (`docs/V2_STRATEGY.md` 4.3): first
+  written as "a new sector after a mount", which cost up to a sector.
 - Measure: the simulator flags a program into a page an interrupted
-  operation changed (every behaviour but ATOMIC).
+  operation changed (every behaviour but ATOMIC), unless it programs bytes
+  that page already reads; and a claim whose bits read either way that
+  is not programmed again before data follows it.
 - Pass: none. Fail: any.
-- Verified by: `safe_no_program_after_torn`.
+- Verified by: `safe_no_program_after_torn`, `safe_powerloss_durable`.
 
 #### ALFS-SAFE-05
 
@@ -576,13 +619,33 @@ Mount and read finish, without a crash, on any content of the region.
 #### ALFS-SAFE-11
 
 A delete is atomic: once it returns, the stream is gone after any power
-loss; before it returns, the stream is whole.
+loss; before it returns, the stream is whole. Before an erase step erases
+any sector of a deleted stream, it programs the stream's dead mark again
+with 00h (A-9), so a mark a power loss left half programmed cannot read as
+live once the reclaim has begun.
 
 - Priority: 3.
-- Source: UC-4.
-- Measure: power loss at every operation of a delete; remount.
+- Source: UC-4; METASTABLE: a half-programmed mark could read deleted at
+  one mount and live at the next, after some sectors were erased. Amended
+  2026-10-14 (`docs/V2_STRATEGY.md` 4.4).
+- Measure: power loss at every operation of a delete; remount; then power
+  loss at every operation of the erase steps that reclaim it; remount.
 - Pass: the stream is whole or gone, never partial. Fail: partial.
-- Verified by: `safe_delete_atomic`.
+- Verified by: `safe_delete_atomic`, `safe_delete_reclaim`.
+
+#### ALFS-SAFE-12
+
+A stream's sectors are numbered in order. A number missing when reading is
+counted as one failed check, and reading goes on with the next sector
+present.
+
+- Priority: 3.
+- Source: UC-6; v1 passed over a lost sector silently
+  (`docs/V2_STRATEGY.md` 4.2).
+- Measure: a sector of a stream made dirty, then the stream read.
+- Pass: every other sector's chunks read, in order, and one failure
+  counted. Fail: otherwise.
+- Verified by: `safe_missing_sector`.
 
 ### 6.4 Simplicity (SIMP)
 
@@ -669,12 +732,15 @@ erase.
 The geometry is configured: sector and page size (powers of two, sector at
 least four pages), prog unit (a power of two up to a page), the region's
 start and length (sector-aligned), the chip's size, and the erase value.
-alfs never programs a prog unit twice between erases.
+alfs programs a prog unit at most once between erases, except to complete
+a program a power loss may have interrupted (A-9): a claim again with the
+bytes it reads, a dead mark again with 00h.
 
 - Priority: S.
 - Verified by: `if_geometry` (every combination the tests use is
   accepted; misaligned or oversized ones are refused); every test (the
-  simulator refuses a program into a prog unit already programmed).
+  simulator refuses a program into a prog unit already programmed, except
+  those two).
 
 #### ALFS-IF-03
 
@@ -693,6 +759,18 @@ and an identity alfs assigns, unique for the life of the region.
 - Priority: S.
 - Source: UC-4, UC-6.
 - Verified by: `if_list_streams`.
+
+#### ALFS-IF-05
+
+The driver programs exactly the bytes alfs passes it, and no others. On
+the BY25Q64ES a page padded with the erase value takes 3.2 times as long as
+its 16 programmed bytes sent alone (`docs/FLASH_PROBE.md` section 3).
+
+- Priority: S.
+- Source: the probe, 2026-10-14; pyro's flash path programs whole pages
+  (`src/littlefs_driver.c`, `prog_size = FLASH_PAGE_SIZE`).
+- Verified by: review of each driver; the simulator counts the bytes of
+  each program.
 
 ### 6.6 Observability and errors (OBS)
 
@@ -734,10 +812,10 @@ launch until all unused flash is erased.
 |---|---|
 | UC-1 flight log | SPD-01 to SPD-05, SPD-08, SPD-09, LIFE-02, LIFE-03 |
 | UC-2 high-rate log | SPD-02, SPD-03, SPD-08, LIFE-02 |
-| UC-3 resume | SPD-06, SPD-07, SAFE-04 |
+| UC-3 resume | SPD-06, SPD-07, SAFE-04, LIFE-08 |
 | UC-4 newest flights | IF-04, SAFE-11 |
 | UC-5 erase before flight | SPD-05, LIFE-01, LIFE-07, SAFE-05, OBS-01, OBS-03 |
-| UC-6 read back | SAFE-03, SAFE-08, IF-04 |
+| UC-6 read back | SAFE-03, SAFE-08, SAFE-12, SPD-10, IF-04 |
 | UC-7 power cut | SAFE-01, SAFE-02, SAFE-04 |
 | UC-8 wrong geometry | SAFE-09, IF-02 |
 | UC-9 write failures | SAFE-06, OBS-01 |

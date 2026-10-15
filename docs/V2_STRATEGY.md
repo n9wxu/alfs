@@ -1,6 +1,10 @@
 # alfs v2: what the probe changes
 
-**Status: a proposal for a decision, 2026-10-14.** Nothing here is built.
+**Status: accepted, 2026-10-14.** The user: "1. I accept the changes, 2.
+≤1ms writes is OK so the chunk size can be larger. 3. run the torn write
+test." So changes 1 to 4 go ahead, no catalog is built, chunks stay up to
+a page (at most 0.46 ms measured), and P8 and P9 run before changes 3 and
+4 rely on A-9.
 It follows `docs/FLASH_PROBE.md` and revises the recommendation of
 `docs/CATALOG_EVALUATION.md`.
 
