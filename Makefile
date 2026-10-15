@@ -1,6 +1,7 @@
 # alfs: `make test` runs the host suite under the address and undefined
 # behaviour sanitizers; `make target` checks the Cortex-M0+ budgets of
 # SIMP-02 to SIMP-04. T=name runs the tests whose names contain it.
+# `make probe` builds the flash probe (docs/TEST_PLAN.md section 6).
 
 CC ?= cc
 ARMCC ?= arm-none-eabi-gcc
@@ -8,6 +9,8 @@ ARMSIZE ?= arm-none-eabi-size
 WARN = -std=c99 -Wall -Wextra -Werror -pedantic
 CFLAGS = $(WARN) -O1 -g -I. -Itests
 SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+PICO_SDK_PATH ?= $(HOME)/.pico-sdk/sdk/2.2.0
+PICO_TOOLCHAIN_PATH ?= $(HOME)/.pico-sdk/toolchain/14_2_Rel1
 
 all: test
 
@@ -32,7 +35,11 @@ target: | build
 	$(ARMSIZE) build/alfs_m0.o
 	sh tests/check_target.sh build/alfs_m0.o build/alfs_m0.ci
 
+probe:
+	cmake -S probe -B build/probe -G Ninja -DPICO_SDK_PATH=$(PICO_SDK_PATH) -DPICO_TOOLCHAIN_PATH=$(PICO_TOOLCHAIN_PATH)
+	cmake --build build/probe
+
 clean:
 	rm -rf build
 
-.PHONY: all test tests-compile target clean
+.PHONY: all test tests-compile target probe clean
