@@ -1,0 +1,25 @@
+{"host": {"product": "Pyro MK1B_8MB", "kind": "mk1b_8mb", "usb_serial": "0237CA1FB1A0", "date": "2026-10-14T19:27:29-07:00"}}
+{"jedec":"684017","bytes":8388608,"uid":"35343239330594F3FFFCA50EFF851D20","sr":[0,2,64],"clk_sys":125000000,"ssi_div":6}
+{"run":{"addr":4177920,"sectors":4,"cycles":20,"seed":20261014,"selftest":false}}
+{"cycle":0,"programs":39152,"mismatches":0,"seconds":7}
+{"cycle":1,"programs":78304,"mismatches":0,"seconds":15}
+{"cycle":2,"programs":117456,"mismatches":0,"seconds":23}
+{"cycle":3,"programs":156608,"mismatches":0,"seconds":31}
+{"cycle":4,"programs":195760,"mismatches":0,"seconds":39}
+{"cycle":5,"programs":234912,"mismatches":0,"seconds":47}
+{"cycle":6,"programs":274064,"mismatches":0,"seconds":55}
+{"cycle":7,"programs":313216,"mismatches":0,"seconds":63}
+{"cycle":8,"programs":352368,"mismatches":0,"seconds":71}
+{"cycle":9,"programs":391520,"mismatches":0,"seconds":79}
+{"cycle":10,"programs":430672,"mismatches":0,"seconds":87}
+{"cycle":11,"programs":469824,"mismatches":0,"seconds":94}
+{"cycle":12,"programs":508976,"mismatches":0,"seconds":102}
+{"cycle":13,"programs":548128,"mismatches":0,"seconds":110}
+{"cycle":14,"programs":587280,"mismatches":0,"seconds":118}
+{"cycle":15,"programs":626432,"mismatches":0,"seconds":126}
+{"cycle":16,"programs":665584,"mismatches":0,"seconds":134}
+{"cycle":17,"programs":704736,"mismatches":0,"seconds":142}
+{"cycle":18,"programs":743888,"mismatches":0,"seconds":150}
+{"cycle":19,"programs":783040,"mismatches":0,"seconds":158}
+{"timing":[{"len":1,"reprogram":false,"padded":false,"count":102560,"min_us":58,"mean_us":60,"max_us":102},{"len":1,"reprogram":true,"padded":false,"count":658480,"min_us":17,"mean_us":55,"max_us":104},{"len":256,"reprogram":false,"padded":false,"count":400,"min_us":328,"mean_us":397,"max_us":458},{"len":256,"reprogram":true,"padded":false,"count":640,"min_us":315,"mean_us":360,"max_us":435},{"len":256,"reprogram":false,"padded":true,"count":249,"min_us":203,"mean_us":252,"max_us":349},{"len":256,"reprogram":true,"padded":true,"count":9991,"min_us":47,"mean_us":232,"max_us":354},{"len":2,"reprogram":false,"padded":false,"count":80,"min_us":59,"mean_us":60,"max_us":62},{"len":4,"reprogram":false,"padded":false,"count":5200,"min_us":59,"mean_us":61,"max_us":84},{"len":8,"reprogram":false,"padded":false,"count":80,"min_us":60,"mean_us":67,"max_us":85},{"len":16,"reprogram":false,"padded":false,"count":80,"min_us":76,"mean_us":78,"max_us":99},{"len":64,"reprogram":false,"padded":false,"count":80,"min_us":130,"mean_us":149,"max_us":170},{"len":128,"reprogram":false,"padded":false,"count":80,"min_us":201,"mean_us":245,"max_us":282},{"len":4,"reprogram":true,"padded":false,"count":5120,"min_us":59,"mean_us":61,"max_us":84}],"erase":{"count":84,"min_us":565,"mean_us":25924,"max_us":31662}}
+{"done":true,"pass":true,"mismatches":0,"blank_failures":0,"timeouts":0,"wel_failures":0,"programs":783040,"erases":84,"left_blank":true,"seconds":158}

@@ -21,6 +21,22 @@ file and PDF page, not memory. Copied from the pyro firmware's
 | XT25F128F | 0.4 / 2 ms (p. 55) | 40 / 800 ms (p. 56) | 250 / 1,600 ms (p. 56) | 100,000, minimum (p. 2) | erase and program; tSUS 20 us, resume to suspend 500 us at least (pp. 43, 55) |
 | BY25Q64ES | 0.45 / 2.4 ms (p. 71) | 35 / 300 ms (p. 71) | 180 / 2,000 ms (p. 71) | 100k, typical (p. 2) | erase only; tESL 30 us (pp. 62, 71) |
 
+## Figures measured
+
+By the flash probe on 2026-10-14 (`docs/FLASH_PROBE.md`), means over 20
+cycles of four sectors, from the end of the command to the chip done:
+
+| Part | 1-4 byte program | Page program | 4 KB erase |
+|---|---|---|---|
+| W25Q128JV | 21-26 us | 0.40 ms | 47 ms |
+| XT25F128F (two chips) | 55-56 us | 0.20 ms | 15 ms |
+| BY25Q64ES (two chips) | 59-61 us | 0.35-0.40 ms | 26 ms |
+
+The XT25F128F's and BY25Q64ES's one-byte times exceed their datasheets'
+50 us maximum (XT25F128F p. 55, BY25Q64ES p. 71). Programming bytes
+already programmed (case 2) worked on every chip, which no datasheet here
+promises.
+
 Partial page programs: each part programs fewer than 256 bytes "without
 having any effect on other bytes within the same page" (W25Q16JV p. 34,
 W25Q128JV p. 37, XT25F128F p. 36, BY25Q64ES pp. 56-57). None states a limit

@@ -134,13 +134,13 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | # | Assumption | Source |
 |---|---|---|
 | A-1 | A program moves bits only away from the erase value; only an erase moves them back. | Every NOR part |
-| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit. The probe programs a page 256 times (A-8) |
+| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit. The probe programmed pages 2,048 times (A-8) |
 | A-3 | A program interrupted by power loss changes no byte outside its own page. | The littlefs fork assumes the same of a prog (`lfs3.h`, `gc_preerase_count`) |
 | A-4 | An erase interrupted by power loss changes no byte outside its own sector, and may leave that sector in any state, including one that reads as erased but holds bits that read randomly. | littlefs's METASTABLE behaviour (4.4) |
 | A-5 | Operations complete in the order issued; there is no write-back cache. | Raw serial NOR |
 | A-6 | The erase value is known and fixed: 0xFF on every part here. | The datasheets |
 | A-7 | A read can fail, as at low supply voltage, and succeed when retried. | The littlefs work's error-handling principle |
-| A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 256 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe (`docs/FLASH_PROBE.md`) |
+| A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 2,048 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe on 2026-10-14 (`docs/FLASH_PROBE.md`): it held on the W25Q128JV, two XT25F128F and two BY25Q64ES; the W25Q16JV is not yet tested |
 
 A-8 is measured, not read. A part with error correction inside the chip
 breaks it, so a new part is probed before anything relies on A-8. The v1
@@ -161,6 +161,12 @@ erase, so a driver can return before an erase ends and resume it later.
 On the RP2040 a program or erase stops every core that runs code from the
 same chip for its whole duration (`rp2040-datasheet_2025-02-20.pdf`
 p. 136).
+
+Measured on the chips themselves (`docs/FLASH_PROBE.md`), a program of 1
+to 4 bytes takes 21-26 us on the W25Q128JV and 55-61 us on the XT25F128F
+and BY25Q64ES; a whole page 0.2-0.4 ms; a sector erase 15 ms (XT25F128F),
+26 ms (BY25Q64ES) and 47 ms (W25Q128JV). The requirements keep the
+datasheets' figures.
 
 ### 4.4 Faults
 

@@ -1,0 +1,25 @@
+{"host": {"product": "Pyro MK1C_SD", "kind": "mk1c_sd", "usb_serial": "02373331FF2A", "date": "2026-10-14T19:55:21-07:00"}}
+{"jedec":"0B4018","bytes":16777216,"uid":"41503459373331FFFFFFFF1500640027","sr":[0,2,0],"clk_sys":125000000,"ssi_div":6}
+{"run":{"addr":8372224,"sectors":4,"cycles":20,"seed":20261014,"selftest":false}}
+{"cycle":0,"programs":39152,"mismatches":0,"seconds":7}
+{"cycle":1,"programs":78304,"mismatches":0,"seconds":15}
+{"cycle":2,"programs":117456,"mismatches":0,"seconds":22}
+{"cycle":3,"programs":156608,"mismatches":0,"seconds":30}
+{"cycle":4,"programs":195760,"mismatches":0,"seconds":38}
+{"cycle":5,"programs":234912,"mismatches":0,"seconds":46}
+{"cycle":6,"programs":274064,"mismatches":0,"seconds":53}
+{"cycle":7,"programs":313216,"mismatches":0,"seconds":61}
+{"cycle":8,"programs":352368,"mismatches":0,"seconds":69}
+{"cycle":9,"programs":391520,"mismatches":0,"seconds":76}
+{"cycle":10,"programs":430672,"mismatches":0,"seconds":84}
+{"cycle":11,"programs":469824,"mismatches":0,"seconds":92}
+{"cycle":12,"programs":508976,"mismatches":0,"seconds":99}
+{"cycle":13,"programs":548128,"mismatches":0,"seconds":107}
+{"cycle":14,"programs":587280,"mismatches":0,"seconds":115}
+{"cycle":15,"programs":626432,"mismatches":0,"seconds":122}
+{"cycle":16,"programs":665584,"mismatches":0,"seconds":130}
+{"cycle":17,"programs":704736,"mismatches":0,"seconds":138}
+{"cycle":18,"programs":743888,"mismatches":0,"seconds":145}
+{"cycle":19,"programs":783040,"mismatches":0,"seconds":153}
+{"timing":[{"len":1,"reprogram":false,"padded":false,"count":102560,"min_us":55,"mean_us":56,"max_us":68},{"len":1,"reprogram":true,"padded":false,"count":658480,"min_us":22,"mean_us":52,"max_us":68},{"len":256,"reprogram":false,"padded":false,"count":400,"min_us":198,"mean_us":200,"max_us":222},{"len":256,"reprogram":true,"padded":false,"count":640,"min_us":193,"mean_us":199,"max_us":220},{"len":256,"reprogram":false,"padded":true,"count":249,"min_us":89,"mean_us":95,"max_us":100},{"len":256,"reprogram":true,"padded":true,"count":9991,"min_us":24,"mean_us":86,"max_us":100},{"len":2,"reprogram":false,"padded":false,"count":80,"min_us":55,"mean_us":56,"max_us":57},{"len":4,"reprogram":false,"padded":false,"count":5200,"min_us":55,"mean_us":56,"max_us":68},{"len":8,"reprogram":false,"padded":false,"count":80,"min_us":60,"mean_us":60,"max_us":62},{"len":16,"reprogram":false,"padded":false,"count":80,"min_us":64,"mean_us":66,"max_us":67},{"len":64,"reprogram":false,"padded":false,"count":80,"min_us":91,"mean_us":92,"max_us":95},{"len":128,"reprogram":false,"padded":false,"count":80,"min_us":128,"mean_us":129,"max_us":132},{"len":4,"reprogram":true,"padded":false,"count":5120,"min_us":55,"mean_us":56,"max_us":68}],"erase":{"count":84,"min_us":6893,"mean_us":15459,"max_us":17937}}
+{"done":true,"pass":true,"mismatches":0,"blank_failures":0,"timeouts":0,"wel_failures":0,"programs":783040,"erases":84,"left_blank":true,"seconds":153}
