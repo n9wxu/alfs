@@ -152,7 +152,10 @@ format does not rely on it: alfs still programs each prog unit once
 
 A-9 lets alfs complete a program a power cut may have left half done, by
 programming the same bytes again: a claim when a stream resumes (SAFE-04),
-a dead mark before its stream is reclaimed (SAFE-11).
+a dead mark before its stream is reclaimed (SAFE-11). A-8 and A-9 are about
+parts that program single bytes. With a larger prog unit (a part with error
+correction), alfs programs nothing twice: a resumed stream goes on in a new
+sector, and no mark is programmed again.
 
 ### 4.3 Timing and endurance
 
@@ -317,13 +320,16 @@ no flash operation.
 #### ALFS-SPD-07
 
 Opening a stream to append, after a mount, reads at most 60 bytes of each
-sector, and performs no flash operation.
+sector and the chunks of the stream's last sector, and performs no flash
+operation.
 
 - Priority: 1.
 - Source: UC-3.
 - Measure: bytes read by `alfs_open_append` on a stream whose last sector
   is full of short chunks.
-- Pass: at most 60 times the number of sectors. Fail: more.
+- Pass: at most 60 times the number of sectors, plus one sector. Fail:
+  more. Amended 2026-10-14: resuming in the last sector (SAFE-04) must find
+  its last good chunk.
 - Verified by: `spd_reopen_reads_bounded`.
 
 #### ALFS-SPD-08
@@ -353,7 +359,9 @@ with the bytes the call passes, plus a constant.
   counter or cycle-accurate model) against bytes passed; on an RP2040 at
   125 MHz, the time of an append and sync of 256 bytes.
 - Pass: on the RP2040, at most 100 us for 256 bytes; on the host, linear
-  in bytes with no term in region size. Fail: otherwise.
+  in bytes with no term in region size. Fail: otherwise. The exception is
+  the call that takes a resumed stream's first new sector, which reads
+  each sector's header once (SAFE-04).
 - Verified by: `spd_cpu_linear` (host); `target_append_256` (RP2040,
   deferred until a target build exists).
 
@@ -466,8 +474,9 @@ run of dirty sectors that fills one aligned block.
 
 #### ALFS-LIFE-08
 
-Resuming a stream after a mount costs at most the rest of the page of its
-last good chunk, the page after it, and one program of the claim.
+With a prog unit of 1, resuming a stream after a mount costs at most the
+rest of the page of its last good chunk, the page after it, and one
+program of the claim.
 
 - Priority: 2.
 - Source: v1 cost up to a sector per resume (SAFE-04 as first written);
@@ -525,19 +534,32 @@ have left half programmed, and no claim can decay into reclaiming what was
 synced after the mount. A resumed stream's first program is its last
 sector's claim, programmed again with the bytes it reads (A-9). Its next
 chunk starts two pages past the page of its last good chunk, or in a new
-sector when the sector has no such page.
+sector when the sector has no such page. Before it claims its first new
+sector, alfs programs 00h over every claim that could be the stream's own
+with a later sector number: one that reads valid with the stream's
+identity and a larger number, and one torn that reads erased in every bit
+where the stream's identity, tag, first sector and next number are erased.
+With a prog
+unit over 1, the stream goes on in a new sector instead (A-9).
 
 - Priority: 3.
 - Source: A-3, A-9; TORNTAIL and METASTABLE: the interrupted program was
   the next chunk in the last good chunk's page, the first chunk of the next
   page, or a claim. Amended 2026-10-14 (`docs/V2_STRATEGY.md` 4.3): first
-  written as "a new sector after a mount", which cost up to a sector.
+  written as "a new sector after a mount", which cost up to a sector. The
+  claim cleared ahead: a torn claim of the stream's next sector reads
+  invalid at one mount, the stream then claims that number again, and a
+  later mount reads the torn claim valid: two sectors with one number, the
+  stale one first. A torn claim's bits only ever read erased where they
+  should not (A-9), so its fields read erased wherever what it was meant
+  to hold is erased.
 - Measure: the simulator flags a program into a page an interrupted
   operation changed (every behaviour but ATOMIC), unless it programs bytes
   that page already reads; and a claim whose bits read either way that
   is not programmed again before data follows it.
 - Pass: none. Fail: any.
-- Verified by: `safe_no_program_after_torn`, `safe_powerloss_durable`.
+- Verified by: `safe_no_program_after_torn`, `safe_powerloss_durable`,
+  `safe_resume_torn_claim`.
 
 #### ALFS-SAFE-05
 
@@ -623,10 +645,10 @@ Mount and read finish, without a crash, on any content of the region.
 #### ALFS-SAFE-11
 
 A delete is atomic: once it returns, the stream is gone after any power
-loss; before it returns, the stream is whole. Before an erase step erases
-any sector of a deleted stream, it programs the stream's dead mark again
-with 00h (A-9), so a mark a power loss left half programmed cannot read as
-live once the reclaim has begun.
+loss; before it returns, the stream is whole. With a prog unit of 1,
+before an erase step erases any sector of a deleted stream, it programs the
+stream's dead mark again with 00h (A-9), so a mark a power loss left half
+programmed cannot read as live once the reclaim has begun.
 
 - Priority: 3.
 - Source: UC-4; METASTABLE: a half-programmed mark could read deleted at
@@ -736,15 +758,17 @@ erase.
 The geometry is configured: sector and page size (powers of two, sector at
 least four pages), prog unit (a power of two up to a page), the region's
 start and length (sector-aligned), the chip's size, and the erase value.
-alfs programs a prog unit at most once between erases, except to complete
-a program a power loss may have interrupted (A-9): a claim again with the
-bytes it reads, a dead mark again with 00h.
+alfs programs a prog unit at most once between erases, except, with a
+prog unit of 1, to settle what a power loss may have left half programmed
+(A-8, A-9): a claim again with the bytes it reads, a dead mark again with
+00h, or 00h over a claim cleared ahead (SAFE-04).
 
 - Priority: S.
 - Verified by: `if_geometry` (every combination the tests use is
   accepted; misaligned or oversized ones are refused); every test (the
-  simulator refuses a program into a prog unit already programmed, except
-  those two).
+  simulator refuses a program into a prog unit already programmed, unless
+  the prog unit is 1 and each byte is the byte its programs meant, or
+  00h).
 
 #### ALFS-IF-03
 
@@ -758,11 +782,17 @@ any host reads any image.
 #### ALFS-IF-04
 
 A stream is identified by a 32-bit tag the caller chooses (a flight number)
-and an identity alfs assigns, unique for the life of the region.
+and an identity alfs assigns, unique for the life of the region, even when
+a power loss tore the claim that first used it.
 
 - Priority: S.
-- Source: UC-4, UC-6.
-- Verified by: `if_list_streams`.
+- Source: UC-4, UC-6. Amended 2026-10-14: v1 took one more than the
+  largest valid claim's sequence at mount, so the sequence of a torn claim,
+  and an identity if it was a first claim, could be used again, and the
+  torn claim read valid later. Each stamp now records the next sequence,
+  and a mount takes two more than the largest in any claim or stamp
+  (`docs/SPEC.md` 1.1).
+- Verified by: `if_list_streams`, `if_identity_never_reused`.
 
 #### ALFS-IF-05
 

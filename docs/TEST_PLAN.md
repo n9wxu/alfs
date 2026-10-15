@@ -33,12 +33,10 @@ violation, and every test fails on any:
 
 - a program that crosses a page (SPD-03);
 - a prog unit programmed twice between erases (IF-02, the rulings),
-  unless every byte of the second program is the byte its first program
-  meant (completing a torn program, A-9);
+  unless the prog unit is 1 and every byte of the second program is the
+  byte the programs before it meant, or 00h (settling a torn program, A-9);
 - a program into a page that an interrupted operation touched (SAFE-04),
   with the same exception;
-- data programmed after a claim whose bits read either way, in that
-  sector, with no program of the claim between (SAFE-04);
 - a second erase started while one is suspended (SPD-05).
 
 **It injects the faults of requirements section 4.4:**
@@ -58,8 +56,9 @@ violation, and every test fails on any:
 - **Bit flips** at any address: `sim_flip`.
 
 **A program is an AND** (A-8): each byte becomes its old value AND the
-data. A bit that reads either way (METASTABLE) settles at 0 when a program
-gives it 0 (A-9), and stays unsettled when given 1.
+data. A torn program's bit that reads either way (METASTABLE) is one its
+data clears, as the probe found (P8); it settles at 0 when a program gives
+it 0 (A-9), and stays unsettled when given 1.
 
 **It measures.** Totals and per-call counts of operations, programs,
 erases and bytes read; the simulated time of each call at the typical
@@ -108,7 +107,7 @@ alfs's help.
 | Test | Requirement | What it does |
 |---|---|---|
 | `if_geometry` | IF-02 | Formats and mounts with prog units 1, 16 and 256; refuses eight bad geometries and a bad erase value with no operation; refuses to mount with a prog unit or region size other than the format's. |
-| `if_endian` | IF-03, SIMP-05 | Checks the stamp's bytes against `docs/SPEC.md`: the magic, the geometry, the generation and erase count as little-endian words, the CRC. |
+| `if_endian` | IF-03, SIMP-05 | Checks the stamp's and a claim's bytes against `docs/SPEC.md`: the magic, version 2, the geometry, the generation, erase count and sequence floor as little-endian words, the claim's fields, the CRCs. |
 | `if_list_streams` | IF-04 | Five streams, one deleted: listed in growing identity, the deleted one missing, the same after a remount. |
 | `basic_round_trip` | (all) | Seven sizes, 1 byte to 20,000, three prog units: written, read, remounted, read. |
 | `spd_no_erase_outside_erase_step` | SPD-01 | W-LOG at both rates and three prog units, two minutes, with erase steps. |
@@ -116,7 +115,7 @@ alfs's help.
 | `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no operation, from append and sync; one erase step later the held bytes are written and read back. |
 | `spd_busy_erase_resumes` | SPD-05 | Erases that take five calls: format and erase steps return `ALFS_BUSY` 31 times and finish 8 sectors. |
 | `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 60 bytes a sector and does no operation. |
-| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most 60 bytes a sector, and does no operation. |
+| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most 60 bytes a sector and one sector more, and does no operation. |
 | `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second, three prog units: no call stalls longer than one program. |
 | `spd_cpu_linear` | SPD-09 | The same appends and syncs on 32 and 2,048 sectors: the same reads, and about the same processor time. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
@@ -126,7 +125,7 @@ alfs's help.
 | `life_erase_count_persists` | LIFE-05 | W-RING, a remount: the least and greatest counts alfs reports equal the simulator's. |
 | `life_partial_program_cap` | LIFE-06 | 1,000 three-byte syncs: at most 16 programs a page, and at most 4 when configured so. |
 | `life_large_erase` | LIFE-07 | Four 64 KB blocks, all dirty but the formatted sector: three large erases and 16 sector erases. |
-| `safe_powerloss_durable` | SAFE-01 | For each behaviour and prog units 1 and 16, power lost at every operation of a 20-second W-LOG with erase steps; remount; every synced byte reads back, nothing beyond what was appended; resume and read again. |
+| `safe_powerloss_durable` | SAFE-01 | For each behaviour and prog units 1 and 16, power lost at every operation of a 20-second W-LOG with erase steps; remount; every synced byte reads back, nothing beyond what was appended; resume; then remount, erase steps and read, twice. |
 | `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss during the resume in every third case. |
 | `safe_no_program_after_torn` | SAFE-04 | The same runs, for the simulator's check that nothing programs a page a power loss touched. |
 | `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a chunk: what reads back is the stream with at most one run cut out, and one failure counted when one was. |
@@ -137,9 +136,11 @@ alfs's help.
 | `safe_foreign_region` | SAFE-09 | Random and blank regions: `ALFS_ENOFS`. Another sector size, and a region past the chip: `ALFS_EGEOMETRY`. No operation in any. |
 | `safe_fuzz_mount_read` | SAFE-10 | 400 images with bits flipped, headers randomised, headers copied, or everything random but one stamp: mount, list and read every stream, under the sanitizers. |
 | `safe_delete_atomic` | SAFE-11 | Power lost in a delete, each behaviour: the stream whole or gone. A delete that returned survives a remount; its sectors are dirty. |
-| `spd_read_next_bounded` | SPD-10 | Two streams written together and one alone, 600 sectors each way on 2,048: every sector change while reading reads at most the headers between, plus one. |
+| `spd_read_next_bounded` | SPD-10 | Two streams of 200 sectors written together on 512 sectors, and one alone: reading one of the pair reads at most one header more a sector than reading the one alone. |
 | `life_resume_waste` | LIFE-08 | A stream reopened after its last chunk ends at each of 40 positions across a sector: bytes lost under two pages, and one program (the claim) before the first chunk. |
 | `safe_delete_reclaim` | SAFE-11 | Power lost in a delete under METASTABLE, a remount, then power lost at every operation of the erase steps that reclaim it, and a remount: the stream whole or gone. The dead mark is programmed again before the first of its sectors is erased. |
+| `safe_resume_torn_claim` | SAFE-04 | Power lost, under METASTABLE, in the claim of a stream's next sector; remount until that claim reads invalid; resume and fill two sectors; then eight remounts with erase steps between: every synced byte reads back, in order, and nothing from the torn sector. |
+| `if_identity_never_reused` | IF-04 | Power lost, under METASTABLE, in a stream's first claim; remount; a new stream; eight remounts: no two streams share an identity, and the new one reads back whole. |
 | `safe_missing_sector` | SAFE-12 | The third of five sectors of a stream made dirty: the other four read in order, one failure counted. |
 | `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
 | `obs_clean` | OBS-03 | Not clean through a format and its suspended erases, clean after, not after a delete, clean again after erase steps. |
