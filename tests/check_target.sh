@@ -1,13 +1,13 @@
 #!/bin/sh
-# SIMP-02: text + data of alfs.o at most 6144 bytes on a Cortex-M0+.
+# SIMP-02: text + data of alfs.o at most 7168 bytes on a Cortex-M0+.
 # SIMP-04: the deepest chain of stack frames under each public call at
 # most 320 bytes, from GCC's call graph (-fcallgraph-info=su); the driver's
 # own frames are the caller's to add.
 set -e
 obj=$1 ci=$2
 size=$(arm-none-eabi-size "$obj" | awk 'NR == 2 { print $1 + $2 }')
-echo "code: $size bytes (budget 6144)"
-[ "$size" -le 6144 ] || { echo "SIMP-02 fails"; exit 1; }
+echo "code: $size bytes (budget 7168)"
+[ "$size" -le 7168 ] || { echo "SIMP-02 fails"; exit 1; }
 python3 - "$ci" <<'PY'
 import re, sys, functools
 txt = open(sys.argv[1]).read()

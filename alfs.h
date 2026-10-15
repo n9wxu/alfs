@@ -63,8 +63,10 @@ enum {
 typedef struct alfs_driver {
     void *ctx;
     int (*read)(void *ctx, uint32_t addr, void *buf, uint32_t len);
-    /* Program len bytes into erased prog units, never across a page. A
-     * driver that must program whole pages pads with the erase value. */
+    /* Program exactly len bytes, never across a page, and no others:
+     * padding a page with the erase value costs over three times as long
+     * on the BY25Q64ES (IF-05). With a prog unit of 1, alfs programs some bytes a second
+     * time, with what they hold or with zero (docs/SPEC.md 4, 5). */
     int (*prog)(void *ctx, uint32_t addr, const void *buf, uint32_t len);
     /* Erase the sector at addr. ALFS_BUSY: the erase continues (a driver
      * that suspends it); alfs calls again with the same addr to resume. */
@@ -108,13 +110,16 @@ typedef struct alfs {
     uint16_t sectors, ready, dirty, nbad;
     uint16_t alloc_cursor, erase_cursor;
     uint16_t esector;  /* the sector, or a large block's first, being erased */
+    uint16_t firmed;   /* the dead mark last programmed again */
+    uint16_t fresh;    /* a ready sector not to use: where allocation stood */
     uint8_t estate;    /* the erase step's state */
     uint8_t estamped;  /* a large block: sectors stamped so far */
     uint16_t bad[ALFS_BAD_MAX]; /* sectors found bad this mount */
 } alfs_t;
 
-/* A stream's buffer: one page and the room for a claim and a header. */
-#define ALFS_BUF_SIZE(page_size) ((page_size) + 24u)
+/* A stream's buffer: one page, and room for a stamp, a dead mark, a claim
+ * and a chunk header ahead of it. */
+#define ALFS_BUF_SIZE(page_size) ((page_size) + 53u)
 
 /* An open stream. The caller supplies it and its buffer. Opaque. */
 typedef struct alfs_stream {
@@ -126,6 +131,7 @@ typedef struct alfs_stream {
     uint16_t off;   /* where the next chunk is, in the sector */
     uint16_t used;  /* append: bytes buffered; read: bytes left in buf */
     uint16_t first; /* append: the first sector; read: the chunk's length */
+    uint16_t index; /* the current sector's number in the stream */
     uint8_t mode;
     uint8_t page_progs;
     uint8_t fails;
@@ -179,7 +185,10 @@ int alfs_create(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t tag);
 
 /*
  * Reopens a stream to append to it, after a reset. Its next chunk starts on
- * a page no interrupted program can have touched. ALFS_ENOENT, ALFS_EIO.
+ * a page no interrupted program can have touched: two pages past its last
+ * good chunk, after its claim is programmed again (prog unit 1), or in a new
+ * sector. Reads the last sector's chunks; no flash operation. ALFS_ENOENT,
+ * ALFS_EIO.
  */
 int alfs_open_append(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id);
 
@@ -193,15 +202,19 @@ int alfs_open_read(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id);
 /*
  * Appends up to len bytes and returns how many it took, >= 0. When the
  * chunk being built is full it is programmed first: one program at most.
- * Errors, nothing taken: ALFS_ENOSPC, ALFS_EPROG, ALFS_ELOST (see above).
+ * It may take 0 when that program settled something instead (a resumed
+ * stream's claim, a claim cleared ahead, the first ready sector after a
+ * mount): call again. Errors, nothing taken: ALFS_ENOSPC, ALFS_EPROG,
+ * ALFS_ELOST (see above).
  */
 int32_t alfs_append(alfs_t *fs, alfs_stream_t *s, const void *data, uint32_t len);
 
 /*
  * Makes every byte appended so far durable: programs the chunk being built.
- * One program at most. ALFS_OK; ALFS_BUSY when bytes remain, which happens
- * only after a failed program moved the stream to a new sector with less
- * room in its first page: call again. Errors as alfs_append.
+ * One program at most. ALFS_OK; ALFS_BUSY when bytes remain: after a failed
+ * program moved the stream to a new sector with less room in its first page,
+ * or when the program settled something instead (see alfs_append). Call
+ * again. Errors as alfs_append.
  */
 int alfs_sync(alfs_t *fs, alfs_stream_t *s);
 

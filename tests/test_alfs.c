@@ -7,7 +7,7 @@
  * erase step) and record the longest stall (SPD-08). Every test ends with
  * done(), which fails it if the simulator saw a violation: a program
  * across a page, a prog unit programmed twice, or a program into a page a
- * power loss touched.
+ * power loss touched (each but a program that settles, docs/TEST_PLAN.md 2).
  */
 #include "alfs.h"
 #include "sim.h"
@@ -21,6 +21,8 @@
 #define PAGE 256u
 #define LARGE (16u * SECTOR)
 #define ROW 22u
+#define C1 27u /* the claim's offset in a sector, prog unit 1 (docs/SPEC.md 1) */
+#define D1 47u /* the first chunk's */
 
 /* ---- the rig ---------------------------------------------------------- */
 
@@ -29,7 +31,7 @@ typedef struct {
     alfs_driver_t drv;
     alfs_config_t cfg;
     alfs_t fs;
-    uint8_t pbuf[4][PAGE + 24];
+    uint8_t pbuf[4][ALFS_BUF_SIZE(PAGE)];
 } rig_t;
 
 static int call_bad;          /* calls that broke SPD-01 or SPD-02 */
@@ -132,6 +134,10 @@ static uint32_t crc32_ref(const uint8_t *p, uint32_t n) {
     return ~c;
 }
 
+static uint32_t get32le(const uint8_t *p) {
+    return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
 /* A row carries its sequence number and a check, like littlefs's W-LOG. */
 static void make_row(uint32_t seq, uint8_t *row) {
     row[0] = (uint8_t)seq;
@@ -164,6 +170,22 @@ static int put_n(rig_t *r, alfs_stream_t *s, const uint8_t *d, uint32_t n, uint3
 static int put(rig_t *r, alfs_stream_t *s, const uint8_t *d, uint32_t n) {
     uint32_t taken = 0;
     return put_n(r, s, d, n, &taken);
+}
+
+/* A sync or close whose program settled something answers ALFS_BUSY (a
+ * resumed stream, the first allocation after a mount): call again. */
+static int sync_done(rig_t *r, alfs_stream_t *s) {
+    int rc = ALFS_BUSY;
+    for (int i = 0; i < 64 && rc == ALFS_BUSY; i++)
+        rc = (int)CALL(r, alfs_sync(&r->fs, s));
+    return rc;
+}
+
+static int close_done(rig_t *r, alfs_stream_t *s) {
+    int rc = ALFS_BUSY;
+    for (int i = 0; i < 64 && rc == ALFS_BUSY; i++)
+        rc = (int)CALL(r, alfs_close(&r->fs, s));
+    return rc;
 }
 
 /* Reads a whole stream. Its length, or an error. */
@@ -230,7 +252,7 @@ static int log_run(rig_t *r, alfs_stream_t *s, log_t *lg, uint32_t rate, uint32_
                 return rc;
         }
         if (t % 1000 == 0) {
-            int rc = (int)CALL(r, alfs_sync(&r->fs, s));
+            int rc = sync_done(r, s);
             if (r->sim.off)
                 return 0;
             if (rc)
@@ -310,15 +332,36 @@ static void if_endian(void) {
     CHECK_EQ(setup(&r), 0);
     const uint8_t *st = r.sim.mem + r.cfg.region_start;
     CHECK(memcmp(st, "alfs", 4) == 0);
-    CHECK_EQ(st[4], 1);  /* version            */
+    CHECK_EQ(st[4], 2);  /* version            */
     CHECK_EQ(st[5], 12); /* log2(sector size)  */
     CHECK_EQ(st[6], 8);  /* log2(page size)    */
     CHECK_EQ(st[7], 0);  /* log2(prog unit)    */
     CHECK_EQ(st[8] | st[9] << 8, 8);
     CHECK_EQ(st[10] | st[11] << 8 | st[12] << 16 | (uint32_t)st[13] << 24, 1); /* generation */
     CHECK_EQ(st[14] | st[15] << 8 | st[16] << 16 | (uint32_t)st[17] << 24, 1); /* erase count */
-    uint32_t c = crc32_ref(st, 18);
-    CHECK_EQ(st[18] | st[19] << 8 | st[20] << 16 | (uint32_t)st[21] << 24, c);
+    CHECK(get32le(st + 18) >= 1);                                               /* sequence floor */
+    CHECK_EQ(get32le(st + 22), crc32_ref(st, 22));
+
+    /* A claim and its first chunk. */
+    alfs_stream_t s;
+    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 0x11223344u)), 0);
+    const uint8_t data[3] = {7, 8, 9};
+    CHECK_EQ(put(&r, &s, data, 3), 0);
+    CHECK_EQ(sync_done(&r, &s), 0);
+    const uint8_t *sec = r.sim.mem + r.cfg.region_start + s.sector * SECTOR;
+    const uint8_t *cl = sec + C1;
+    CHECK_EQ(get32le(cl), s.id);           /* identity                */
+    CHECK_EQ(get32le(cl + 4), s.id);       /* sequence: a first claim */
+    CHECK_EQ(get32le(cl + 8), 0x11223344u); /* tag                     */
+    CHECK_EQ(cl[12] | cl[13] << 8, s.sector); /* first sector          */
+    CHECK_EQ(cl[14] | cl[15] << 8, 0);     /* sector number           */
+    CHECK_EQ(get32le(cl + 16), crc32_ref(cl, 16));
+    CHECK_EQ(sec[C1 - 1], 0xFF);           /* the dead mark, erased   */
+    const uint8_t *ch = sec + D1;
+    CHECK_EQ(ch[0] | ch[1] << 8, 3);
+    uint8_t body[5] = {ch[0], ch[1], 7, 8, 9};
+    CHECK_EQ(get32le(ch + 2), crc32_ref(body, 5));
+    CHECK(memcmp(ch + 6, data, 3) == 0);
     DONE(&r);
     rig_close(&r);
 }
@@ -334,7 +377,7 @@ static void if_list_streams(void) {
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 100 + i)), 0);
         make_row(i, row);
         CHECK_EQ(put(&r, &s, row, ROW), 0);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
         ids[i] = s.id;
         if (i)
             CHECK(ids[i] > ids[i - 1]);
@@ -372,7 +415,7 @@ static void basic_round_trip(void) {
             alfs_stream_t s;
             CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
             CHECK_EQ(put(&r, &s, d, sizes[z]), 0);
-            CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+            CHECK_EQ(close_done(&r, &s), 0);
             CHECK_EQ(slurp(&r, s.id, o, sizes[z] + 1024), (int32_t)sizes[z]);
             CHECK(memcmp(o, d, sizes[z]) == 0);
             CHECK_EQ(MOUNT(&r), 0);
@@ -422,7 +465,7 @@ static void spd_one_operation_per_call(void) {
             blk[i] = (uint8_t)(t + i);
         CHECK_EQ(put(&r, &s, blk, sizeof(blk)), 0);
         if (t % 50 == 0)
-            CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), 0);
+            CHECK_EQ(sync_done(&r, &s), 0);
     }
     DONE(&r);
     rig_close(&r);
@@ -450,12 +493,12 @@ static void spd_enospc_without_erase(void) {
     }
     CHECK_EQ(rc, ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_ops, 0);
-    CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), ALFS_ENOSPC);
+    CHECK_EQ(sync_done(&r, &s), ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_ops, 0);
     /* One erase step makes room; the bytes held are written. */
     CHECK_EQ(ESTEP(&r), ALFS_OK);
-    CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(sync_done(&r, &s), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     CHECK_EQ(slurp(&r, s.id, o, 6 * SECTOR), (int32_t)n);
     CHECK(memcmp(o, d, n) == 0);
     free(d);
@@ -496,11 +539,11 @@ static void spd_mount_reads_bounded(void) {
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], (uint32_t)k)), 0);
         lg.len = 0;
         CHECK_EQ(log_run(&r, &s, &lg, 50, 30000, false), 0);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
     }
     CHECK_EQ(MOUNT(&r), 0);
     CHECK_EQ(r.sim.c_ops, 0);
-    CHECK(r.sim.c_bytes_read <= 60u * 128u);
+    CHECK(r.sim.c_bytes_read <= 68u * 128u);
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
@@ -515,13 +558,13 @@ static void spd_reopen_reads_bounded(void) {
     uint8_t b = 0x5A;
     for (int i = 0; i < 3000; i++) { /* the last sector full of tiny chunks */
         CHECK_EQ(put(&r, &s, &b, 1), 0);
-        CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), 0);
+        CHECK_EQ(sync_done(&r, &s), 0);
     }
     uint32_t id = s.id;
     CHECK_EQ(MOUNT(&r), 0);
     CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], id)), 0);
     CHECK_EQ(r.sim.c_ops, 0);
-    CHECK(r.sim.c_bytes_read <= 60u * 64u);
+    CHECK(r.sim.c_bytes_read <= 68u * 64u + SECTOR);
     DONE(&r);
     rig_close(&r);
 }
@@ -544,6 +587,59 @@ static void spd_wlog_longest_stall(void) {
     }
 }
 
+/* Bytes read reading a stream back whole. */
+static void read_cost(rig_t *r, uint32_t id, uint32_t want, uint64_t *cost) {
+    uint8_t *got = malloc(want + 1024);
+    uint64_t b0 = r->sim.bytes_read;
+    int32_t n = slurp(r, id, got, want + 1024);
+    *cost = r->sim.bytes_read - b0;
+    free(got);
+    CHECK_EQ(n, (int32_t)want);
+}
+
+/* SPD-10: reading on to the next sector reads the headers between, not the
+ * region's. Two streams written together cost one header a sector more to
+ * read than one written alone. */
+static void spd_read_next_bounded(void) {
+    enum { ROUNDS = 200, CHUNK = 3900 };
+    uint8_t *d = malloc(CHUNK);
+    for (uint32_t i = 0; i < CHUNK; i++)
+        d[i] = (uint8_t)(i * 7u + 1u);
+    rig_t r;
+    rig_open(&r, 512, 1, 0);
+    CHECK_EQ(setup(&r), 0);
+    alfs_stream_t a, b;
+    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &a, r.pbuf[0], 1)), 0);
+    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &b, r.pbuf[1], 2)), 0);
+    for (int i = 0; i < ROUNDS; i++) {
+        CHECK_EQ(put(&r, &a, d, CHUNK), 0);
+        CHECK_EQ(sync_done(&r, &a), 0);
+        CHECK_EQ(put(&r, &b, d, CHUNK), 0);
+        CHECK_EQ(sync_done(&r, &b), 0);
+    }
+    uint64_t pair = 0, alone = 0;
+    read_cost(&r, a.id, ROUNDS * CHUNK, &pair);
+    DONE(&r);
+    rig_close(&r);
+
+    rig_t q;
+    rig_open(&q, 512, 1, 0);
+    CHECK_EQ(setup(&q), 0);
+    alfs_stream_t c;
+    CHECK_EQ(CALL(&q, alfs_create(&q.fs, &c, q.pbuf[0], 3)), 0);
+    for (int i = 0; i < ROUNDS; i++) {
+        CHECK_EQ(put(&q, &c, d, CHUNK), 0);
+        CHECK_EQ(sync_done(&q, &c), 0);
+    }
+    read_cost(&q, c.id, ROUNDS * CHUNK, &alone);
+    printf("    reading %u sectors: %llu bytes beside another stream, %llu alone\n", ROUNDS,
+           (unsigned long long)pair, (unsigned long long)alone);
+    CHECK(pair <= alone + 2u * D1 * (ROUNDS + 10u));
+    free(d);
+    DONE(&q);
+    rig_close(&q);
+}
+
 /* Reads per append and sync do not grow with the region. */
 static void spd_cpu_linear(void) {
     uint64_t reads[2];
@@ -561,7 +657,7 @@ static void spd_cpu_linear(void) {
         clock_t t0 = clock();
         for (int i = 0; i < 1000; i++) { /* 64 kB: 16 sectors */
             CHECK_EQ(put(&r, &s, blk, sizeof(blk)), 0);
-            CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), 0);
+            CHECK_EQ(sync_done(&r, &s), 0);
         }
         secs[k] = (double)(clock() - t0) / CLOCKS_PER_SEC;
         reads[k] = r.sim.bytes_read - before;
@@ -604,10 +700,10 @@ static int ring(rig_t *r, uint32_t cycles, uint32_t every, uint32_t max_ticks) {
                 rows++;
             }
         }
-        if (tick % 50 == 0 && CALL(r, alfs_sync(&r->fs, &s)) < 0)
+        if (tick % 50 == 0 && sync_done(r, &s) < 0)
             return -5;
         if (rows >= every) {
-            if (CALL(r, alfs_close(&r->fs, &s)))
+            if (close_done(r, &s))
                 return -6;
             if (CALL(r, alfs_create(&r->fs, &s, r->pbuf[0], tick)))
                 return -7;
@@ -658,7 +754,7 @@ static void life_write_amplification(void) {
             log_t lg;
             log_init(&lg, 1 << 20);
             CHECK_EQ(log_run(&r, &s, &lg, rates[k], 600000, false), 0);
-            CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+            CHECK_EQ(close_done(&r, &s), 0);
             uint64_t progs = r.sim.programs - p0, bytes = r.sim.bytes_programmed - b0;
             alfs_status_t st;
             alfs_status(&r.fs, &st);
@@ -685,7 +781,7 @@ static void life_wlog_erases(void) {
     log_t lg;
     log_init(&lg, 1 << 20);
     CHECK_EQ(log_run(&r, &s, &lg, 50, 600000, false), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     uint64_t filled = (r.sim.bytes_programmed - b0 + SECTOR - 1) / SECTOR;
     uint64_t e0 = r.sim.erases;
     CHECK_EQ(CALL(&r, alfs_delete(&r.fs, s.id)), 0);
@@ -752,7 +848,7 @@ static void life_partial_program_cap(void) {
         for (uint32_t i = 0; i < 1000; i++) {
             make_row(i, row);
             CHECK_EQ(put(&r, &s, row, 3), 0); /* tiny syncs: many per page */
-            CHECK_EQ(CALL(&r, alfs_sync(&r.fs, &s)), 0);
+            CHECK_EQ(sync_done(&r, &s), 0);
         }
         CHECK(r.sim.max_page_progs <= (caps[c] ? caps[c] : 16u));
         DONE(&r);
@@ -775,13 +871,109 @@ static void life_large_erase(void) {
     rig_close(&r);
 }
 
+/* LIFE-08: a resume loses under two pages, and settles with one program. */
+static void life_resume_waste(void) {
+    for (int pos = 0; pos <= 40; pos++) {
+        uint32_t unit = pos == 40 ? 16u : 1u; /* the last: a unit over 1 */
+        rig_t r;
+        rig_open(&r, 16, unit, 0);
+        CHECK_EQ(setup(&r), 0);
+        alfs_stream_t s;
+        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 5)), 0);
+        uint32_t total = 3000u + (uint32_t)pos * 137u, n = 0;
+        uint8_t *exp = malloc(total + 10);
+        for (uint32_t i = 0; i < total + 10; i++)
+            exp[i] = (uint8_t)(i * 13u + (uint32_t)pos);
+        while (n < total) {
+            uint32_t k = total - n < 300 ? total - n : 300;
+            CHECK_EQ(put(&r, &s, exp + n, k), 0);
+            CHECK_EQ(sync_done(&r, &s), 0);
+            n += k;
+        }
+        CHECK_EQ(close_done(&r, &s), 0);
+        uint32_t end = r.sim.last_prog_addr + r.sim.last_prog_len;
+        uint32_t id = s.id;
+        CHECK_EQ(MOUNT(&r), 0);
+        CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], id)), 0);
+        uint64_t p0 = r.sim.programs;
+        CHECK_EQ(put(&r, &s, exp + total, 10), 0);
+        CHECK_EQ(sync_done(&r, &s), 0);
+        uint64_t progs = r.sim.programs - p0;
+        uint32_t at = r.sim.last_prog_addr;
+        bool same = at / SECTOR == (end - 1) / SECTOR;
+        uint32_t lost = same ? at - end : ((end - 1) / SECTOR + 1) * SECTOR - end;
+        if (unit == 1) {
+            CHECK(lost < 2 * PAGE);
+            CHECK_EQ(progs, 2); /* the claim again, or the fresh sector's; then the chunk */
+        } else {
+            CHECK(!same);
+            CHECK_EQ(progs, 1);
+        }
+        CHECK_EQ(close_done(&r, &s), 0);
+        uint8_t *got = malloc(total + 1024);
+        CHECK_EQ(slurp(&r, id, got, total + 1024), (int32_t)(total + 10));
+        CHECK(memcmp(got, exp, total + 10) == 0);
+        free(got);
+        free(exp);
+        DONE(&r);
+        rig_close(&r);
+    }
+}
+
 /* ---- SAFE ------------------------------------------------------------- */
 
 /*
+ * What a stream may read after a power loss and a resume (SAFE-01): a
+ * prefix of what was appended before the loss, at least what was synced
+ * then; then a prefix of what was appended after the resume, at least what
+ * was synced since. Bytes never synced may be lost, or come back later in
+ * their place.
+ */
+typedef struct {
+    const uint8_t *pre;  /* appended before the loss */
+    uint32_t pre_synced, pre_len;
+    const uint8_t *post; /* appended after the resume */
+    uint32_t post_synced, post_len;
+} expect_t;
+
+static bool reads_as_expected(const uint8_t *got, int32_t n, const expect_t *e) {
+    if (n < 0)
+        return false;
+    uint32_t a = 0;
+    while (a < (uint32_t)n && a < e->pre_len && got[a] == e->pre[a])
+        a++;
+    for (uint32_t al = a + 1; al-- > e->pre_synced;) {
+        if (al > (uint32_t)n)
+            continue;
+        uint32_t bl = (uint32_t)n - al;
+        if (bl >= e->post_synced && bl <= e->post_len && !memcmp(got + al, e->post, bl))
+            return true;
+    }
+    return false;
+}
+
+/* Remounts, runs erase steps until clean, and reads the stream: twice. */
+static void reread(rig_t *r, uint32_t id, const expect_t *e, uint8_t *got, const char *what) {
+    for (int round = 0; round < 2; round++) {
+        memset(&r->fs, 0, sizeof(r->fs));
+        CHECK_EQ(MOUNT(r), 0);
+        CHECK(clean(r) >= 0);
+        int32_t n = slurp(r, id, got, 64 * 1024);
+        if (n < 0 && e->pre_synced == 0 && e->post_synced == 0)
+            n = 0; /* nothing synced: no stream */
+        bool ok = reads_as_expected(got, n, e);
+        if (!ok)
+            printf("    %s, round %d: read %d; before %u (synced %u), after %u (synced %u)\n", what,
+                   round, n, e->pre_len, e->pre_synced, e->post_len, e->post_synced);
+        CHECK(ok);
+    }
+}
+
+/*
  * Power lost at operation k of a logging run that also erases, with each
- * behaviour; then a remount, a read, a resume and a read again. Some cases
- * lose power a second time during the resume. Returns 1 when k is past the
- * run's last operation.
+ * behaviour; then a remount, a read, a resume, and remounts with erase steps
+ * and reads. Some cases lose power a second time during the resume. Sets
+ * *past when k is past the run's last operation.
  */
 static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, int *past) {
     rig_t r;
@@ -805,6 +997,8 @@ static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, in
         return;
     }
     uint32_t synced = lg.synced, appended = lg.len;
+    uint8_t *pre = malloc(appended + 1);
+    memcpy(pre, lg.exp, appended);
     sim_reboot(&r.sim);
     memset(&r.fs, 0, sizeof(r.fs));
     CHECK_EQ(MOUNT(&r), 0);
@@ -814,16 +1008,17 @@ static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, in
     uint32_t have = 0;
     if (CALL(&r, alfs_next(&r.fs, 0, &in)) == 0) {
         int32_t n = slurp(&r, in.id, got, 64 * 1024);
-        if (n < (int32_t)synced || n > (int32_t)appended || memcmp(got, lg.exp, (size_t)n))
+        if (n < (int32_t)synced || n > (int32_t)appended || memcmp(got, pre, (size_t)n))
             printf("    pl %d unit %u k %lld: read %d, synced %u, appended %u\n", pl, unit,
                    (long long)k, n, synced, appended);
         CHECK(n >= (int32_t)synced);
         CHECK(n <= (int32_t)appended);
-        CHECK(memcmp(got, lg.exp, (size_t)n) == 0);
+        CHECK(memcmp(got, pre, (size_t)n) == 0);
         have = (uint32_t)n;
         CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], in.id)), 0);
     } else {
         CHECK_EQ(synced, 0);
+        appended = 0;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 77)), 0);
     }
 
@@ -835,37 +1030,17 @@ static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, in
     rc = log_run(&r, &s, &lg, 50, 6000, true);
     if (!r.sim.off) {
         CHECK_EQ(rc, 0);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
         lg.synced = lg.len;
     } else {
         sim_reboot(&r.sim);
-        memset(&r.fs, 0, sizeof(r.fs));
-        CHECK_EQ(MOUNT(&r), 0);
     }
-    /*
-     * What reads back is A then B: A a prefix of what survived the first
-     * loss, at least what was synced before it (bytes never synced may yet
-     * be lost to bits that read either way, but never altered); B a prefix
-     * of what was appended after it, at least what was synced since.
-     */
-    int32_t n = slurp(&r, s.id, got, 64 * 1024);
-    if (n < 0 && lg.synced == 0)
-        n = 0; /* never synced after a create: no stream */
-    CHECK(n >= 0);
-    uint32_t a = 0, b_min = lg.synced - have, b_max = lg.len - have;
-    while (a < (uint32_t)n && a < have && got[a] == lg.exp[a])
-        a++;
-    bool ok = false;
-    for (uint32_t al = a + 1; al-- > synced && !ok;) {
-        uint32_t bl = (uint32_t)n - al;
-        ok = al <= (uint32_t)n && bl >= b_min && bl <= b_max &&
-             !memcmp(got + al, lg.exp + have, bl);
-    }
-    if (!ok)
-        printf("    pl %d unit %u k %lld: read %d, survived %u (synced %u), then %u to %u\n", pl, unit,
-               (long long)k, n, have, synced, b_min, b_max);
-    CHECK(ok);
+    expect_t e = {pre, synced, appended, lg.exp + have, lg.synced - have, lg.len - have};
+    char what[64];
+    snprintf(what, sizeof(what), "pl %d unit %u k %lld", pl, unit, (long long)k);
+    reread(&r, s.id, &e, got, what);
     free(got);
+    free(pre);
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
@@ -912,7 +1087,7 @@ static void safe_no_false_data(void) {
         log_t lg;
         log_init(&lg, 1 << 16);
         CHECK_EQ(log_run(&r, &s, &lg, 50, 20000, false), 0);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
         /* Flip one bit in a chunk: past the sector's headers. */
         uint32_t sector = r.fs.cfg->region_start + (uint32_t)(trial % 2) * SECTOR;
         uint32_t at = sector + 64 + sim_rand(&r.sim) % (SECTOR - 64);
@@ -993,15 +1168,15 @@ static void safe_prog_failure(void) {
             memcpy(lg.exp + lg.len, row, ROW);
             lg.len += ROW;
             lg.seq++;
-            int rc = (int)CALL(&r, alfs_sync(&r.fs, &s));
+            int rc = sync_done(&r, &s);
             while (rc == ALFS_EPROG || rc == ALFS_BUSY) {
                 failures += rc == ALFS_EPROG;
-                rc = (int)CALL(&r, alfs_sync(&r.fs, &s));
+                rc = sync_done(&r, &s);
             }
             CHECK_EQ(rc, 0);
         }
         CHECK(failures >= 1);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
         uint8_t *got = malloc(1 << 16);
         int32_t n = slurp(&r, s.id, got, 1 << 16);
         CHECK_EQ(n, (int32_t)lg.len);
@@ -1027,7 +1202,7 @@ static void safe_prog_failure(void) {
     uint8_t row[ROW] = {0};
     CHECK_EQ(put(&r, &s, row, ROW), 0);
     int rc, tries = 0;
-    while ((rc = (int)CALL(&r, alfs_sync(&r.fs, &s))) == ALFS_EPROG)
+    while ((rc = sync_done(&r, &s)) == ALFS_EPROG)
         tries++;
     CHECK_EQ(rc, ALFS_ELOST);
     CHECK_EQ(tries, 2);
@@ -1085,7 +1260,7 @@ static void safe_read_retry(void) {
     log_t lg;
     log_init(&lg, 1 << 16);
     CHECK_EQ(log_run(&r, &s, &lg, 50, 10000, false), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     uint32_t id = s.id;
 
     r.sim.read_fail_once = 1;
@@ -1153,9 +1328,9 @@ static void build_image(rig_t *r) {
             make_row(i, row);
             put(r, &s, row, ROW);
             if (i % 20 == 0)
-                CALL(r, alfs_sync(&r->fs, &s));
+                sync_done(r, &s);
         }
-        CALL(r, alfs_close(&r->fs, &s));
+        close_done(r, &s);
         if (k == 1)
             del = s.id;
     }
@@ -1209,7 +1384,7 @@ static void safe_delete_atomic(void) {
         log_t lg;
         log_init(&lg, 1 << 16);
         CHECK_EQ(log_run(&r, &s, &lg, 50, 10000, false), 0);
-        CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
         sim_power_after(&r.sim, 0, (sim_pl_t)pl);
         CALL(&r, alfs_delete(&r.fs, s.id));
         CHECK(r.sim.off);
@@ -1233,7 +1408,7 @@ static void safe_delete_atomic(void) {
     log_t lg;
     log_init(&lg, 1 << 16);
     CHECK_EQ(log_run(&r, &s, &lg, 50, 10000, false), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     alfs_status_t st;
     alfs_status(&r.fs, &st);
     uint32_t used = 16u - st.ready;
@@ -1248,6 +1423,210 @@ static void safe_delete_atomic(void) {
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
+}
+
+/* The first claim of stream s's sector numbered n, or NULL. */
+static uint8_t *claim_of(rig_t *r, uint32_t id, uint32_t n) {
+    for (uint32_t k = 0; k < r->cfg.region_size / SECTOR; k++) {
+        uint8_t *cl = r->sim.mem + r->cfg.region_start + k * SECTOR + C1;
+        if (get32le(cl) == id && (uint32_t)(cl[14] | cl[15] << 8) == n && get32le(cl + 16) == crc32_ref(cl, 16))
+            return cl;
+    }
+    return NULL;
+}
+
+/* SAFE-11: a delete a power loss left half programmed, read as deleted,
+ * then power lost at each operation of its reclaim: whole or gone. */
+static void safe_delete_reclaim(void) {
+    for (int64_t k = 0;; k++) {
+        rig_t r;
+        rig_open(&r, 16, 1, 0);
+        CHECK_EQ(setup(&r), 0);
+        alfs_stream_t s;
+        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
+        log_t lg;
+        log_init(&lg, 1 << 16);
+        CHECK_EQ(log_run(&r, &s, &lg, 50, 10000, false), 0);
+        CHECK_EQ(close_done(&r, &s), 0);
+        sim_power_after(&r.sim, 0, PL_FLICKER);
+        CALL(&r, alfs_delete(&r.fs, s.id));
+        CHECK(r.sim.off);
+        sim_reboot(&r.sim);
+        alfs_info_t in;
+        bool deleted = false;
+        for (int t = 0; t < 64 && !deleted; t++) {
+            memset(&r.fs, 0, sizeof(r.fs));
+            CHECK_EQ(MOUNT(&r), 0);
+            deleted = CALL(&r, alfs_next(&r.fs, 0, &in)) == ALFS_ENOENT;
+        }
+        CHECK(deleted);
+        sim_power_after(&r.sim, k, PL_ATOMIC);
+        clean(&r);
+        bool past = !r.sim.off;
+        sim_reboot(&r.sim);
+        uint8_t *got = malloc(1 << 16);
+        for (int t = 0; t < 8; t++) {
+            memset(&r.fs, 0, sizeof(r.fs));
+            CHECK_EQ(MOUNT(&r), 0);
+            int32_t n = slurp(&r, s.id, got, 1 << 16);
+            bool ok = n == ALFS_ENOENT || (n == (int32_t)lg.len && memcmp(got, lg.exp, lg.len) == 0);
+            if (!ok)
+                printf("    power lost at reclaim operation %lld: read %d of %u\n", (long long)k, n, lg.len);
+            CHECK(ok);
+        }
+        free(got);
+        free(lg.exp);
+        DONE(&r);
+        rig_close(&r);
+        if (past || tf_failed)
+            break;
+    }
+}
+
+/* SAFE-12: a sector lost from the middle of a stream is counted, and the
+ * rest reads in order. */
+static void safe_missing_sector(void) {
+    rig_t r;
+    rig_open(&r, 16, 1, 0);
+    CHECK_EQ(setup(&r), 0);
+    alfs_stream_t s;
+    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
+    uint32_t total = 5u * 3900u;
+    uint8_t *exp = malloc(total);
+    for (uint32_t i = 0; i < total; i++)
+        exp[i] = (uint8_t)(i * 5u + 3u);
+    for (uint32_t n = 0; n < total; n += 3900) {
+        CHECK_EQ(put(&r, &s, exp + n, 3900), 0);
+        CHECK_EQ(sync_done(&r, &s), 0);
+    }
+    CHECK_EQ(close_done(&r, &s), 0);
+    uint8_t *cl = claim_of(&r, s.id, 2);
+    CHECK(cl != NULL);
+    if (cl)
+        sim_flip(&r.sim, (uint32_t)(cl + 16 - r.sim.mem), 0x01);
+    alfs_status_t st;
+    alfs_status(&r.fs, &st);
+    uint32_t before = st.n.check_failures;
+    uint8_t *got = malloc(total + 1024);
+    int32_t n = slurp(&r, s.id, got, total + 1024);
+    CHECK(n > 0 && n < (int32_t)total);
+    uint32_t a = 0;
+    while (a < (uint32_t)n && got[a] == exp[a])
+        a++;
+    CHECK(n > 0 && memcmp(got + a, exp + total - ((uint32_t)n - a), (uint32_t)n - a) == 0);
+    alfs_status(&r.fs, &st);
+    CHECK_EQ(st.n.check_failures - before, 1);
+    free(got);
+    free(exp);
+    DONE(&r);
+    rig_close(&r);
+}
+
+/* SAFE-04: power lost in the claim of a stream's next sector; the stream
+ * resumes, fills two sectors, and reads the same through remounts. */
+static void safe_resume_torn_claim(void) {
+    static const sim_pl_t pls[] = {PL_FLICKER, PL_METASTABLE};
+    int cases = 0;
+    for (unsigned b = 0; b < 2; b++)
+        for (int64_t k = 0;; k++) {
+            rig_t r;
+            rig_open(&r, 16, 1, 0);
+            CHECK_EQ(setup(&r), 0);
+            alfs_stream_t s;
+            CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 9)), 0);
+            log_t lg;
+            log_init(&lg, 64 * 1024);
+            sim_power_after(&r.sim, k, pls[b]);
+            CHECK_EQ(log_run(&r, &s, &lg, 50, 20000, false), 0);
+            bool claim = r.sim.off && r.sim.cut_prog && r.sim.cut_addr % SECTOR == 0;
+            bool past = !r.sim.off;
+            if (claim) {
+                cases++;
+                uint32_t synced = lg.synced, appended = lg.len;
+                uint8_t *pre = malloc(appended + 1);
+                memcpy(pre, lg.exp, appended);
+                sim_reboot(&r.sim);
+                memset(&r.fs, 0, sizeof(r.fs));
+                CHECK_EQ(MOUNT(&r), 0);
+                uint8_t *got = malloc(64 * 1024);
+                int32_t have = slurp(&r, s.id, got, 64 * 1024);
+                if (have == ALFS_ENOENT && synced == 0) { /* its first claim: no stream to resume */
+                    free(got);
+                    free(pre);
+                    free(lg.exp);
+                    DONE(&r);
+                    rig_close(&r);
+                    continue;
+                }
+                CHECK(have >= (int32_t)synced && have <= (int32_t)appended);
+                CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], s.id)), 0);
+                lg.len = lg.synced = (uint32_t)have;
+                CHECK_EQ(log_run(&r, &s, &lg, 50, 8000, false), 0); /* two sectors and more */
+                CHECK_EQ(close_done(&r, &s), 0);
+                expect_t e = {pre, synced, appended, lg.exp + have, lg.len - (uint32_t)have,
+                              lg.len - (uint32_t)have};
+                char what[64];
+                snprintf(what, sizeof(what), "pl %d k %lld", pls[b], (long long)k);
+                for (int t = 0; t < 4; t++)
+                    reread(&r, s.id, &e, got, what);
+                free(got);
+                free(pre);
+            }
+            free(lg.exp);
+            DONE(&r);
+            rig_close(&r);
+            if (past || tf_failed)
+                break;
+        }
+    printf("    %d power losses in a claim\n", cases);
+    CHECK(cases >= 4);
+}
+
+/* IF-04: a first claim torn by a power loss never shares its identity with
+ * a stream made after it. */
+static void if_identity_never_reused(void) {
+    static const sim_pl_t pls[] = {PL_FLICKER, PL_METASTABLE, PL_SOMEBITS};
+    for (unsigned b = 0; b < 3; b++) {
+        rig_t r;
+        rig_open(&r, 16, 1, 0);
+        CHECK_EQ(setup(&r), 0);
+        alfs_stream_t a;
+        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &a, r.pbuf[0], 1)), 0);
+        uint8_t row[ROW];
+        make_row(1, row);
+        CHECK_EQ(put(&r, &a, row, ROW), 0);
+        sim_power_after(&r.sim, 0, pls[b]);
+        CALL(&r, alfs_sync(&r.fs, &a)); /* its first claim, torn */
+        CHECK(r.sim.off);
+        sim_reboot(&r.sim);
+        memset(&r.fs, 0, sizeof(r.fs));
+        CHECK_EQ(MOUNT(&r), 0);
+        alfs_stream_t c;
+        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &c, r.pbuf[1], 2)), 0);
+        uint8_t rows[3 * ROW];
+        for (int i = 0; i < 3; i++)
+            make_row(10u + (uint32_t)i, rows + i * ROW);
+        CHECK_EQ(put(&r, &c, rows, sizeof(rows)), 0);
+        CHECK_EQ(close_done(&r, &c), 0);
+        CHECK(c.id != a.id);
+        for (int t = 0; t < 8; t++) {
+            memset(&r.fs, 0, sizeof(r.fs));
+            CHECK_EQ(MOUNT(&r), 0);
+            uint32_t seen[8], nseen = 0, after = 0;
+            alfs_info_t in;
+            while (nseen < 8 && CALL(&r, alfs_next(&r.fs, after, &in)) == 0) {
+                for (uint32_t i = 0; i < nseen; i++)
+                    CHECK(seen[i] != in.id);
+                seen[nseen++] = in.id;
+                after = in.id;
+            }
+            uint8_t got[1024];
+            CHECK_EQ(slurp(&r, c.id, got, sizeof(got)), (int32_t)sizeof(rows));
+            CHECK(memcmp(got, rows, sizeof(rows)) == 0);
+        }
+        DONE(&r);
+        rig_close(&r);
+    }
 }
 
 /* ---- OBS -------------------------------------------------------------- */
@@ -1270,7 +1649,7 @@ static void obs_status(void) {
     log_t lg;
     log_init(&lg, 1 << 18);
     CHECK_EQ(log_run(&r, &s, &lg, 50, 60000, false), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     alfs_status(&r.fs, &st);
     CHECK_EQ(st.n.programs, r.sim.programs);
     CHECK_EQ(st.n.erases, r.sim.erases);
@@ -1303,7 +1682,7 @@ static void obs_clean(void) {
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
     uint8_t row[ROW] = {1};
     CHECK_EQ(put(&r, &s, row, ROW), 0);
-    CHECK_EQ(CALL(&r, alfs_close(&r.fs, &s)), 0);
+    CHECK_EQ(close_done(&r, &s), 0);
     CHECK_EQ(CALL(&r, alfs_delete(&r.fs, s.id)), 0);
     alfs_status(&r.fs, &st);
     CHECK(!st.clean);
@@ -1320,7 +1699,7 @@ static void simp_ram(void) {
     /* The budgets are for a 32-bit target; a host's pointers are wider. */
     size_t wide = sizeof(void *) - 4;
     CHECK(sizeof(alfs_t) <= 96 + 2 * wide);
-    CHECK(sizeof(alfs_stream_t) <= 32 + wide);
+    CHECK(sizeof(alfs_stream_t) <= 32 + 2 * wide); /* a wider pointer, and its alignment */
 }
 
 int main(int argc, char **argv) {
@@ -1328,6 +1707,7 @@ int main(int argc, char **argv) {
         {"if_geometry", if_geometry},
         {"if_endian", if_endian},
         {"if_list_streams", if_list_streams},
+        {"if_identity_never_reused", if_identity_never_reused},
         {"basic_round_trip", basic_round_trip},
         {"spd_no_erase_outside_erase_step", spd_no_erase_outside_erase_step},
         {"spd_one_operation_per_call", spd_one_operation_per_call},
@@ -1337,6 +1717,7 @@ int main(int argc, char **argv) {
         {"spd_reopen_reads_bounded", spd_reopen_reads_bounded},
         {"spd_wlog_longest_stall", spd_wlog_longest_stall},
         {"spd_cpu_linear", spd_cpu_linear},
+        {"spd_read_next_bounded", spd_read_next_bounded},
         {"life_erase_only_dirty", life_erase_only_dirty},
         {"life_write_amplification", life_write_amplification},
         {"life_wlog_erases", life_wlog_erases},
@@ -1344,6 +1725,7 @@ int main(int argc, char **argv) {
         {"life_erase_count_persists", life_erase_count_persists},
         {"life_partial_program_cap", life_partial_program_cap},
         {"life_large_erase", life_large_erase},
+        {"life_resume_waste", life_resume_waste},
         {"safe_powerloss_durable", safe_powerloss_durable},
         {"safe_powerloss_bound", safe_powerloss_bound},
         {"safe_no_program_after_torn", safe_no_program_after_torn},
@@ -1355,6 +1737,9 @@ int main(int argc, char **argv) {
         {"safe_foreign_region", safe_foreign_region},
         {"safe_fuzz_mount_read", safe_fuzz_mount_read},
         {"safe_delete_atomic", safe_delete_atomic},
+        {"safe_delete_reclaim", safe_delete_reclaim},
+        {"safe_missing_sector", safe_missing_sector},
+        {"safe_resume_torn_claim", safe_resume_torn_claim},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},

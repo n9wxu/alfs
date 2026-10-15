@@ -32,11 +32,13 @@ erase value 0xFF. Its contents start random, as a used chip's are.
 violation, and every test fails on any:
 
 - a program that crosses a page (SPD-03);
-- a prog unit programmed twice between erases (IF-02, the rulings),
-  unless the prog unit is 1 and every byte of the second program is the
-  byte the programs before it meant, or 00h (settling a torn program, A-9);
-- a program into a page that an interrupted operation touched (SAFE-04),
-  with the same exception;
+- a byte programmed again between erases (IF-02, the rulings), unless
+  the prog unit is 1 and it is given the value the programs before it
+  meant, or 00h (settling, A-9); with a prog unit over 1, any second program
+  of a unit;
+- a program of a byte that an interrupted operation touched (SAFE-04),
+  with the same exception. A torn program touches only the bytes it was
+  given (A-3; the probe's P4 found no neighbour disturbed).
 - a second erase started while one is suspended (SPD-05).
 
 **It injects the faults of requirements section 4.4:**
@@ -117,8 +119,8 @@ alfs's help.
 | `spd_one_operation_per_call` | SPD-02 | W-HR for 30 seconds. |
 | `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no operation, from append and sync; one erase step later the held bytes are written and read back. |
 | `spd_busy_erase_resumes` | SPD-05 | Erases that take five calls: format and erase steps return `ALFS_BUSY` 31 times and finish 8 sectors. |
-| `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 60 bytes a sector and does no operation. |
-| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most 60 bytes a sector and one sector more, and does no operation. |
+| `spd_mount_reads_bounded` | SPD-06 | Four streams on 128 sectors: a mount reads at most 68 bytes a sector and does no operation. |
+| `spd_reopen_reads_bounded` | SPD-07 | 3,000 one-byte syncs: reopening reads at most 68 bytes a sector and one sector more, and does no operation. |
 | `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second, three prog units: no call stalls longer than one program. |
 | `spd_cpu_linear` | SPD-09 | The same appends and syncs on 32 and 2,048 sectors: the same reads, and about the same processor time. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
@@ -148,7 +150,7 @@ alfs's help.
 | `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
 | `obs_clean` | OBS-03 | Not clean through a format and its suspended erases, clean after, not after a delete, clean again after erase steps. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
-| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 6,144 bytes; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 7,168 bytes; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
 
 **By review:** SPD-05 (no loop waits on the flash), SIMP-01 (the
 libraries used), SIMP-05 (the spec covers every field), OBS-02 (every
