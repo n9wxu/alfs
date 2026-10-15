@@ -134,12 +134,18 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | # | Assumption | Source |
 |---|---|---|
 | A-1 | A program moves bits only away from the erase value; only an erase moves them back. | Every NOR part |
-| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit |
+| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit. The probe programs a page 256 times (A-8) |
 | A-3 | A program interrupted by power loss changes no byte outside its own page. | The littlefs fork assumes the same of a prog (`lfs3.h`, `gc_preerase_count`) |
 | A-4 | An erase interrupted by power loss changes no byte outside its own sector, and may leave that sector in any state, including one that reads as erased but holds bits that read randomly. | littlefs's METASTABLE behaviour (4.4) |
 | A-5 | Operations complete in the order issued; there is no write-back cache. | Raw serial NOR |
 | A-6 | The erase value is known and fixed: 0xFF on every part here. | The datasheets |
 | A-7 | A read can fail, as at low supply voltage, and succeed when retried. | The littlefs work's error-handling principle |
+| A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 256 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe (`docs/FLASH_PROBE.md`) |
+
+A-8 is measured, not read. A part with error correction inside the chip
+breaks it, so a new part is probed before anything relies on A-8. The v1
+format does not rely on it: alfs still programs each prog unit once
+(IF-02). It is recorded so that a later format may.
 
 ### 4.3 Timing and endurance
 
@@ -737,6 +743,7 @@ launch until all unused flash is erased.
 
 - `docs/datasheets/` and its `README.md`: the four flash parts and the
   RP2040.
+- `docs/FLASH_PROBE.md`: what the probe measured on the parts themselves.
 - The littlefs fork (github.com/n9wxu/littlefs), branch `v3-integration`
   at 58367256: `REQUIREMENTS.md` sections 4-5 and Appendix B,
   `benches/bench_wlog.toml`, `bd/lfs3_emubd.h`, `lfs3.h`.

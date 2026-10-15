@@ -14,6 +14,8 @@ says how the tests work and what each one does.
 | `make test T=safe_` | the tests whose names contain `safe_` |
 | `make target` | the Cortex-M0+ budgets: code size (SIMP-02), structure sizes (SIMP-03), stack frames (SIMP-04) |
 | `make tests-compile` | the tests compiled alone, before the code exists |
+| `make probe` | the flash probe, an RP2040 program that runs from RAM (section 6) |
+| `probe/run_probe.py` | runs the probe on attached boards and saves what it measured |
 
 A run passes when every test passes, no sanitizer reports, and the
 target checks pass.
@@ -150,3 +152,61 @@ error documented in `alfs.h`).
 - Timing is simulated at typical figures. The worst-case figures of
   requirements 4.3 scale every stall by the same factor and change no
   pass or fail.
+
+---
+
+## 6. The flash probe (`probe/`)
+
+Assumption A-8 is a property of each chip, so the probe tests it on the
+chips. It also measures how long programs and erases take there.
+
+**How it runs.** `probe/run_probe.py` puts an attached board into BOOTSEL
+and loads `alfs_probe.uf2` into RAM. The probe never runs from flash,
+since it erases and programs that flash. It drives the flash interface
+directly, with its own commands: Read (03h), Page Program (02h) of any
+length within a page, Sector Erase (20h), Read Status (05h) and JEDEC ID
+(9Fh). A program's or erase's time is measured from the end of its command
+to the moment the status register shows it done.
+
+**Where.** The last four sectors of the board's firmware-update download
+slot, which no image reaches, unless `--addr` gives others. The probe
+refuses to touch a sector that is not blank when it starts, and leaves
+every sector it tested erased. Then it reboots the board into its own
+firmware.
+
+**What it does.** For each of 20 cycles, and in each test sector, the
+probe erases the sector, times the erase, and checks that all 4,096 bytes
+read back erased. It then fills the sector's 16 pages as below, keeping a
+model of what every byte should hold: a programmed byte becomes its old
+value AND the data, and nothing else changes.
+
+| Test | Pages | What |
+|---|---|---|
+| P5, many programs a page | 0 | 256 one-byte programs into erased bytes, a different byte each time (case 1) |
+| P1, bit stepping | 1-4 | Each byte programmed eight times, each clearing one more bit: pages 1-2 send the cumulative value (FE, FC, ... 00), pages 3-4 a mask with one bit clear, in a random order (case 2) |
+| P2, AND | 5-8 | Each page programmed whole three times, with random A, then B, then C: it must read A AND B AND C |
+| P6, padded pages | 9-10 | 64 updates a page sent as whole-page programs: random values at 16 random places, FFh everywhere else, as a driver that programs only whole pages would (A-1) |
+| P4, over-programming | 11 | One byte programmed 00h 1,000 times; pages 10-12 checked after every 100 |
+| P7, timing | 12-14 | Programs of 1, 2, 4, 8, 16, 64 and 128 bytes into erased bytes (page 12), one of 256 (page 13), and 1- and 4-byte reprograms of programmed bytes (page 14) |
+| control | 15 | Never programmed: it must stay erased |
+
+After every program the probe reads back the page it programmed and
+compares it with the model. After every cycle it compares the whole
+sector.
+
+**Pass:** every read equals the model and every erase reads back erased.
+A program that takes longer than 10 ms, or an erase longer than 2 s, also
+fails (the datasheets' maximums are 3 ms and 800 ms). The probe reports
+every program's time, grouped by its length and by whether any byte was
+already programmed, as count, minimum, mean and maximum.
+
+**The probe can fail.** `run_probe.py --selftest` makes the probe flip one
+bit of its model after the first P2 program. That run must report exactly
+that mismatch.
+
+**What it does not test:** whether case-2 data keeps (retention), a power
+cut during a reprogram, or more than one chip of each part.
+
+Results go to `docs/probe_results/`, and `docs/FLASH_PROBE.md` summarises
+them part by part.
+
