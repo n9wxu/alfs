@@ -43,9 +43,10 @@ violation, and every test fails on any:
 
 - **Power loss.** `sim_power_after(n, behaviour)` interrupts the (n+1)th
   operation from now with one of ATOMIC, SOMEBITS, MOSTBITS, METASTABLE and
-  TORNTAIL, as the littlefs fork's emulated device defines them, and then
-  turns the chip off: every later operation fails until `sim_reboot`.
-  Metastable bits read randomly until their sector is erased.
+  TORNTAIL, as the littlefs fork's emulated device defines them, or
+  FLICKER, the probe's early abort (requirements 4.4), and then turns the
+  chip off: every later operation fails until `sim_reboot`. Unsettled bits
+  read randomly until their sector is erased or a program settles them.
 - **Bad sectors.** `sim_mkbad(sector, mode)`: PROGERROR, ERASEERROR,
   READERROR, PROGNOOP, ERASENOOP, PROGFLIP, READFLIP.
 - **Wear-out.** `wear_limit`: a sector erased that often fails its next
@@ -58,7 +59,9 @@ violation, and every test fails on any:
 **A program is an AND** (A-8): each byte becomes its old value AND the
 data. A torn program's bit that reads either way (METASTABLE) is one its
 data clears, as the probe found (P8); it settles at 0 when a program gives
-it 0 (A-9), and stays unsettled when given 1.
+it 0 (A-9), and stays unsettled when given 1. With a prog unit over 1 a
+torn program leaves no such bit: the part corrects one bit a unit, which is
+why it has that unit.
 
 **It measures.** Totals and per-call counts of operations, programs,
 erases and bytes read; the simulated time of each call at the typical
@@ -125,7 +128,7 @@ alfs's help.
 | `life_erase_count_persists` | LIFE-05 | W-RING, a remount: the least and greatest counts alfs reports equal the simulator's. |
 | `life_partial_program_cap` | LIFE-06 | 1,000 three-byte syncs: at most 16 programs a page, and at most 4 when configured so. |
 | `life_large_erase` | LIFE-07 | Four 64 KB blocks, all dirty but the formatted sector: three large erases and 16 sector erases. |
-| `safe_powerloss_durable` | SAFE-01 | For each behaviour and prog units 1 and 16, power lost at every operation of a 20-second W-LOG with erase steps; remount; every synced byte reads back, nothing beyond what was appended; resume; then remount, erase steps and read, twice. |
+| `safe_powerloss_durable` | SAFE-01 | For each behaviour and prog units 1 and 16, power lost at every operation of a 20-second W-LOG with erase steps; remount; every synced byte reads back, nothing beyond what was appended; resume; then remount, erase steps and read, twice. Each read must be a prefix of what was appended before the loss, at least what was synced, then a prefix of what was appended after the resume, at least what was synced since: bytes never synced may be lost, or come back later in their place. |
 | `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss during the resume in every third case. |
 | `safe_no_program_after_torn` | SAFE-04 | The same runs, for the simulator's check that nothing programs a page a power loss touched. |
 | `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a chunk: what reads back is the stream with at most one run cut out, and one failure counted when one was. |

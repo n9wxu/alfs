@@ -157,7 +157,16 @@ a larger number, the stream ends.
 
 - **A new sector:** the ready sector found by scanning forward, circularly,
   from the sector after the last claimed. One program writes the claim and
-  the first chunk. Its sector number is one more than the stream's last.
+  the first chunk; with U = 1 it starts at byte 0 and writes the stamp
+  again, with the bytes it reads, and the dead mark erased, so that a stamp
+  an erase step left half programmed is completed (A-9). Its sector number
+  is one more than the stream's last.
+- **The first allocation after a mount**, with U = 1, does not use the
+  ready sector it finds: it programs zero over that sector's claim, which
+  makes it dirty, and takes the next. A claim program torn at its start
+  leaves a sector that reads ready but holds a bit that reads either way
+  (the probe's FLICKER), and it is that sector: the first ready one from
+  where the allocation cursor stood.
 - **The next chunk:** at RU of the last one's end, in the same page while
   it fits and the page has had fewer than `max_page_programs` programs;
   otherwise at the next page's start; past the sector's end, in a new
@@ -174,22 +183,27 @@ the claim of a new sector. Its bits may read either way (littlefs's
 METASTABLE, seen on the XT25F128F by the probe), but it cleared only bits
 its data cleared (A-9). So:
 
-1. The stream's first program is its last sector's claim again, with the
-   bytes it reads. That completes the claim if the interrupted program was
-   it.
+1. The stream's first program is its last sector's stamp, dead mark and
+   claim again, with the bytes they read. That completes the claim if the
+   interrupted program was it.
 2. Its next chunk starts at the start of the second page after the page of
    the last good chunk in its last sector (after the claim's page, if no
    chunk there is good), or in a new sector when there is no such page.
    Neither page that the interrupted program could have touched takes new
    data.
-3. Before its first new sector, it scans every sector and programs zero
+3. Before its first chunk, it scans every sector and programs zero
    over any claim that reads valid with its identity and a sector number
    past its last, and any torn claim whose identity, tag, first sector and
    sector number fields read erased in every bit where its own identity,
    tag, first sector and next number are erased (a torn program leaves a
-   bit erased only where its data cleared it, A-9). One such claim a call. A torn claim of the
-   sector it was moving into, which might otherwise read valid at a later
-   mount, cannot then stand beside the sector that replaces it.
+   bit erased only where its data cleared it, A-9). One such claim a call.
+   A torn claim of the sector it was moving into, which might otherwise
+   read valid at a later mount, then cannot put bytes appended before the
+   power loss after those appended since.
+
+A chunk that a power loss tore may read invalid at one mount and valid at
+a later one. Its bytes were appended, though never synced, and they read
+in their place, before anything appended after the mount.
 
 With U over 1 the chip cannot take a second program, so the stream goes on
 in a new sector, as in version 1.

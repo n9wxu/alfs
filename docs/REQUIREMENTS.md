@@ -180,6 +180,12 @@ datasheets' figures.
 
 ### 4.4 Faults
 
+FLICKER is not littlefs's: it is the state the probe left on the
+XT25F128F by aborting a program early, a page that reads erased but for a
+bit that reads either way (`docs/FLASH_PROBE.md` section 4). Under
+METASTABLE and FLICKER, a program's unsettled bit is one its data clears
+(A-9), and a part whose prog unit is over 1 corrects it.
+
 Power-loss behaviours, from the littlefs fork's emulated block device
 (`REQUIREMENTS.md` 5.5 at `v3-integration`; `bd/lfs3_emubd.h`). The
 interrupted operation:
@@ -191,6 +197,7 @@ interrupted operation:
 | MOSTBITS | is applied, then one bit of its first prog unit flips | is applied, then one bit anywhere flips |
 | METASTABLE | is applied, then one bit it wrote reads randomly until the sector is erased | is applied, then one bit of the sector reads randomly until erased |
 | TORNTAIL | its first prog unit stays erased, a run of random length after it is programmed, and one bit of that run flips | is atomic |
+| FLICKER | is not applied, but one bit its data clears reads randomly | is not applied, but one bit of the sector reads randomly |
 
 littlefs's sixth, OOO (writes since the last sync revert), needs a write
 cache and is out of scope (A-5).
@@ -360,8 +367,8 @@ with the bytes the call passes, plus a constant.
   125 MHz, the time of an append and sync of 256 bytes.
 - Pass: on the RP2040, at most 100 us for 256 bytes; on the host, linear
   in bytes with no term in region size. Fail: otherwise. The exception is
-  the call that takes a resumed stream's first new sector, which reads
-  each sector's header once (SAFE-04).
+  the call that writes a resumed stream's first chunk, which reads each
+  sector's header once (SAFE-04).
 - Verified by: `spd_cpu_linear` (host); `target_append_256` (RP2040,
   deferred until a target build exists).
 
@@ -475,8 +482,8 @@ run of dirty sectors that fills one aligned block.
 #### ALFS-LIFE-08
 
 With a prog unit of 1, resuming a stream after a mount costs at most the
-rest of the page of its last good chunk, the page after it, and one
-program of the claim.
+rest of the page of its last good chunk, the page after it, one program of
+the claim, and one program for each claim cleared ahead (SAFE-04).
 
 - Priority: 2.
 - Source: v1 cost up to a sector per resume (SAFE-04 as first written);
@@ -484,7 +491,8 @@ program of the claim.
 - Measure: bytes between the end of the last chunk before the mount and
   the first chunk after it, and programs before that chunk, for every
   position of the last chunk in its sector.
-- Pass: under two pages, and one program of the claim. Fail: more.
+- Pass: under two pages, and one program of the claim when no claim is
+  cleared ahead. Fail: more.
 - Verified by: `life_resume_waste`.
 
 ### 6.3 Safety (SAFE)
@@ -530,34 +538,46 @@ next page, counts one failure, and reads on.
 #### ALFS-SAFE-04
 
 After a mount, nothing synced shares a page with bits a power loss may
-have left half programmed, and no claim can decay into reclaiming what was
-synced after the mount. A resumed stream's first program is its last
-sector's claim, programmed again with the bytes it reads (A-9). Its next
-chunk starts two pages past the page of its last good chunk, or in a new
-sector when the sector has no such page. Before it claims its first new
-sector, alfs programs 00h over every claim that could be the stream's own
-with a later sector number: one that reads valid with the stream's
-identity and a larger number, and one torn that reads erased in every bit
-where the stream's identity, tag, first sector and next number are erased.
-With a prog
-unit over 1, the stream goes on in a new sector instead (A-9).
+have left half programmed, and no claim or stamp can decay into
+reclaiming what was synced. With a prog unit of 1:
+
+1. A resumed stream's first program is its last sector's stamp and claim,
+   programmed again with the bytes they read (A-9).
+2. Its next chunk starts two pages past the page of its last good chunk,
+   or in a new sector when the sector has no such page.
+3. Before its first chunk after the mount, alfs programs 00h over every
+   claim that could be the stream's own with a later sector number: one
+   that reads valid with the stream's identity and a larger number, and
+   one torn that reads erased in every bit where the stream's identity,
+   tag, first sector and next number are erased.
+4. Every program of a claim starts at the sector's first byte and programs
+   the stamp again with the bytes it reads.
+5. The first ready sector an allocation finds after a mount is not used:
+   alfs programs 00h over its claim, and erase steps reclaim it.
+
+With a prog unit over 1 the part takes no second program; a resumed
+stream goes on in a new sector, and rules 3 to 5 do not apply.
 
 - Priority: 3.
-- Source: A-3, A-9; TORNTAIL and METASTABLE: the interrupted program was
-  the next chunk in the last good chunk's page, the first chunk of the next
-  page, or a claim. Amended 2026-10-14 (`docs/V2_STRATEGY.md` 4.3): first
-  written as "a new sector after a mount", which cost up to a sector. The
-  claim cleared ahead: a torn claim of the stream's next sector reads
-  invalid at one mount, the stream then claims that number again, and a
-  later mount reads the torn claim valid: two sectors with one number, the
-  stale one first. A torn claim's bits only ever read erased where they
-  should not (A-9), so its fields read erased wherever what it was meant
-  to hold is erased.
+- Source: A-3, A-9; METASTABLE and FLICKER (4.4). The interrupted program
+  was the next chunk in the last good chunk's page, the first chunk of the
+  next page, a claim, or a stamp. Amended 2026-10-14
+  (`docs/V2_STRATEGY.md` 4.3): first written as "a new sector after a
+  mount", which cost up to a sector. Rule 3: a torn claim of the stream's
+  next sector can read invalid at one mount and valid at a later one, and
+  its bytes, appended before the power loss, would then read after those
+  appended since. A torn claim reads erased only where it should not
+  (A-9), so its fields read erased wherever what it was meant to hold is.
+  Rule 4: a stamp that an erase step's power loss left half programmed can
+  read valid at one mount and invalid at a later one. Rule 5: a claim
+  program torn at its start leaves a sector that reads ready but holds a
+  bit that reads either way; it is the first ready sector from where the
+  allocation cursor stood.
 - Measure: the simulator flags a program into a page an interrupted
-  operation changed (every behaviour but ATOMIC), unless it programs bytes
-  that page already reads; and a claim whose bits read either way that
-  is not programmed again before data follows it.
-- Pass: none. Fail: any.
+  operation changed (every behaviour but ATOMIC), unless every byte is
+  what the programs before it meant, or 00h; the power-loss runs remount
+  and read again after the resume, with erase steps between.
+- Pass: no flag, and every read as SAFE-01 requires. Fail: otherwise.
 - Verified by: `safe_no_program_after_torn`, `safe_powerloss_durable`,
   `safe_resume_torn_claim`.
 
