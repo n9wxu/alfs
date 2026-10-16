@@ -1,8 +1,10 @@
 # alfs: `make test` runs the host suite on 8 simulator seeds under the
 # address and undefined behaviour sanitizers; `make soak` on 100 seeds
 # without them; `make target` checks the Cortex-M0+ budgets of SIMP-02 to
-# SIMP-04. T=name runs the tests whose names contain it; SEEDS="..." the
-# seeds given. `make probe` builds the flash probe (docs/TEST_PLAN.md 7).
+# SIMP-04. `make test-rt` and `make target-rt` do the same for the flash
+# task (alfs_rtos.c). T=name runs the tests whose names contain it;
+# SEEDS="..." the seeds given. `make probe` builds the flash probe
+# (docs/TEST_PLAN.md 7).
 
 CC ?= cc
 ARMCC ?= arm-none-eabi-gcc
@@ -81,7 +83,7 @@ build/rt_kernel.a: | build $(ALFS_RT_KERNEL)
 	ar rcs $@ build/rt_*.o
 
 build/test_rtos: alfs.c alfs.h alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
-	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(RT_INC) -o $@ alfs.c alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
+	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(SAN) $(RT_INC) -o $@ alfs.c alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
 
 test-rt: build/test_rtos
 	$(call run_seeds,./build/test_rtos,$(SEEDS))

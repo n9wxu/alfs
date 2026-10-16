@@ -23,6 +23,7 @@
 #define configUSE_MUTEXES 1
 #define configUSE_TASK_NOTIFICATIONS 1
 #define configUSE_TIMERS 0
+#define configENABLE_MPU 0
 
 #define INCLUDE_vTaskDelete 1
 #define INCLUDE_xTaskGetSchedulerState 1
