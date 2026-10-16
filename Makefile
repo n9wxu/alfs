@@ -62,4 +62,36 @@ probe:
 clean:
 	rm -rf build
 
-.PHONY: all test soak tests-compile target probe clean
+# The flash task (alfs_rtos.c) against FreeRTOS-Kernel, fetched once into
+# build/_deps. ALFS_RT_KERNEL names another copy; FREERTOS_KERNEL_PATH is
+# deliberately not read, since a shell may export a stale one.
+ALFS_RT_KERNEL ?= build/_deps/FreeRTOS-Kernel
+RT_TAG = V11.3.1
+RT_POSIX = $(ALFS_RT_KERNEL)/portable/ThirdParty/GCC/Posix
+RT_KSRC = $(ALFS_RT_KERNEL)/tasks.c $(ALFS_RT_KERNEL)/queue.c $(ALFS_RT_KERNEL)/list.c \
+	$(RT_POSIX)/port.c $(RT_POSIX)/utils/wait_for_event.c
+RT_INC = -I. -Itests -Itests/rtos -I$(ALFS_RT_KERNEL)/include -I$(RT_POSIX) -I$(RT_POSIX)/utils
+
+$(ALFS_RT_KERNEL):
+	git clone -q --depth 1 --branch $(RT_TAG) https://github.com/FreeRTOS/FreeRTOS-Kernel.git $@
+
+build/rt_kernel.a: | build $(ALFS_RT_KERNEL)
+	cd build && rm -f rt_*.o && for f in $(abspath $(RT_KSRC)); do \
+		$(CC) -std=gnu99 -O1 -g -w $(addprefix -I$(CURDIR)/,$(patsubst -I%,%,$(RT_INC))) -c $$f -o rt_$$(basename $$f .c).o || exit 1; done
+	ar rcs $@ build/rt_*.o
+
+build/test_rtos: alfs.c alfs.h alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
+	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(RT_INC) -o $@ alfs.c alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
+
+test-rt: build/test_rtos
+	$(call run_seeds,./build/test_rtos,$(SEEDS))
+
+# SIMP-02 and SIMP-04 for the task layer, on the kernel's generic Cortex-M0 port.
+RT_M0_INC = -I. -Itests/rtos_m0 -I$(ALFS_RT_KERNEL)/include -I$(ALFS_RT_KERNEL)/portable/GCC/ARM_CM0
+
+target-rt: target | $(ALFS_RT_KERNEL)
+	$(ARMCC) -std=c99 -Wall -Wextra -Werror -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su $(RT_M0_INC) -c alfs_rtos.c -o build/alfs_rtos_m0.o
+	$(ARMSIZE) build/alfs_rtos_m0.o
+	sh tests/check_target_rt.sh build/alfs_rtos_m0.o build/alfs_rtos_m0.ci build/alfs_m0.ci
+
+.PHONY: all test soak tests-compile target test-rt target-rt probe clean
