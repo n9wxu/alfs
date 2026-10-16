@@ -2,9 +2,9 @@
  * A simulated serial NOR flash for alfs's tests.
  *
  * It holds the chip in RAM and injects the faults of docs/REQUIREMENTS.md
- * section 4.4: the power-loss behaviours littlefs's emulated device names,
- * limited to bits a program's data moves (A-9), the bad-sector behaviours,
- * wear-out, a read that fails once, and bits that read randomly. It also
+ * section 4.4: the power-loss behaviours, each moving only bits a
+ * program's data moves (A-9), the bad-sector behaviours, wear-out, a read
+ * that fails once, and bits that read randomly. It also
  * enforces what the requirements forbid, and counts each violation: a
  * program across a page (SPD-03), a byte programmed twice between erases
  * (IF-02), and a program into a byte an interrupted operation touched

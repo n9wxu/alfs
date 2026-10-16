@@ -148,7 +148,7 @@ static uint32_t get32le(const uint8_t *p) {
     return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-/* A row carries its sequence number and a check, like littlefs's W-LOG. */
+/* A W-LOG row: its sequence number and a check. */
 static void make_row(uint32_t seq, uint8_t *row) {
     row[0] = (uint8_t)seq;
     row[1] = (uint8_t)(seq >> 8);
@@ -1030,7 +1030,7 @@ static void life_wlog_erases(void) {
     CHECK_EQ(CALL(&r, alfs_delete(&r.fs, "log", f.version)), 0);
     CHECK(clean(&r) >= 0);
     uint64_t erases = r.sim.erases - e0;
-    printf("    W-LOG 50 rows/s, 10 min: %llu erases (littlefs v2.11.3: 807)\n",
+    printf("    W-LOG 50 rows/s, 10 min: %llu erases\n",
            (unsigned long long)erases);
     CHECK(erases <= filled + 1);
     free(lg.exp);

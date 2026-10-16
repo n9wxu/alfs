@@ -1,6 +1,6 @@
-# What the flash probe found
+# The flash probe's measurements
 
-The probe (`probe/`, `docs/TEST_PLAN.md` section 6) tests assumption A-8
+The probe (`probe/`, `docs/TEST_PLAN.md` section 7) tests assumption A-8
 of `docs/REQUIREMENTS.md` on the chips themselves: a program into bytes
 already programmed clears exactly the bits that are 0 in its data and
 changes nothing else. No datasheet promises it (W25Q16JV p. 34 and
@@ -16,11 +16,11 @@ ID, and the date.
 
 ## 1. Verdict
 
-**A-8 holds on every chip tested.** Five chips of three parts took
+**A-8 holds on every chip tested.** Five chips of three parts take
 783,040 programs each (674,231 of them into bytes already programmed),
-with 84 erases each, and not one byte read back other than the model
-said. Every page of the bit-stepping test (P1) took 2,048 programs between
-erases, and the over-programmed byte (P4) 1,000.
+with 84 erases each, and not one byte reads back other than the model
+says. Every page of the bit-stepping test (P1) takes 2,048 programs
+between erases, and the over-programmed byte (P4) 1,000.
 
 | Part | Board kind | Chip (last 6 of unique ID) | Result |
 |---|---|---|---|
@@ -29,27 +29,26 @@ erases, and the over-programmed byte (P4) 1,000.
 | XT25F128F (0B4018) | MK1C_SD | 640027 | pass |
 | BY25Q64ES (684017) | MK1B_8MB | 851D20 | pass |
 | BY25Q64ES (684017) | MK1B_8MB | 361D20 | pass |
-| W25Q16JV | MK1B | | not tested: no MK1B was attached |
+| W25Q16JV | MK1B | | not tested |
 
 **The probe can fail.** The self-test run on the MK1A (`..._selftest.jsonl`)
-planted one wrong bit in the model and reported exactly that one
-mismatch, at 0x7FC500.
+plants one wrong bit in the model and reports exactly that one mismatch,
+at 0x7FC500.
 
 ---
 
 ## 2. The runs
 
-Each run used four sectors at the end of the board's firmware-update
+Each run uses four sectors at the end of the board's firmware-update
 download slot (0x7FC000 on MK1A, MK1C and MK1C_SD; 0x3FC000 on MK1B_8MB),
-which were blank before and are blank after. 20 cycles, seed 20261014.
-Each board rebooted into its own firmware afterwards and answered its
-status page.
+blank before and after the run. 20 cycles, seed 20261014. Each board
+reboots into its own firmware afterwards.
 
 | Part | Programs | Of them reprograms | Erases | Mismatches | Erases not blank | Seconds |
 |---|---|---|---|---|---|---|
 | each of the five | 783,040 | 674,231 | 84 | 0 | 0 | 132-158 |
 
-The status registers read as each part's defaults; no block was write
+The status registers read as each part's defaults; no block is write
 protected. The probe reads with 03h at clk_sys / 6 (20.8 MHz).
 
 ---
@@ -97,7 +96,7 @@ What the times say:
   XT25F128F, a quarter and a half of a full page; on the BY25Q64ES 250 us,
   two thirds of a full page. A driver should send only the bytes it
   programs.
-- **Some erases end early.** The quickest BY25Q64ES erases took 0.56 ms,
+- **Some erases end early.** The quickest BY25Q64ES erases take 0.56 ms,
   and XT25F128F 6.8 ms. The probe does not record which erases those were.
   The only sectors erased while already blank are the four at the start of
   each run, so these parts appear to skip most of the work on a blank
@@ -107,38 +106,39 @@ What the times say:
 
 ## 4. Torn programs and erases (P8, P9)
 
-P8 and P9 (`run_probe.py --torn`, `docs/TEST_PLAN.md` section 6) abort a
+P8 and P9 (`run_probe.py --torn`, `docs/TEST_PLAN.md` section 7) abort a
 program or erase with the chips' software reset, Enable Reset (66h) then
 Reset (99h), at delays swept across the operation's time. Files
 `*_torn.jsonl`, one line a trial.
 
-**A-9 holds wherever a program could be torn.** No torn program ever
-cleared a bit its data left 1, and programming the same data again left
-every byte reading as intended on 16 reads, on every trial.
+**A-9 holds wherever a program can be torn.** No torn program clears a
+bit its data leaves 1, and programming the same data again leaves every
+byte reading as intended on 16 reads, on every trial.
 
 | Part | Board | Torn 256 B / 18 B (of 128 each) | Trials with bits reading both ways | Stray bits | Wrong after programming again | Verdict |
 |---|---|---|---|---|---|---|
 | W25Q128JV | MK1A | 97 / 27 | 0 | 0 | 0 | holds |
 | XT25F128F | MK1C | 37 / 10 | 25 / 4 (49 / 4 bits) | 0 | 0 | holds |
 | XT25F128F | MK1C_SD | 35 / 13 | 27 / 1 (63 / 3 bits) | 0 | 0 | holds |
-| BY25Q64ES | MK1B_8MB (both) | 0 / 0 | | | | untested: the chip finished every program and erase |
-| W25Q16JV | MK1B | | | | | untested: not attached |
+| BY25Q64ES | MK1B_8MB (both) | 0 / 0 | | | | untested: the chip finishes every program and erase despite the reset |
+| W25Q16JV | MK1B | | | | | untested |
 
 What the trials show:
 
 - **A torn program clears its bits in proportion to the time it ran.** On
-  the W25Q128JV a 256-byte program aborted at 33 us had cleared 55 of 989
+  the W25Q128JV a 256-byte program aborted at 33 us has cleared 55 of 989
   bits, at 189 us 452, at 377 us 967; the program of the same data again
-  took less time the more had been done (383 us down to 85 us).
-- **The XT25F128F leaves bits that read either way**, littlefs's
-  METASTABLE: a program aborted 17 to 52 us in left a page that read
-  erased but for one or two bits that read 0 on some reads and 1 on others.
-  Such a page passes a single blank check. Programming the intended data
-  again settled every one. This is why a resumed stream skips the page
-  after its last good chunk too (SAFE-04), and why it programs its claim
-  again (A-9).
+  takes less time the more is done (383 us down to 85 us).
+- **The XT25F128F leaves bits that read either way** (FLICKER,
+  requirements 4.4): a program aborted 17 to 52 us in leaves a page that
+  reads erased but for one or two bits that read 0 on some reads and 1 on
+  others. Such a page passes a single blank check. Programming the intended
+  data again settles every one. So alfs never writes again to a file a
+  mount finds unclosed, zeroes the claim of the sector a torn claim program
+  would have taken, and programs a sector's stamp again with each claim
+  (SAFE-04, A-9).
 - **The BY25Q64ES ignores the reset while busy**, in effect: even 2 us
-  in, every program completed and every erase finished, though its
+  in, every program completes and every erase finishes, though its
   datasheet says a reset terminates "any on-going internal operations"
   (p. 30). Tearing it needs a power cut, which these boards cannot make.
 
@@ -154,7 +154,7 @@ Between those, a few trials read partly erased, with bits reading either
 way. So a blank check cannot tell a finished erase from one cut short at
 a tenth (W25Q128JV) or half (XT25F128F) of its time. alfs does not rely on
 it: a sector is ready only once its stamp is programmed, after the erase
-has returned done (SPEC section 5), and a power cut between leaves no
+has returned done (SPEC section 6), and a power cut between leaves no
 stamp, so the sector stays dirty and is erased again.
 
 ---
@@ -166,7 +166,7 @@ stamp, so the sector stays dirty and is erased again.
 - **Read back at once.** Whether bits cleared by a reprogram keep as well
   as bits programmed once (retention) is not tested.
 - **No real power cut.** P8 and P9 abort by command with the supply
-  steady, a stand-in for a supply collapsing. The BY25Q64ES could not be
-  torn that way at all.
+  steady, a stand-in for a supply collapsing. The BY25Q64ES cannot be torn
+  that way at all.
 - **The probe reads with 03h at clk_sys / 6** (20.8 MHz), which is not how
   pyro reads in flight (execute-in-place).

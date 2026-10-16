@@ -9,15 +9,9 @@ size, P the page size. "Erased" means every byte equals the configured
 erase value E; "zero" means every byte equals its complement, ~E. The
 prog unit is one byte (requirements A-8, A-9).
 
-Version 3 gives files names and versions (requirements draft 3). Against
-version 2:
-- The claim drops its 4-byte tag.
-- A file's first sector holds its name and a close record in its first
-  page, and its data from its second page.
-- The rules that resumed a file after a mount are gone.
-- Prog units over one byte are gone.
-
-A version 2 region does not mount as version 3.
+A stamp is valid only with version 3 (section 1.1), so a region whose
+stamps carry another format version holds no valid stamp, and a mount of
+it returns `ALFS_ENOFS`.
 
 ---
 
@@ -75,21 +69,21 @@ sectors with one more than the largest valid count among them.
 The **next sequence** at mount is two more than the largest of every valid
 claim's sequence and every valid stamp's floor, and three more when the
 mount finds a torn claim.
-- **Why:** a power loss can tear a claim so that it reads invalid now and
-  valid later.
-- **The bound:** that claim's sequence is at most two more than the largest
-  known. Either it was the first sequence its mount gave, two more than the
-  largest then, or it followed a claim that is still valid. The floors keep
-  the largest sequence known after its sector is erased.
-- **So** starting three more past a torn claim never gives its sequence
-  again. Two more is not enough: a mount followed by a create torn at once
-  left the next mount starting exactly at the torn claim's sequence (found
-  with seeds 16 and 30, 2026-10-15).
+- **Why:** a power loss can tear a claim so that it reads invalid at one
+  mount and valid at a later one. Its sequence must never be given again.
+- **The bound:** a torn claim's sequence is at most two more than the
+  largest known. Either it is the first sequence its mount gave, two more
+  than the largest then, or it follows a claim that is still valid. The
+  floors keep the largest sequence known after its sector is erased.
+- **So** three more than the largest known is past any sequence a torn
+  claim holds. Two more is not: a create torn straight after a mount holds
+  exactly two more than the largest that mount knew, which is also the
+  largest the next mount knows.
 
 ### 1.2 The dead mark
 
-Erased: the file whose first sector this is lives. Any other value: it
-was deleted. alfs writes ~E, in one program, so a delete is atomic. Only a
+Erased: the file whose first sector this is lives. Any other value: the
+file is deleted. alfs writes ~E, in one program, so a delete is atomic. Only a
 file's first sector's mark is read.
 
 ### 1.3 The claim
@@ -277,8 +271,7 @@ last page, a sector no file holds yet, or a stamp.
 Step 3 means a close a power loss left half programmed cannot read unclosed
 once this version is gone. It completes any close record that is not
 erased, not only one that reads whole: the application may have seen it
-whole in a listing a moment before, and a second read can differ (found by
-`safe_config_replace`, 2026-10-15).
+whole in a listing a moment before, and a second read can differ.
 
 ---
 
@@ -302,6 +295,6 @@ decides from one read of its file's dead mark:
 erased, programs the stamp and reads the stamp back. Any failure makes the
 sector bad for the rest of the mount.
 
-The stamp, not the blank check, is what shows an erase completed. The probe
-found erases aborted at a tenth of their time already reading blank
+The stamp, not the blank check, is what shows an erase completed: an erase
+aborted at a tenth of its time can already read blank
 (`docs/FLASH_PROBE.md` section 4).

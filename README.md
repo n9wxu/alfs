@@ -6,21 +6,19 @@ code from the same chip and cannot afford to stall.
 
 Priorities, in order: speed, then flash life, then safety. A corrupted data
 block is less important than a broken exec loop. Nothing erases unless the
-application asks: every write programs flash that was erased ahead of
-time.
+application asks: every write programs flash erased ahead of time.
 
-**Status:** format version 3, 2026-10-15. Requirements, tests and code.
-- **Core:** 44 tests pass on 8 simulator seeds under the sanitizers
-  (`make test`) and on 100 seeds (`make soak`). It is 7.1 KB of code on a
-  Cortex-M0+, against littlefs's 15.5 KB on the same build.
-- **Flash task:** 7 tests pass on the FreeRTOS POSIX port
-  (`make test-rt`). It is 1.2 KB of code.
-- **Erases:** on littlefs's 10-minute logging workload at 50 rows a second,
-  alfs erases 168 sectors, all when asked, where littlefs 2.11.3 erases
-  807 in its write path.
-- **Hardware:** the flash assumptions alfs rests on were measured on the
-  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs itself has not yet
-  run on hardware.
+**Status:** format version 3. Requirements, tests and code.
+- **Core:** 44 tests, run on 8 simulator seeds under the sanitizers
+  (`make test`) and on 100 seeds (`make soak`). 7,101 bytes of code on a
+  Cortex-M0+.
+- **Flash task:** 7 tests on the FreeRTOS POSIX port (`make test-rt`).
+  1,153 bytes of code.
+- **Erases:** on the W-LOG workload (22-byte rows at 50 a second, synced
+  every second, for 10 minutes), 168 sector erases, all of them asked for.
+- **Hardware:** the flash assumptions alfs rests on are measured on the
+  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs itself runs in the
+  simulator and on the POSIX port only; it is untested on hardware.
 
 ## How it works
 
@@ -61,24 +59,24 @@ A write that fits in its block never leaves the caller's task.
 | `alfs_rtos.h`, `alfs_rtos.c` | the flash task, on FreeRTOS |
 | `tests/` | the simulated flash, the harness and both test suites |
 | `docs/datasheets/` | the flash parts the figures come from |
-| `probe/`, `docs/FLASH_PROBE.md` | the flash probe, which measures the chips themselves, and what it found |
-| `docs/CATALOG_EVALUATION.md`, `docs/V2_STRATEGY.md` | earlier design decisions, kept for their reasoning |
+| `probe/`, `docs/FLASH_PROBE.md` | the flash probe, which measures the chips themselves, and its measurements |
 
 The use cases come from the pyro flight computer
-(github.com/n9wxu/pyro_fw); the flash fault model from the littlefs v3 work
+(github.com/n9wxu/pyro_fw), the flash fault model from the littlefs fork
 (github.com/n9wxu/littlefs). alfs shares no code with either.
 
 ## Branches
 
-| Branch | What |
+| Branch | What it holds |
 |---|---|
 | `main` | format version 3 and the flash task |
-| `experiment/format-1` | the first build: streams found by an identity and a tag, one flash operation a call, 5.3 KB |
-| `experiment/format-2` | exact programs, sector numbers and resuming a file after a reset, 6.8 KB; replaced by format 3 |
-| `experiment/v2-safety-rule-cost` | what each of format 2's safety rules costs in code, by building alfs without it |
-| `experiment/v3-requirement-cost` | what each requirement costs in format 3's code, and the simplest alfs that still meets them |
+| `experiment/format-1` | format 1: streams found by an identity and a tag, one flash operation a call; 5.3 KB |
+| `experiment/format-2` | format 2: streams with sector numbers, exact programs, and resuming a stream after a reset; 6.8 KB |
+| `experiment/v2-safety-rule-cost` | the code each of format 2's safety rules takes, measured by building format 2 without it |
+| `experiment/v3-requirement-cost` | the code each requirement takes in format 3, and which tests fail without it |
 
-An experiment's branch holds its own `experiments/<name>/RESULTS.md`.
+Each experiment branch holds its method and results in
+`experiments/<name>/RESULTS.md`.
 
 ## Tests and releases
 
@@ -86,12 +84,12 @@ Every push runs every test (`.github/workflows/test.yml`):
 - the core and the flash task on 8 seeds under the sanitizers, built with
   GCC and with Clang;
 - the core on 100 seeds;
-- the Cortex-M0+ size and stack budgets, with the Arm GNU Toolchain
-  release they were measured with (13.2.Rel1).
+- the Cortex-M0+ size and stack budgets, built with Arm GNU Toolchain
+  13.2.Rel1, the release the budgets are set for.
 
 A release is made by pushing a tag `v*`. The release workflow runs all of
-those tests on the tagged commit first, and makes the release only if every
-one passes.
+those tests on the tagged commit, and makes the release only if every one
+passes.
 
 ## License
 

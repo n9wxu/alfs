@@ -1,13 +1,7 @@
 # alfs test plan
 
-**Status: draft 3, 2026-10-15.** Written after `docs/REQUIREMENTS.md` and
-before the code. Draft 3 adds the tests of requirements draft 3:
-- names, versions, listing and the close record;
-- the flash task, tested on the FreeRTOS POSIX port;
-- every test run over several simulator seeds.
-
-Every requirement names its test there; this document says how the tests
-work and what each one does.
+**Status: draft 3.** Every requirement in `docs/REQUIREMENTS.md` names its
+test; this document says how the tests work and what each one does.
 
 ---
 
@@ -34,11 +28,10 @@ and the target checks pass.
 - which bit a torn operation tears;
 - what a bit that reads either way reads.
 
-Draft 2's suite ran one fixed seed. Other seeds found two faults that seed
-hid, one in the code and one in the simulator (requirements SAFE-04,
-SAFE-11). The test binary takes its seed from `ALFS_SEED`. `make test` runs
-seeds 1 to 8 and `make soak` 1 to 100. A failure prints its seed, so it can
-be run again alone.
+One seed reaches only some of the ways a torn bit can read, so every test
+runs on several. The test binary takes its seed from `ALFS_SEED`. `make
+test` runs seeds 1 to 8 and `make soak` 1 to 100. A failure prints its
+seed, so it can be run again alone.
 
 ---
 
@@ -56,7 +49,7 @@ violation, and every test fails on any:
   given the value the programs before it meant, or 00h (settling, A-9);
 - a program of a byte that an interrupted operation touched (SAFE-04),
   with the same exception. A torn program touches only the bytes it was
-  given (A-3; the probe's P4 found no neighbour disturbed).
+  given (A-3; in the probe's P4 no neighbouring byte changes).
 
 **It injects the faults of requirements section 4.4:**
 
@@ -77,7 +70,7 @@ violation, and every test fails on any:
 
 **A program is an AND** (A-8): each byte becomes its old value AND the
 data. A torn program's bit that reads either way (METASTABLE, FLICKER) is
-one its data clears, as the probe found (P8). It settles at 0 when a
+one its data clears, as in the probe's P8. It settles at 0 when a
 program gives it 0 (A-9), and stays unsettled when given 1.
 
 **It measures:**
@@ -108,9 +101,8 @@ test, not only the ones named for them.
 The region starts one sector into the chip (one large block, where large
 erases are tested), so that no address is ever taken as an offset.
 
-**Rows.** A 22-byte row carries its sequence number and a CRC-32, like
-littlefs's W-LOG rows, so a test can tell good data from bad without
-alfs's help.
+**Rows.** A 22-byte row carries its sequence number and a CRC-32, so a
+test can tell good data from bad without alfs's help.
 
 **Workloads** (requirements 4.5):
 
@@ -152,7 +144,7 @@ alfs's help.
 | `spd_read_next_bounded` | SPD-10 | Two files of 200 sectors written together on 512 sectors, and one alone: reading one of the pair reads at most one header more a sector than reading the one alone. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
 | `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and W-HR, against the bound computed from the simulator's own counts. |
-| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, deleted and erased: erases at most the sectors the log filled, plus one. Prints the count beside littlefs v2.11.3's 807. |
+| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, deleted and erased: erases at most the sectors the log filled, plus one. Prints the count. |
 | `life_wear_level` | LIFE-04 | W-RING until every sector is erased ten times: counts within 2. |
 | `life_erase_count_persists` | LIFE-05 | W-RING, a remount: the least and greatest counts alfs reports equal the simulator's. |
 | `life_partial_program_cap` | LIFE-06 | 1,000 three-byte syncs: at most 16 programs a page, and at most 4 when configured so. |
@@ -230,7 +222,7 @@ has one core, so pyro's two-core scheduling is not reproduced.
   recursion and calls nothing through a pointer but the driver, whose
   frames the caller adds.
 - The power-loss runs are linear: one loss at each operation, and a second
-  in a third of them. littlefs's exhaustive schedules are not reproduced.
+  in a third of them. Schedules of three or more losses are not run.
 - Timing is simulated at typical figures. The worst-case figures of
   requirements 4.3 scale every stall by the same factor and change no
   pass or fail.

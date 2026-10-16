@@ -3,19 +3,14 @@
 alfs, the append-log flash store: a small filesystem of named, versioned
 files on serial NOR flash, built for append-only logs.
 
-**Status: draft 3, 2026-10-15.** Requirements come first, then the tests
-that verify them (`docs/TEST_PLAN.md`), then the code. Draft 2 added what
-the flash probe found and the changes of `docs/V2_STRATEGY.md`. Draft 3
-gives files names and versions, makes alfs a typical filesystem served by
-one task that does every flash operation, and drops resuming a file after
-a reset. Requirements it changes say so, with the reason; those it retires
-keep their numbers.
+**Status: draft 3.** Requirements come first, then the tests that verify
+them (`docs/TEST_PLAN.md`), then the code.
 
 ---
 
 ## 1. Purpose and priorities
 
-The brief, 2026-10-14:
+The brief, from the user:
 
 > "Clean sheet a focused flash filesystem optimized for append logging and
 > preserving the flash memory. ... Use the pyro lessons as use-cases. Use
@@ -24,8 +19,7 @@ The brief, 2026-10-14:
 > less important than a broken exec loop. Simplicity will keep the code
 > fast and flash overhead cheap."
 
-And two rulings given the same day for the pyro flight computer, which
-alfs adopts as its founding rules:
+The founding rules, the user's rulings for the pyro flight computer:
 
 > "Fast writes require pre-erase. Before flight, we must ensure all unused
 > flash is erased."
@@ -34,7 +28,7 @@ alfs adopts as its founding rules:
 > sectors. It does not matter if the write is metadata or document data.
 > Erase before write adds significant delay to the append operations."
 
-The user, 2026-10-15, on the shape of draft 3:
+The user, on the design:
 
 > "Give ALFS a freertos task for the flash ops. Writes collect in the
 > writer function and then spill to the flash ops task when enough data is
@@ -61,10 +55,10 @@ The user, 2026-10-15, on the shape of draft 3:
 > file but with a version number bump. All versions appear in a directory
 > listing. Delete is explicit on version numbers."
 
-And three choices the user made the same day: erasing happens only when
-the application asks; a version number is alfs's identity of the file,
-never reused; after a reset the application starts a new version of a
-file rather than resuming the old one.
+And the user's choices: erasing happens only when the application asks; a
+version number is alfs's identity of the file, never reused; after a reset
+the application starts a new version of a file rather than resuming the
+old one.
 
 **The order of priority.** Every requirement carries one:
 
@@ -106,12 +100,11 @@ writes less and has fewer ways to fail. Its requirements are budgets.
 
 - Writing into the middle of a file, truncating, renaming, directories. A
   name may hold a `/`, but no directory exists.
-- Reopening a file to append to it. Draft 2 resumed a file after a reset
-  (SAFE-04 as it then stood); draft 3 starts a new version instead, the
-  user's choice of 2026-10-15.
+- Reopening a file to append to it. After a reset the application starts
+  a new version (the user's choice); the rest of the cut-short file's last
+  sector stays unused until that file is deleted.
 - NAND, SD cards, eMMC: any medium with a write-back cache or its own
-  translation layer. Their reordering (littlefs's OOO behaviour) is not
-  modelled.
+  translation layer. The reordering such a cache makes is not modelled.
 - A part whose prog unit is over one byte (one with error correction
   inside it): alfs relies on A-8 and A-9.
 - Encryption and an unknown erase value.
@@ -125,19 +118,19 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 (`REQUIREMENTS.md`, FLT-LOG-nn) and its open tasks
 (`docs/outstanding_tasks.md`).
 
-| # | Use case | What pyro learned |
+| # | Use case | Need |
 |---|---|---|
-| UC-1 | **A flight log.** 22-byte rows at 1 to 50 a second, written by a task of a system whose flight loop runs every 20 ms, and synced every second. | Every flash program or erase on the RP2040 stops both cores (DD-074). littlefs 2.11.3 erased a block at every sync: 46 to 73 ms stops and 20 to 77 loop overruns a minute (DD-035, L2). Hence the rulings. |
-| UC-2 | **A high-rate log.** Everything sensed, about 24 kB a second: 16.2 MB in a 668 s flight. | On MK1C-SD it goes to an SD card through a 32 kB RAM ring, into a file preallocated on the pad (DD-077). On NOR it is about 94 page programs a second. |
-| UC-3 | **Restart after a reset in flight.** The board restarts and logs on into a new version of its log; the version cut short stays readable. | DD-086. The time from reset to the first sample is flight time lost. Changed 2026-10-15: draft 2 reopened the newest log and appended to it. |
+| UC-1 | **A flight log.** 22-byte rows at 1 to 50 a second, written by a task of a system whose flight loop runs every 20 ms, and synced every second. | Every flash program or erase on the RP2040 stops both cores (DD-074), and an erase takes 35 to 800 ms (section 4.3), many loop periods. Hence the rulings. |
+| UC-2 | **A high-rate log.** Everything sensed, about 24 kB a second: 16.2 MB in a 668 s flight. | On NOR it is about 94 page programs a second. |
+| UC-3 | **Restart after a reset in flight.** The board restarts and logs on into a new version of its log; the version cut short stays readable. | The time from reset to the first sample is flight time lost (DD-086). |
 | UC-4 | **Keep the newest flights.** Two, the oldest deleted by the application. | C6. |
 | UC-5 | **Erase before flight.** On the bench, or paced on the pad; launch waits until it is done. | The rulings; C6's OK to LAUNCH gate. A 4 KB erase takes 35 to 45 ms typically and up to 800 ms (section 4.3). |
 | UC-6 | **Read a file back.** Sequentially, for download, perhaps while another file is written. | `/api/flight.csv` renders the log as it reads. |
 | UC-7 | **Power cut at any moment.** A battery lead lost at landing. | FLT-LOG-06: "no more than the last second shall be lost." |
-| UC-8 | **The wrong geometry.** An image built for an 8 MB chip, run on a 2 MB one. | The flash wrapped, and the filesystem formatted over the bootloader (DD-098). |
-| UC-9 | **Write failures.** A program that fails part-way. | A retry wrote part of a record twice and misaligned everything after it, and nothing counted the loss (L4). |
-| UC-10 | **Unattended, soldered-in flash.** Replacing the chip loses everything; the unit may be out of reach. | From the littlefs work: degrade gracefully, shrink with bad sectors, stay readable at end of life, report health. |
-| UC-11 | **Configuration files.** Saved on the ground, each save a new version of the same name; every version listed; the application deletes the old ones. | The user, 2026-10-15. pyro keeps its configuration and web pages in littlefs today. |
+| UC-8 | **The wrong geometry.** An image built for an 8 MB chip, run on a 2 MB one. | Nothing may be written past the chip's end or outside the region, where the bootloader and the code lie (DD-098). |
+| UC-9 | **Write failures.** A program that fails part-way. | A retry must not write part of a record twice, and every byte lost is counted (L4). |
+| UC-10 | **Unattended, soldered-in flash.** Replacing the chip loses everything; the unit may be out of reach. | Degrade gracefully, shrink with bad sectors, stay readable at end of life, report health. |
+| UC-11 | **Configuration files.** Saved on the ground, each save a new version of the same name; every version listed; the application deletes the old ones. | The user's words on config files (section 1). |
 | UC-12 | **Many tasks, one flash.** The flight log from a storage task, configuration and downloads from a network task, each blocking only itself. | pyro runs FreeRTOS on both cores (DD-073); its flash operations go through one routine that stops both cores for one operation at a time (DD-074, `src/flash_op.c`). |
 
 ---
@@ -171,7 +164,7 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 - **sync:** a call after which every byte written so far is durable.
 - **durable:** survives a power loss at any later moment.
 - **flash task:** the one task that performs every flash operation of an
-  instance (draft 3).
+  instance.
 - **request:** what a call in the application's task sends the flash task,
   and waits on until it is done.
 - **ready sector:** a sector whose erase completed and which nothing has
@@ -186,14 +179,14 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | # | Assumption | Source |
 |---|---|---|
 | A-1 | A program moves bits only away from the erase value; only an erase moves them back. | Every NOR part |
-| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit. The probe programmed pages 2,048 times (A-8) |
-| A-3 | A program interrupted by power loss changes no byte outside its own page. | The littlefs fork assumes the same of a prog (`lfs3.h`, `gc_preerase_count`) |
-| A-4 | An erase interrupted by power loss changes no byte outside its own sector, and may leave that sector in any state, including one that reads as erased but holds bits that read randomly. | littlefs's METASTABLE behaviour (4.4) |
+| A-2 | A program of fewer bytes than a page, into erased bytes, leaves the page's other bytes as they were, and a page may be programmed so at least 16 times between erases. | All four datasheets (`docs/datasheets/README.md`); none states a limit. The probe programs pages 2,048 times (A-8) |
+| A-3 | A program interrupted by power loss changes no byte outside its own page. | The fault model (the littlefs fork's `lfs3.h`, `gc_preerase_count`) |
+| A-4 | An erase interrupted by power loss changes no byte outside its own sector, and may leave that sector in any state, including one that reads as erased but holds bits that read randomly. | METASTABLE (4.4) |
 | A-5 | Operations complete in the order issued; there is no write-back cache. | Raw serial NOR |
 | A-6 | The erase value is known and fixed: 0xFF on every part here. | The datasheets |
-| A-7 | A read can fail, as at low supply voltage, and succeed when retried. | The littlefs work's error-handling principle |
-| A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 2,048 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe on 2026-10-14 (`docs/FLASH_PROBE.md`): it held on the W25Q128JV, two XT25F128F and two BY25Q64ES; the W25Q16JV is not yet tested |
-| A-9 | A program that a power cut interrupts never clears a bit its data left 1. Programming the intended bytes again over it leaves them reading as intended on every later read, and changes no other byte. | No datasheet states it. Measured by the probe's P8, which interrupts programs with the chips' software reset (66h then 99h; W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30) as a stand-in for a power cut (`docs/FLASH_PROBE.md` section 4). Held on the W25Q128JV and two XT25F128F, 2026-10-14, including bits torn into reading either way; the BY25Q64ES finishes an operation despite the reset, so is untested, as is the W25Q16JV |
+| A-7 | A read can fail, as at low supply voltage, and succeed when retried. | UC-10 |
+| A-8 | A program into bytes already programmed clears exactly the bits that are 0 in its data and changes no other bit of the page. A page takes at least 2,048 programs between erases. | No datasheet states it: the Winbond parts' Page Program writes "previously erased (FFh) memory locations" (W25Q16JV p. 34, W25Q128JV p. 37), and the XT25F128F and BY25Q64ES sheets say nothing. Measured by the probe (`docs/FLASH_PROBE.md`): it holds on the W25Q128JV, two XT25F128F and two BY25Q64ES; the W25Q16JV is untested |
+| A-9 | A program that a power cut interrupts never clears a bit its data left 1. Programming the intended bytes again over it leaves them reading as intended on every later read, and changes no other byte. | No datasheet states it. Measured by the probe's P8, which interrupts programs with the chips' software reset (66h then 99h; W25Q128JV p. 60, XT25F128F p. 41, BY25Q64ES p. 30) as a stand-in for a power cut (`docs/FLASH_PROBE.md` section 4). It holds on the W25Q128JV and two XT25F128F, including bits torn into reading either way; the BY25Q64ES finishes an operation despite the reset, so is untested, as is the W25Q16JV |
 
 A-8 and A-9 are measured, not read. A part with error correction inside
 the chip breaks them, so a new part is probed before alfs runs on it.
@@ -221,14 +214,13 @@ duration (`rp2040-datasheet_2025-02-20.pdf` p. 136).
 Measured on the chips themselves (`docs/FLASH_PROBE.md`), a program of 1
 to 4 bytes takes 21-26 us on the W25Q128JV and 55-61 us on the XT25F128F
 and BY25Q64ES; a whole page 0.2-0.4 ms; a sector erase 15 ms (XT25F128F),
-26 ms (BY25Q64ES) and 47 ms (W25Q128JV). The requirements keep the
+26 ms (BY25Q64ES) and 47 ms (W25Q128JV). The requirements use the
 datasheets' figures.
 
 ### 4.4 Faults
 
-Power-loss behaviours, from the littlefs fork's emulated block device
-(`REQUIREMENTS.md` 5.5 at `v3-integration`; `bd/lfs3_emubd.h`), with
-FLICKER added. The interrupted operation:
+Power-loss behaviours, after the littlefs fork's emulated block device
+(`bd/lfs3_emubd.h`), and FLICKER. The interrupted operation:
 
 | Name | Program | Erase |
 |---|---|---|
@@ -239,19 +231,15 @@ FLICKER added. The interrupted operation:
 | TORNTAIL | its first byte stays as it was, a run of random length after it is programmed, and one bit the run cleared reads erased again | is atomic |
 | FLICKER | is not applied, but one bit its data clears reads randomly | is not applied, but one bit of the sector reads randomly |
 
-FLICKER is not littlefs's: it is the state the probe left on the
-XT25F128F by aborting a program early, a page that reads erased but for a
-bit that reads either way (`docs/FLASH_PROBE.md` section 4).
+FLICKER is the state the probe produces on the XT25F128F by aborting a
+program early: a page that reads erased but for a bit that reads either
+way (`docs/FLASH_PROBE.md` section 4).
 
-Every torn program moves only bits its data moves (A-9). Amended
-2026-10-15: SOMEBITS, MOSTBITS and TORNTAIL as littlefs defines them flip
-any bit, including one the data left as it was. A program cannot do that
-on NOR flash, and since alfs programs a sector's stamp again with each
-claim, those flips lost synced data in 5 of 100 test seeds; limited to
-bits the data moves, none did.
+Every torn program moves only bits its data moves (A-9): a program cannot
+move a bit its data leaves as it was.
 
-littlefs's sixth, OOO (writes since the last sync revert), needs a write
-cache and is out of scope (A-5).
+Reordering of the writes since the last sync needs a write cache, and is
+out of scope (A-5).
 
 Bad-sector behaviours, from the same device: PROGERROR (a program fails and
 writes nothing), ERASEERROR (an erase fails and erases nothing), READERROR
@@ -260,9 +248,9 @@ erase silently does nothing, and programs do nothing), PROGFLIP (a program
 lands with one bit wrong), READFLIP (reads flip one bit half the time).
 And wear-out: a sector goes bad after a number of erases.
 
-Faults the littlefs device could not inject, which alfs's tests must:
-a torn erase that reads as erased (A-4), a read that fails once then
-succeeds (A-7), and a failure confined to some offsets of a sector.
+The tests also inject a torn erase that reads as erased (A-4), a read that
+fails once then succeeds (A-7), and a failure confined to some offsets of
+a sector.
 
 ### 4.5 Workloads
 
@@ -270,9 +258,9 @@ Measurements use these, on the W25Q128JV's geometry (4,096-byte sectors,
 256-byte pages) with an 8 MiB region, timed with the typical figures of
 4.3, and with a block of one page unless a workload says otherwise.
 
-- **W-LOG:** littlefs's logging workload, so the figures compare with its
-  (the fork's `benches/bench_wlog.toml`): 22-byte rows produced at 1 or 50 a
-  second, written every 200 ms, synced every second, for 10 minutes.
+- **W-LOG:** 22-byte rows produced at 1 or 50 a second, written every
+  200 ms, synced every second, for 10 minutes (the littlefs fork's
+  `benches/bench_wlog.toml`).
 - **W-HR:** 480 bytes written every 20 ms (24,000 a second), synced every
   second, for 10 minutes.
 - **W-RING:** W-LOG at 50 rows a second, a new version of the log every 10
@@ -308,7 +296,8 @@ Nothing erases but an erase the application asks for (`alfs_erase`) and
 format.
 
 - Priority: 1.
-- Source: the rulings; UC-1; the user, 2026-10-15 (erase only when asked).
+- Source: the rulings; UC-1; the user's choice that erasing happens only
+  when the application asks.
 - Measure: erases the simulator counts during each call, under W-LOG,
   W-HR and W-RING, with power loss at every operation and every bad-sector
   behaviour.
@@ -325,12 +314,10 @@ fills, and then all but less than a page's room: X is at most the block's
 size B plus the bytes the write passes.
 
 - Priority: 1.
-- Source: UC-1, UC-2; the stall of 4.3. Amended 2026-10-15: draft 2 did one
-  operation a call and left the pacing to the caller; draft 3's write
-  blocks until its bytes are covered (the user's words, section 1), so it
-  bounds the burst instead. The application chooses B to fit its slack: a
-  sync of a full 4,096-byte block is about 20 programs, 8 ms at the
-  typical time.
+- Source: UC-1, UC-2; the stall of 4.3. A write blocks until its bytes are
+  covered (the user's words, section 1), so the burst it makes is what is
+  bounded. The application chooses B to fit its slack: a sync of a full
+  4,096-byte block is about 20 programs, 8 ms at the typical time.
 - Measure: programs the simulator counts during each call, against the
   bytes the call took into and left in the block, with writes of 480 and 22
   bytes and blocks of one page and of 4,096 bytes.
@@ -351,23 +338,15 @@ one page.
 #### ALFS-SPD-04
 
 A write or sync that finds no ready sector returns `ALFS_ENOSPC`, keeps
-the bytes it holds in the file's block, and erases nothing.
+the bytes it holds in the file's block, and erases nothing. A write may
+have programmed part of its bytes before it found no ready sector.
 
 - Priority: 1.
 - Source: the rulings.
 - Measure: a file written until no sector is ready.
 - Pass: `ALFS_ENOSPC`, no erase, and after an erase makes a sector ready
-  the bytes held are written. Fail: an erase, or a lost byte. Amended
-  2026-10-15: draft 2 also required no flash operation in that call; a
-  draft 3 write may already have programmed part of its bytes.
+  the bytes held are written. Fail: an erase, or a lost byte.
 - Verified by: `spd_enospc_without_erase`.
-
-#### ALFS-SPD-05
-
-Retired 2026-10-15. It said alfs never waits and passes on a driver's
-`ALFS_BUSY` from a suspended erase. In draft 3 each request is a loop that
-returns when its flash work is done (the user's words, section 1), and a
-driver that slices an erase does so inside its erase (IF-01).
 
 #### ALFS-SPD-06
 
@@ -375,30 +354,22 @@ Mounting reads at most 60 bytes of each sector of the region, and performs
 no flash operation.
 
 - Priority: 1.
-- Source: UC-3.
+- Source: UC-3. The 60 bytes are a sector's stamp (26), dead mark (1) and
+  claim (16), and its file's first sector's dead mark and claim (17).
 - Measure: bytes the simulator reads during `alfs_mount`.
 - Pass: at most 60 times the number of sectors. Fail: more, or any
-  operation. Amended 2026-10-14 from 60 to 68 for version 2's stamp floor
-  and sector number; 2026-10-15 back to 60: version 3's claim drops the
-  4-byte tag (names replace it) and holds 16 bytes.
+  operation.
 - Verified by: `spd_mount_reads_bounded`.
-
-#### ALFS-SPD-07
-
-Retired 2026-10-15 with reopening a file to append (section 2).
 
 #### ALFS-SPD-08
 
 On W-LOG and W-HR no flash operation stalls longer than one page program.
 
 - Priority: 1.
-- Source: UC-1, UC-2; littlefs v2.11.3's 96.6 ms and v3's 49.6 to 53.9 ms
-  on W-LOG (the fork's `REQUIREMENTS.md`, Appendix B.1). The user,
-  2026-10-14: "≤1ms writes is OK so the chunk size can be larger". A page
-  program measured at most 0.46 ms on the chips (`docs/FLASH_PROBE.md`),
-  so chunks stay up to a page; the datasheets' maximums (2 to 3 ms) are
-  above 1 ms. Amended 2026-10-15: each operation, where draft 2 measured
-  each call, which was then one operation.
+- Source: UC-1, UC-2. The user: "≤1ms writes is OK so the chunk size can
+  be larger". A page program measures at most 0.46 ms on the chips
+  (`docs/FLASH_PROBE.md`), so chunks are up to a page; the datasheets'
+  maximums (2 to 3 ms) are above 1 ms.
 - Measure: simulated time of each operation, at the typical times of 4.3.
 - Pass: at most 0.4 ms (one W25Q128JV page program). Fail: more.
 - Verified by: `spd_wlog_longest_stall`.
@@ -427,8 +398,9 @@ at most the sectors between them, in the direction alfs allocates, and
 the next one's.
 
 - Priority: 1.
-- Source: UC-6; v1 read every header in the region at each sector change
-  of a file written alongside another (`docs/V2_STRATEGY.md` 4.2).
+- Source: UC-6. A read that scanned every header in the region at each
+  sector change would slow with the region's size, and most with a file
+  written alongside another.
 - Measure: headers read by `alfs_read` at each sector change, reading back
   one of two files written together, and of one file written alone.
 - Pass: at most the sectors between, plus one. Fail: more.
@@ -441,8 +413,8 @@ the bytes the call passes, or the configured retries, whatever the flash
 holds.
 
 - Priority: 1.
-- Source: draft 3 makes each operation a loop (section 1), and a loop whose
-  end depends on what the flash reads is a hung task when the flash is
+- Source: each operation is a loop (section 1), and a loop whose end
+  depends on what the flash reads is a hung task when the flash is
   damaged. "A corrupted data block is less important than a broken exec
   loop."
 - Measure: every call made on fuzzed regions (SAFE-10); review of each
@@ -470,13 +442,10 @@ program, plus 72 bytes for each sector a file takes, plus 128 bytes a
 file.
 
 - Priority: 2.
-- Source: the brief; littlefs v3 programs about 768 bytes of metadata for a
-  16-byte append and sync with prog unit 256 (the fork's Appendix B.2).
-  Amended 2026-10-15: a sector costs its stamp (26 bytes) and a claim
+- Source: the brief. A sector costs its stamp (26 bytes) and a claim
   program that writes the stamp again with the dead mark and the claim
-  (43); a file's first sector adds its name, its close record and the marks
-  programmed again (SPEC section 1). Draft 2's bound counted prog units
-  over one byte.
+  (43); a file's first sector adds its name, its close record and the
+  marks programmed again (SPEC section 1).
 - Measure: bytes the simulator programs, against the bound computed from
   its own counts of programs, sectors and files, under W-LOG (22 bytes a
   sync at 1 row a second, 1,100 at 50) and W-HR (24,000).
@@ -488,8 +457,7 @@ file.
 On W-LOG, alfs erases no more sectors than the bytes it programmed fill.
 
 - Priority: 2.
-- Source: littlefs v2.11.3 erases 58.7 to 80.7 sectors a minute on W-LOG,
-  v3 2.8 to 48.5 (the fork's Appendix B.1).
+- Source: the brief; UC-1.
 - Measure: erases over 10 minutes against the bytes programmed divided by
   the sector size, after the log is deleted and every sector erased.
 - Pass: erases at most the sectors filled, plus one. Fail: more.
@@ -528,9 +496,9 @@ A page is programmed at most a configured number of times between erases
 
 - Priority: 2.
 - Source: A-2: no datasheet here limits partial programs, but other NOR
-  parts do. Amended 2026-10-15: a file's first page holds no data, and
-  takes four programs and at most two more in each mount (SPEC 1.5), so no
-  program of it is held back for its marks.
+  parts do. A file's first page holds no data, and takes four programs and
+  at most two more in each mount (SPEC 1.5), so no program of it is held
+  back for its marks.
 - Measure: programs per page the simulator counts, under W-LOG at 1 row a
   second.
 - Pass: at most the configured number. Fail: more.
@@ -548,13 +516,6 @@ of dirty sectors that fills one aligned block.
 - Pass: one large erase per aligned block. Fail: sector erases there.
 - Verified by: `life_large_erase`.
 
-#### ALFS-LIFE-08
-
-Retired 2026-10-15 with reopening a file to append (section 2). It bounded
-the bytes a resume left unused. A reset now leaves the rest of the
-unclosed file's last sector unused until the file is deleted: at most one
-sector.
-
 ### 6.3 Safety (SAFE)
 
 #### ALFS-SAFE-01
@@ -565,9 +526,8 @@ a power loss at any later operation, under every power-loss behaviour of
 
 - Priority: 3.
 - Source: UC-7.
-- Measure: W-LOG and W-HR with power lost after operation k, for every k
-  (littlefs's `-Plinear`), and for a sample of pairs; remount; read every
-  file.
+- Measure: W-LOG and W-HR with power lost after operation k, for every k,
+  and for a sample of pairs; remount; read every file.
 - Pass: every synced byte reads back, in order. Fail: any missing or wrong.
 - Verified by: `safe_powerloss_durable`.
 
@@ -611,18 +571,14 @@ reclaiming what was synced:
    alfs programs 00h over its claim, and an erase reclaims it.
 
 - Priority: 3.
-- Source: A-3, A-9; METASTABLE and FLICKER (4.4). The interrupted program
-  was the next chunk of a file, a claim, or a stamp. Rule 2: a stamp that
-  an erase's power loss left half programmed can read valid at one mount
-  and invalid at a later one. Rule 3: a claim program torn at its start
-  leaves a sector that reads ready but holds a bit that reads either way;
-  it is the first ready sector from where the allocation cursor stood,
-  after the newest claim. Amended 2026-10-15: rules 1 to 3 of draft 2
-  (programming a resumed file's claim again, skipping two pages, clearing
-  claims ahead) went with resuming; rule 1 is new, and draft 2's rules 4
-  and 5 are now 2 and 3. Seeds other than the suite's one fixed seed found
-  the resume reading its last claim twice and building on the second read
-  (2026-10-15): a fault that went with it.
+- Source: A-3, A-9; METASTABLE and FLICKER (4.4). The program a power loss
+  interrupts is the next chunk of a file, a claim, or a stamp. Rule 1: the
+  torn chunk is in the unclosed file's last page, which nothing writes
+  again. Rule 2: a stamp that an erase's power loss left half programmed
+  can read valid at one mount and invalid at a later one. Rule 3: a claim
+  program torn at its start leaves a sector that reads ready but holds a
+  bit that reads either way; it is the first ready sector from where the
+  allocation cursor stood, after the newest claim.
 - Measure: the simulator flags a program of a byte an interrupted
   operation changed (every behaviour but ATOMIC), unless it is given what
   the programs before it meant, or 00h; the power-loss runs remount, start
@@ -654,8 +610,7 @@ failing. After a configured number of failures in a row (default 3) they
 are dropped and counted. A program is checked by reading it back.
 
 - Priority: 3.
-- Source: UC-9. Amended 2026-10-15: draft 2 retried in a later call, to
-  keep one operation a call (SPD-02 as it then stood).
+- Source: UC-9.
 - Measure: PROGERROR, PROGNOOP and PROGFLIP sectors in the path of W-LOG.
 - Pass: every byte is written or counted as lost; nothing is written twice.
   Fail: otherwise.
@@ -706,9 +661,7 @@ writes nothing.
 Every call finishes, without a crash, on any content of the region.
 
 - Priority: 3.
-- Source: UC-10; littlefs's crafted images. Amended 2026-10-15: draft 2
-  named mount and read; draft 3's calls are loops (SPD-11), so every call
-  is held to it.
+- Source: UC-10; crafted images. Every call is a loop (SPD-11).
 - Measure: fuzzed regions (random sectors, valid headers with random
   fields), under a sanitizer: mount, list, open, read, create, write,
   close, delete and erase.
@@ -726,15 +679,15 @@ again with 00h (A-9), so a mark a power loss left half programmed cannot
 read as live once the reclaim has begun.
 
 - Priority: 3.
-- Source: UC-4; METASTABLE: a half-programmed mark could read deleted at
-  one mount and live at the next, after some sectors were erased. Amended
-  2026-10-14 (`docs/V2_STRATEGY.md` 4.4). The second read: a torn claim
-  that read invalid when the erase chose its sector, and valid when it
-  read again, made a live file look deleted, and the mark programmed
-  deleted it (found by `safe_powerloss_bound`).
+- Source: UC-4; METASTABLE: a half-programmed mark can read deleted at one
+  mount and live at the next, after some sectors were erased. The read
+  just before the erase: a torn claim can read invalid when the erase
+  chooses its sector and valid a moment later, so a live file can look
+  deleted when chosen; deciding from the later read keeps the mark's
+  program from deleting it.
 - Measure: power loss at every operation of a delete; remount; then power
   loss at every operation of the erases that reclaim it; remount; for
-  several simulator seeds, since one seed hid a fault here (2026-10-15).
+  several simulator seeds.
 - Pass: the version is whole or gone, never partial. Fail: partial.
 - Verified by: `safe_delete_atomic`, `safe_delete_reclaim`.
 
@@ -745,8 +698,8 @@ counted as one failed check, and reading goes on with the next sector
 present.
 
 - Priority: 3.
-- Source: UC-6; v1 passed over a lost sector silently
-  (`docs/V2_STRATEGY.md` 4.2).
+- Source: UC-6; a sector lost from the middle of a file is a loss to
+  count, not to pass over.
 - Measure: a sector of a file made dirty, then the file read.
 - Pass: every other sector's chunks read, in order, and one failure
   counted. Fail: otherwise.
@@ -759,8 +712,8 @@ absent, or present and empty. One whose name a power loss left half
 programmed lists without a name, and is deleted by its version.
 
 - Priority: 3.
-- Source: UC-11; draft 3 programs a file's first sector when it is created,
-  so that an empty file exists (SPEC 3).
+- Source: UC-11; a create programs the file's first sector, so that an
+  empty file exists (SPEC 3).
 - Measure: power loss at the create's program under each behaviour; eight
   remounts.
 - Pass: no version is listed with a name other than the one created, none
@@ -781,11 +734,11 @@ will not program releases the file unclosed.
 - Source: UC-11. A close record torn by METASTABLE can read closed at one
   mount and unclosed at the next; had the application seen it closed and
   deleted the version before, a later mount would find no closed version
-  of its configuration. First written as "the newest closed version": the
-  delete's own read of the record could find it unclosed after the
-  application's listing found it closed (`safe_config_replace`, amended
-  2026-10-15). A close record's place is fixed in the file's first
-  sector, so one that fails cannot move to a fresh sector (SAFE-06).
+  of its configuration. The delete completes every close record that is
+  not erased, not only one that reads whole: the application's listing can
+  read a record whole a moment before the delete's own read finds it torn.
+  A close record's place is fixed in the file's first sector, so one that
+  fails cannot move to a fresh sector (SAFE-06).
 - Measure: power loss at every operation of W-CFG; after each, eight
   remounts.
 - Pass: whenever a closed version of the file existed before the loss,
@@ -804,8 +757,7 @@ is one more of each (`alfs_rtos.c`, `alfs_rtos.h`), which adds only the
 FreeRTOS kernel's headers.
 
 - Priority: S.
-- Source: amended 2026-10-15 for the flash task; the core stays usable
-  without an RTOS (section 2).
+- Source: the core is usable without an RTOS (section 2).
 - Measure: the build and a review.
 - Pass: as stated. Fail: otherwise.
 - Verified by: `make target` (compiles `alfs.c` alone, with
@@ -813,23 +765,12 @@ FreeRTOS kernel's headers.
 
 #### ALFS-SIMP-02
 
-The core is at most 7 KiB on a Cortex-M0+ (Thumb, `-Os`), under half of
-littlefs's, and the task layer at most 1.5 KiB.
+The core is at most 7 KiB on a Cortex-M0+ (Thumb, `-Os`), and the task
+layer at most 1.5 KiB.
 
 - Priority: S.
 - Source: the brief ("Simplicity will keep the code fast and flash
-  overhead cheap"). littlefs 2.11.3 built the same way (`-Os`,
-  `-mcpu=cortex-m0plus`, its debug, warning, error and assert output off,
-  no malloc) is 15,456 bytes. Draft 1 guessed 4 KiB before any code
-  existed; the first build was 5.4 KiB, 5.3 after its duplication was
-  removed. Amended 2026-10-14 from 6 KiB: version 2 was 6,845 bytes, 1,544
-  more than version 1, nearly all for the rules that settle what a power
-  loss half programmed (measured 2026-10-15: 1,508 bytes). Draft 3 removed
-  resuming, the erase-step state machine and prog units over one byte: on
-  the version 2 layout that was 5,041 bytes. Names, versions, the close
-  record, listing, the open-file list and caller blocks bring version 3
-  to 7,101 bytes (2026-10-15), 67 under the budget. The task layer
-  measured 1,153 bytes.
+  overhead cheap"). The core measures 7,101 bytes and the task layer 1,153.
 - Measure: `arm-none-eabi-size` of `alfs.o` and `alfs_rtos.o`, text plus
   data; the task layer compiled against the kernel's generic Cortex-M0
   port.
@@ -842,20 +783,16 @@ RAM does not grow with the region, and all of it is the caller's: an
 instance is at most 96 bytes and a scratch page; a file handle at most 48
 bytes and its block, of at least one page; the task layer, the task's
 stack and control block, the queue's storage, and for each request about
-100 bytes on the calling task's stack.
+200 bytes on the calling task's stack.
 
 - Priority: S.
-- Source: pyro's Lua boards have about 13.5 kB of SRAM spare (measured
-  2026-10-14, pyro's `docs/flash_stall_options.md` section 6.3), and a
-  region of 8 MiB must not cost more than a small one. The user,
-  2026-10-15: "Applications bring their ram so ram allocations in ALFS
-  should not be an issue." Amended 2026-10-15: draft 2's stream was 32
-  bytes and a buffer of a page plus 53; a file handle now keeps a list
-  link and its size, and the scratch page lets a block be any size.
-  Measured on the Cortex-M0+: an instance 96 bytes, a handle 36. A request
-  puts about 200 bytes on its caller's stack (its frames, the request and
-  the semaphore), and the kernel's own frames under them, where "about
-  100" was guessed.
+- Source: pyro's Lua boards have about 13.5 kB of SRAM spare (pyro's
+  `docs/flash_stall_options.md` section 6.3), and a region of 8 MiB must
+  not cost more than a small one. The user: "Applications bring their ram
+  so ram allocations in ALFS should not be an issue." Measured on the
+  Cortex-M0+: an instance 96 bytes, a handle 36. A request puts about 200
+  bytes on its caller's stack (its frames, the request and the semaphore),
+  and the kernel's own frames under them.
 - Measure: `sizeof` of the instance and handle structures, blocks and
   scratch excluded.
 - Pass: at most 96 and 48 bytes. Fail: more.
@@ -867,12 +804,9 @@ No core call uses more than 320 bytes of stack, and the flash task's
 deepest chain no more than 512 bytes, the driver's own frames apart.
 
 - Priority: S.
-- Source: draft 1 guessed 256 before any code existed; the first build's
-  deepest chain was 292 bytes. pyro's smallest task stack is 2 kB.
-  Amended 2026-10-15 for the flash task, whose stack holds the core's
-  deepest chain under the task's loop. Measured 2026-10-15: 316 bytes
-  under `alfs_write`, after headers moved to the scratch page and names
-  were compared in pieces (404 before); 356 under the flash task.
+- Source: pyro's smallest task stack is 2 kB. The flash task's stack holds
+  the core's deepest chain under the task's loop. Measured: 316 bytes
+  under `alfs_write`, 356 under the flash task.
 - Measure: the deepest chain of frames under each public call and under
   the task's function, from GCC's call graph (`-fcallgraph-info=su`) on
   the Cortex-M0+ build. A host build's stacks say nothing here: the
@@ -901,10 +835,9 @@ operation waits, and fails only on a fault of the flash. A read sees every
 program and erase before it.
 
 - Priority: S.
-- Source: amended 2026-10-15: draft 2's erase could return `ALFS_BUSY` to
-  be called again (SPD-05, retired). pyro's flash routine refuses an
-  operation it cannot start within 500 ms (`src/flash_op.c`); to alfs a
-  refusal is a failed program, and the sector would be abandoned.
+- Source: pyro's flash routine refuses an operation it cannot start within
+  500 ms (`src/flash_op.c`); to alfs a refusal is a failed program, and the
+  sector would be abandoned.
 - Verified by: the simulator implements exactly these.
 
 #### ALFS-IF-02
@@ -918,9 +851,8 @@ claim, a dead mark again with 00h, a close record again with the bytes it
 reads, and 00h over a claim (SAFE-04 rule 3).
 
 - Priority: S.
-- Source: amended 2026-10-15: draft 2 configured a prog unit up to a page
-  and settled nothing when it was over one byte; draft 3 requires one byte
-  (section 2). The page holds a file's first sector's records (SPEC 1).
+- Source: the prog unit is one byte (section 2). The page holds a file's
+  first sector's records (SPEC 1).
 - Verified by: `if_geometry` (every combination the tests use is
   accepted; misaligned or oversized ones are refused); every test (the
   simulator refuses a program into a byte already programmed unless it is
@@ -940,9 +872,7 @@ any host reads any image.
 A file is found by its name and its version.
 
 - Priority: S.
-- Source: the user, 2026-10-15: "All files will be accessed by name."
-  Amended 2026-10-15: draft 2 found a stream by an identity and a 32-bit
-  tag the caller chose.
+- Source: the user: "All files will be accessed by name."
 - Verified by: `if_names`, `if_list_files`.
 
 #### ALFS-IF-05
@@ -952,8 +882,7 @@ the BY25Q64ES a page padded with the erase value takes 3.2 times as long as
 its 16 programmed bytes sent alone (`docs/FLASH_PROBE.md` section 3).
 
 - Priority: S.
-- Source: the probe, 2026-10-14; pyro's flash path programs whole pages
-  (`src/littlefs_driver.c`, `prog_size = FLASH_PAGE_SIZE`).
+- Source: the probe.
 - Verified by: review of each driver; the simulator counts the bytes of
   each program.
 
@@ -963,8 +892,8 @@ A name is 1 to 31 bytes, none of them 00h, compared byte for byte. A `/`
 is an ordinary byte.
 
 - Priority: S.
-- Source: the user, 2026-10-15: "files need filenames." pyro's longest
-  littlefs path today is 15 bytes (`/www/index.html`).
+- Source: the user: "files need filenames." pyro's longest file path is 15
+  bytes (`/www/index.html`).
 - Verified by: `if_names` (names of 1 and 31 bytes; 0 and 32 bytes, and one
   holding 00h, refused).
 
@@ -975,14 +904,14 @@ life of the region, growing with each create of any name, and never used
 again, even after a delete or a create a power loss tore.
 
 - Priority: S.
-- Source: the user, 2026-10-15 (versions as global identities, never
-  reused). A version counted per name would be used again after its
-  newest version was deleted, and twice after a torn create read invalid
-  at one mount and valid at a later one. The identity has both covered:
-  each stamp records the next sequence, and a mount takes two more than
-  the largest in any claim or stamp, three when it finds a torn claim
-  (SPEC 1.1). Two alone gave a torn create's version again when the create
-  came straight after a mount (found 2026-10-15, seeds 16 and 30).
+- Source: the user's choice of versions as global identities, never
+  reused. A version counted per name would be used again after its newest
+  version was deleted, and twice after a torn create read invalid at one
+  mount and valid at a later one. The identity has both covered: each
+  stamp records the next sequence, and a mount takes two more than the
+  largest in any claim or stamp, three when it finds a torn claim (SPEC
+  1.1). Three, because a create torn straight after a mount holds the
+  sequence that mount gave, two more than the largest valid one.
 - Verified by: `if_version_never_reused`.
 
 #### ALFS-IF-08
@@ -992,8 +921,8 @@ its name, its version, whether it is closed, and its size, which is
 unknown until it is closed.
 
 - Priority: S.
-- Source: the user, 2026-10-15: "All versions appear in a directory
-  listing." The size of an unclosed file would need every chunk read.
+- Source: the user: "All versions appear in a directory listing." The
+  size of an unclosed file would need every chunk read.
 - Verified by: `if_list_files`.
 
 #### ALFS-IF-09
@@ -1014,9 +943,9 @@ while any handle has that version open, and mount and format are refused
 while any handle is open.
 
 - Priority: S.
-- Source: the user, 2026-10-15: "Delete is explicit on version numbers."
-  A reader of a deleted version could read on into a sector erased and
-  taken by another file.
+- Source: the user: "Delete is explicit on version numbers." A reader of a
+  deleted version could read on into a sector erased and taken by another
+  file.
 - Verified by: `if_delete_open_refused`.
 
 #### ALFS-IF-11
@@ -1037,9 +966,8 @@ returns when every byte it was given is in flash or in the block. A sync
 programs what the block holds.
 
 - Priority: S.
-- Source: the user, 2026-10-15, quoted in section 1. Keeping the last part
-  of a page in the block packs the file into whole-page chunks between
-  syncs.
+- Source: the user's words on writes, section 1. Keeping the last part of
+  a page in the block packs the file into whole-page chunks between syncs.
 - Verified by: `basic_round_trip`, `spd_write_burst_bounded`.
 
 ### 6.6 Observability and errors (OBS)
@@ -1061,7 +989,8 @@ Every error a call can return is documented with the state it leaves and
 what the caller should do: retry, rebuild (format), or fail.
 
 - Priority: 3.
-- Source: the littlefs work's error-handling principle (UC-10).
+- Source: UC-10: an unattended unit's software must know which of the
+  three to do.
 - Verified by: review of `alfs.h` and `alfs_rtos.h`.
 
 #### ALFS-OBS-03
@@ -1076,9 +1005,8 @@ launch until all unused flash is erased.
 
 ### 6.7 The flash task (RT)
 
-Added 2026-10-15, from the user's words in section 1. The task layer
-serves one instance of the core; every requirement above holds through
-it.
+The task layer serves one instance of the core; every requirement above
+holds through it.
 
 #### ALFS-RT-01
 
@@ -1194,15 +1122,14 @@ its steps.
 
 - `docs/datasheets/` and its `README.md`: the four flash parts and the
   RP2040.
-- `docs/FLASH_PROBE.md`: what the probe measured on the parts themselves.
+- `docs/FLASH_PROBE.md`: what the probe measures on the parts themselves.
 - The littlefs fork (github.com/n9wxu/littlefs), branch `v3-integration`
-  at 58367256: `REQUIREMENTS.md` sections 4-5 and Appendix B,
-  `benches/bench_wlog.toml`, `bd/lfs3_emubd.h`, `lfs3.h`.
+  at 58367256: `bd/lfs3_emubd.h` (the fault model), `lfs3.h` (A-3),
+  `benches/bench_wlog.toml` (W-LOG).
 - The pyro firmware (github.com/n9wxu/pyro_fw) at v2.2.8: `DECISIONS.md`
-  DD-035, DD-073, DD-074, DD-077, DD-086, DD-098; `REQUIREMENTS.md`
-  FLT-LOG-06; `docs/outstanding_tasks.md` L2, L4, C6;
-  `docs/flash_stall_options.md`; `src/flash_op.c`;
-  `src/rtos/FreeRTOSConfig.h`.
+  DD-073, DD-074, DD-086, DD-098; `REQUIREMENTS.md` FLT-LOG-06;
+  `docs/outstanding_tasks.md` L4, C6; `docs/flash_stall_options.md`;
+  `src/flash_op.c`; `src/rtos/FreeRTOSConfig.h`.
 - FreeRTOS-Kernel V11.3.1: the RP2040 SMP port pyro uses, and the POSIX
   port the host tests of the task layer run on.
-- The user's statements of 2026-10-14 and 2026-10-15, quoted in section 1.
+- The user's statements quoted in section 1.
