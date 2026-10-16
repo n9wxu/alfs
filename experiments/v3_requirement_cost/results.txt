@@ -1,0 +1,15 @@
+full    alfs v3 as it is                                        7101  saves     0  no test fails on 16 seeds
+A       LIFE-07 large erase                                     6809  saves   292  life_large_erase (16/16 seeds)
+B       LIFE-05 erase counts kept                               6925  saves   176  if_endian (16/16 seeds), life_erase_count_persists (16/16 seeds), obs_status (16/16 seeds)
+C       SAFE-06 retry in a fresh sector, read-back              6945  saves   156  safe_prog_failure (16/16 seeds)
+D       SAFE-14 rebuild a torn close record (refuse instead)    6917  saves   184  safe_config_replace (5/16 seeds)
+E       IF-02 sector, page, erase value configured              6809  saves   292  no test fails on 16 seeds
+F       LIFE-06 cap on programs a page                          7017  saves    84  life_partial_program_cap (16/16 seeds)
+ABCEF   A, B, C, E and F: no behaviour the user asked for       6149  saves   952  if_endian (16/16 seeds), life_erase_count_persists (16/16 seeds), life_large_erase (16/16 seeds), life_partial_program_cap (16/16 seeds), obs_status (16/16 seeds), safe_prog_failure (16/16 seeds)
+ABCDEF  all six above                                           5973  saves  1128  if_endian (16/16 seeds), life_erase_count_persists (16/16 seeds), life_large_erase (16/16 seeds), life_partial_program_cap (16/16 seeds), obs_status (16/16 seeds), safe_config_replace (5/16 seeds), safe_prog_failure (16/16 seeds)
+P1      SAFE-11 dead mark again, re-read before erase           6817  saves   284  safe_delete_reclaim (8/16 seeds)
+P2      SAFE-14 close record again before delete                6689  saves   412  safe_config_replace (9/16 seeds)
+P3      SAFE-04 rule 3 the fresh sector                         6885  saves   216  if_version_never_reused (16/16 seeds), safe_no_program_after_torn (16/16 seeds), safe_powerloss_bound (16/16 seeds), safe_powerloss_durable (16/16 seeds)
+P4      IF-07 sequence floor, three past a torn claim           7057  saves    44  if_endian (16/16 seeds), if_version_never_reused (16/16 seeds), safe_create_atomic (5/16 seeds)
+P       all four power-loss rules above                         6105  saves   996  if_endian (16/16 seeds), if_version_never_reused (16/16 seeds), safe_config_replace (8/16 seeds), safe_create_atomic (5/16 seeds), safe_delete_reclaim (8/16 seeds), safe_no_program_after_torn (16/16 seeds), safe_powerloss_bound (16/16 seeds), safe_powerloss_durable (16/16 seeds)
+ALL     all six and all four                                    5217  saves  1884  if_endian (16/16 seeds), if_version_never_reused (16/16 seeds), life_erase_count_persists (16/16 seeds), life_large_erase (16/16 seeds), life_partial_program_cap (16/16 seeds), obs_status (16/16 seeds), safe_config_replace (8/16 seeds), safe_create_atomic (5/16 seeds), safe_delete_reclaim (8/16 seeds), safe_no_program_after_torn (16/16 seeds), safe_powerloss_bound (16/16 seeds), safe_powerloss_durable (16/16 seeds), safe_prog_failure (16/16 seeds)
