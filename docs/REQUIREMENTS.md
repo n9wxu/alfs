@@ -824,10 +824,12 @@ littlefs's, and the task layer at most 1.5 KiB.
   existed; the first build was 5.4 KiB, 5.3 after its duplication was
   removed. Amended 2026-10-14 from 6 KiB: version 2 was 6,845 bytes, 1,544
   more than version 1, nearly all for the rules that settle what a power
-  loss half programmed (measured 2026-10-15: 1,508 bytes). Draft 3 removes
-  resuming (about 800 bytes), the erase-step state machine and prog units
-  over one byte, and adds names, versions and the close record. The task
-  layer's figure is an estimate until it is built.
+  loss half programmed (measured 2026-10-15: 1,508 bytes). Draft 3 removed
+  resuming, the erase-step state machine and prog units over one byte: on
+  the version 2 layout that was 5,041 bytes. Names, versions, the close
+  record, listing, the open-file list and caller blocks bring version 3
+  to 7,101 bytes (2026-10-15), 67 under the budget. The task layer
+  measured 1,153 bytes.
 - Measure: `arm-none-eabi-size` of `alfs.o` and `alfs_rtos.o`, text plus
   data; the task layer compiled against the kernel's generic Cortex-M0
   port.
@@ -850,6 +852,10 @@ stack and control block, the queue's storage, and for each request about
   should not be an issue." Amended 2026-10-15: draft 2's stream was 32
   bytes and a buffer of a page plus 53; a file handle now keeps a list
   link and its size, and the scratch page lets a block be any size.
+  Measured on the Cortex-M0+: an instance 96 bytes, a handle 36. A request
+  puts about 200 bytes on its caller's stack (its frames, the request and
+  the semaphore), and the kernel's own frames under them, where "about
+  100" was guessed.
 - Measure: `sizeof` of the instance and handle structures, blocks and
   scratch excluded.
 - Pass: at most 96 and 48 bytes. Fail: more.
@@ -864,7 +870,9 @@ deepest chain no more than 512 bytes, the driver's own frames apart.
 - Source: draft 1 guessed 256 before any code existed; the first build's
   deepest chain was 292 bytes. pyro's smallest task stack is 2 kB.
   Amended 2026-10-15 for the flash task, whose stack holds the core's
-  deepest chain under the task's loop.
+  deepest chain under the task's loop. Measured 2026-10-15: 316 bytes
+  under `alfs_write`, after headers moved to the scratch page and names
+  were compared in pieces (404 before); 356 under the flash task.
 - Measure: the deepest chain of frames under each public call and under
   the task's function, from GCC's call graph (`-fcallgraph-info=su`) on
   the Cortex-M0+ build. A host build's stacks say nothing here: the
