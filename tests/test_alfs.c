@@ -2,12 +2,13 @@
  * alfs's tests, one or more for each requirement of docs/REQUIREMENTS.md.
  * Each is named in the requirement's "Verified by".
  *
- * Every alfs call a test makes goes through CALL, ESTEP or FORMAT, which
- * hold it to SPD-01 and SPD-02 (one flash operation, no erase outside an
- * erase step) and record the longest stall (SPD-08). Every test ends with
- * done(), which fails it if the simulator saw a violation: a program
- * across a page, a prog unit programmed twice, or a program into a page a
- * power loss touched (each but a program that settles, docs/TEST_PLAN.md 2).
+ * Every alfs call a test makes goes through CALL, ERASE or FORMAT, which
+ * hold it to SPD-01 (no erase outside an erase) and record the longest
+ * single operation (SPD-08). Every test ends with DONE, which fails it if
+ * the simulator saw a violation: a program across a page, a byte
+ * programmed twice, or a program into a byte a power loss touched (each
+ * but a program that settles, docs/TEST_PLAN.md 2). The simulator's seed
+ * comes from ALFS_SEED.
  */
 #include "alfs.h"
 #include "sim.h"
@@ -34,14 +35,15 @@ typedef struct {
     uint8_t pbuf[4][ALFS_BUF_SIZE(PAGE)];
 } rig_t;
 
-static int call_bad;          /* calls that broke SPD-01 or SPD-02 */
+static int call_bad;          /* calls that broke SPD-01 */
 static char call_why[96];
-static uint64_t longest_stall; /* the longest call but an erase step, us */
+static uint64_t longest_stall; /* the longest operation outside an erase, us */
+static uint32_t seed;          /* the simulator's, from ALFS_SEED */
 
-static void rig_open(rig_t *r, uint32_t sectors, uint32_t unit, uint32_t large) {
+static void rig_open(rig_t *r, uint32_t sectors, uint32_t large) {
     uint32_t start = large ? large : SECTOR; /* the region does not start at 0 */
     uint32_t chip = start + sectors * SECTOR + (large ? large : SECTOR);
-    sim_init(&r->sim, chip, SECTOR, PAGE, unit, large, 0xFF);
+    sim_init(&r->sim, chip, SECTOR, PAGE, large, 0xFF, seed);
     sim_fill_random(&r->sim, 0, chip); /* what a used chip holds */
     r->drv = sim_driver(&r->sim);
     memset(&r->cfg, 0, sizeof(r->cfg));
@@ -50,7 +52,6 @@ static void rig_open(rig_t *r, uint32_t sectors, uint32_t unit, uint32_t large) 
     r->cfg.chip_size = chip;
     r->cfg.sector_size = SECTOR;
     r->cfg.page_size = PAGE;
-    r->cfg.prog_unit = unit;
     r->cfg.large_size = large;
     r->cfg.erase_value = 0xFF;
     memset(&r->fs, 0, sizeof(r->fs));
@@ -63,21 +64,20 @@ static void rig_close(rig_t *r) {
     sim_free(&r->sim);
 }
 
-static int64_t chk(rig_t *r, int64_t rc, bool erase_step, const char *what) {
+static int64_t chk(rig_t *r, int64_t rc, bool erases, const char *what) {
     sim_t *s = &r->sim;
-    uint64_t erases = s->c_ops - s->c_programs;
-    if (erase_step ? (s->c_programs > 1 || erases > 1) : (s->c_ops > 1 || erases > 0)) {
+    uint64_t n = s->c_ops - s->c_programs;
+    if (!erases && n > 0) {
         call_bad++;
-        snprintf(call_why, sizeof(call_why), "%s: %llu programs, %llu erases", what,
-                 (unsigned long long)s->c_programs, (unsigned long long)erases);
+        snprintf(call_why, sizeof(call_why), "%s: %llu erases", what, (unsigned long long)n);
     }
-    if (!erase_step && s->c_time_us > longest_stall)
-        longest_stall = s->c_time_us;
+    if (!erases && s->c_max_op_us > longest_stall)
+        longest_stall = s->c_max_op_us;
     return rc;
 }
 
 #define CALL(r, e) (sim_call_begin(&(r)->sim), chk((r), (int64_t)(e), false, #e))
-#define ESTEP(r) ((int)(sim_call_begin(&(r)->sim), chk((r), alfs_erase_step(&(r)->fs), true, "erase step")))
+#define ERASE(r) ((int)(sim_call_begin(&(r)->sim), chk((r), alfs_erase(&(r)->fs, 1), true, "erase")))
 #define FORMAT(r)                                                                                  \
     ((int)(sim_call_begin(&(r)->sim),                                                              \
            chk((r), alfs_format(&(r)->fs, &(r)->cfg, &(r)->drv), true, "format")))
@@ -86,7 +86,7 @@ static int64_t chk(rig_t *r, int64_t rc, bool erase_step, const char *what) {
 /* Erase steps until nothing is dirty. The number of steps, or -1. */
 static int clean(rig_t *r) {
     for (int i = 0; i < 2000000; i++) {
-        int rc = ESTEP(r);
+        int rc = ERASE(r);
         if (rc == ALFS_CLEAN)
             return i;
         if (rc < 0 && rc != ALFS_EIO)
@@ -99,8 +99,6 @@ static int clean(rig_t *r) {
 
 static int format_only(rig_t *r) {
     int rc = FORMAT(r);
-    while (rc == ALFS_BUSY)
-        rc = ESTEP(r);
     return rc < 0 ? rc : 0;
 }
 
@@ -111,7 +109,7 @@ static int setup(rig_t *r) {
     return clean(r) < 0 ? -1 : 0;
 }
 
-/* Ends a test: no violation of the flash's rules or of SPD-01/02. */
+/* Ends a test: no violation of the flash's rules or of SPD-01. */
 #define DONE(r)                                                                                    \
     do {                                                                                           \
         if ((r)->sim.violations)                                                                   \
@@ -153,18 +151,17 @@ static void make_row(uint32_t seq, uint8_t *row) {
     row[ROW - 1] = (uint8_t)(c >> 24);
 }
 
-/* Appends d, one call at a time, adding what alfs took to *taken. 0, or
- * the first error. */
+/* Appends d, adding what alfs took to *taken. 0, or the error. */
 static int put_n(rig_t *r, alfs_stream_t *s, const uint8_t *d, uint32_t n, uint32_t *taken) {
-    for (int guard = 0; n && guard < 100000; guard++) {
+    while (n) {
         int32_t k = (int32_t)CALL(r, alfs_append(&r->fs, s, d, n));
-        if (k < 0)
-            return (int)k;
+        if (k <= 0)
+            return k ? (int)k : -100;
         d += k;
         n -= (uint32_t)k;
         *taken += (uint32_t)k;
     }
-    return n ? -100 : 0;
+    return 0;
 }
 
 static int put(rig_t *r, alfs_stream_t *s, const uint8_t *d, uint32_t n) {
@@ -172,20 +169,12 @@ static int put(rig_t *r, alfs_stream_t *s, const uint8_t *d, uint32_t n) {
     return put_n(r, s, d, n, &taken);
 }
 
-/* A sync or close whose program settled something answers ALFS_BUSY (a
- * resumed stream, the first allocation after a mount): call again. */
 static int sync_done(rig_t *r, alfs_stream_t *s) {
-    int rc = ALFS_BUSY;
-    for (int i = 0; i < 64 && rc == ALFS_BUSY; i++)
-        rc = (int)CALL(r, alfs_sync(&r->fs, s));
-    return rc;
+    return (int)CALL(r, alfs_sync(&r->fs, s));
 }
 
 static int close_done(rig_t *r, alfs_stream_t *s) {
-    int rc = ALFS_BUSY;
-    for (int i = 0; i < 64 && rc == ALFS_BUSY; i++)
-        rc = (int)CALL(r, alfs_close(&r->fs, s));
-    return rc;
+    return (int)CALL(r, alfs_close(&r->fs, s));
 }
 
 /* Reads a whole stream. Its length, or an error. */
@@ -227,7 +216,7 @@ static int log_run(rig_t *r, alfs_stream_t *s, log_t *lg, uint32_t rate, uint32_
     uint32_t due = 0;
     for (uint32_t t = 20; t <= ms; t += 20) {
         if (steps) {
-            int rc = ESTEP(r);
+            int rc = ERASE(r);
             if (r->sim.off)
                 return 0;
             if (rc < 0 && rc != ALFS_EIO)
@@ -269,21 +258,46 @@ static void log_init(log_t *lg, uint32_t cap) {
     lg->cap = cap;
 }
 
+/* ---- the simulator ------------------------------------------------------ */
+
+/* 4.4: a torn program moves only bits its data moves (A-9), into erased
+ * bytes and over programmed ones, under every behaviour. */
+static void sim_torn_obeys_a9(void) {
+    for (int pl = 0; pl < PL_COUNT; pl++)
+        for (int t = 0; t < 500; t++) {
+            sim_t s;
+            sim_init(&s, 4 * SECTOR, SECTOR, PAGE, 0, 0xFF, seed + (uint32_t)t);
+            alfs_driver_t d = sim_driver(&s);
+            uint8_t first[PAGE], data[PAGE], got[PAGE];
+            uint32_t len = 1 + sim_rand(&s) % PAGE, addr = SECTOR + (sim_rand(&s) % 16) * PAGE;
+            for (uint32_t i = 0; i < len; i++) {
+                first[i] = (uint8_t)sim_rand(&s);
+                data[i] = (uint8_t)sim_rand(&s);
+            }
+            bool over = t % 2; /* over bytes already programmed */
+            if (over)
+                CHECK_EQ(d.prog(d.ctx, addr, first, len), 0);
+            sim_power_after(&s, 0, (sim_pl_t)pl);
+            d.prog(d.ctx, addr, data, len);
+            CHECK(s.off);
+            sim_reboot(&s);
+            for (int k = 0; k < 16; k++) {
+                CHECK_EQ(d.read(d.ctx, addr, got, len), 0);
+                for (uint32_t i = 0; i < len; i++) {
+                    uint8_t had = over ? first[i] : 0xFF;
+                    CHECK_EQ((uint8_t)(~got[i] & had & data[i]), 0); /* 1 before and in the data: 1 */
+                    CHECK_EQ((uint8_t)(got[i] & ~had), 0);           /* programmed before: 0 */
+                }
+            }
+            sim_free(&s);
+        }
+}
+
 /* ---- IF ---------------------------------------------------------------- */
 
 static void if_geometry(void) {
-    static const uint32_t units[] = {1, 16, 256};
-    for (unsigned u = 0; u < 3; u++) {
-        rig_t r;
-        rig_open(&r, 8, units[u], 0);
-        CHECK_EQ(setup(&r), 0);
-        CHECK_EQ(MOUNT(&r), 0);
-        DONE(&r);
-        rig_close(&r);
-    }
-
     rig_t r;
-    rig_open(&r, 8, 1, 0);
+    rig_open(&r, 8, 0);
     alfs_config_t good = r.cfg;
     struct {
         const char *what;
@@ -295,8 +309,6 @@ static void if_geometry(void) {
         {"sector not a power of two", &r.cfg.sector_size, 3000},
         {"sector under four pages", &r.cfg.sector_size, 512},
         {"page not a power of two", &r.cfg.page_size, 200},
-        {"prog unit over a page", &r.cfg.prog_unit, 512},
-        {"prog unit not a power of two", &r.cfg.prog_unit, 3},
         {"empty region", &r.cfg.region_size, 0},
     };
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -316,9 +328,7 @@ static void if_geometry(void) {
     /* A region formatted with one geometry does not mount with another. */
     r.cfg = good;
     CHECK_EQ(setup(&r), 0);
-    r.cfg.prog_unit = 16;
-    CHECK_EQ(MOUNT(&r), ALFS_EGEOMETRY);
-    r.cfg = good;
+    CHECK_EQ(MOUNT(&r), 0);
     r.cfg.region_size = 6 * SECTOR;
     CHECK_EQ(MOUNT(&r), ALFS_EGEOMETRY);
     DONE(&r);
@@ -328,7 +338,7 @@ static void if_geometry(void) {
 /* The stamp's fields, little-endian, where docs/SPEC.md puts them. */
 static void if_endian(void) {
     rig_t r;
-    rig_open(&r, 8, 1, 0);
+    rig_open(&r, 8, 0);
     CHECK_EQ(setup(&r), 0);
     const uint8_t *st = r.sim.mem + r.cfg.region_start;
     CHECK(memcmp(st, "alfs", 4) == 0);
@@ -368,7 +378,7 @@ static void if_endian(void) {
 
 static void if_list_streams(void) {
     rig_t r;
-    rig_open(&r, 16, 1, 0);
+    rig_open(&r, 16, 0);
     CHECK_EQ(setup(&r), 0);
     uint32_t ids[5];
     uint8_t row[ROW];
@@ -402,12 +412,11 @@ static void if_list_streams(void) {
 /* ---- basics ---------------------------------------------------------- */
 
 static void basic_round_trip(void) {
-    static const uint32_t units[] = {1, 16, 256};
     static const uint32_t sizes[] = {1, 7, 250, 251, 256, 4000, 20000};
-    for (unsigned u = 0; u < 3; u++) {
+    {
         for (unsigned z = 0; z < 7; z++) {
             rig_t r;
-            rig_open(&r, 16, units[u], 0);
+            rig_open(&r, 16, 0);
             CHECK_EQ(setup(&r), 0);
             uint8_t *d = malloc(sizes[z]), *o = malloc(sizes[z] + 1024);
             for (uint32_t i = 0; i < sizes[z]; i++)
@@ -431,15 +440,12 @@ static void basic_round_trip(void) {
 
 /* ---- SPD -------------------------------------------------------------- */
 
-/* W-LOG at both rates and every prog unit, and W-HR: every call held to
- * SPD-01/02 by CALL, every erase step by ESTEP. */
-static void spd_no_erase_outside_erase_step(void) {
-    static const uint32_t units[] = {1, 16, 256};
+/* W-LOG at both rates: every call held to SPD-01 by CALL. */
+static void spd_no_erase_outside_erase(void) {
     static const uint32_t rates[] = {1, 50};
-    for (unsigned u = 0; u < 3; u++)
-        for (unsigned k = 0; k < 2; k++) {
+    for (unsigned k = 0; k < 2; k++) {
             rig_t r;
-            rig_open(&r, 64, units[u], 0);
+            rig_open(&r, 64, 0);
             CHECK_EQ(setup(&r), 0);
             alfs_stream_t s;
             CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -452,30 +458,11 @@ static void spd_no_erase_outside_erase_step(void) {
         }
 }
 
-static void spd_one_operation_per_call(void) {
-    /* W-HR: 480 bytes every 20 ms, synced every second. */
-    rig_t r;
-    rig_open(&r, 256, 1, 0);
-    CHECK_EQ(setup(&r), 0);
-    alfs_stream_t s;
-    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 2)), 0);
-    uint8_t blk[480];
-    for (uint32_t t = 1; t <= 30 * 50; t++) {
-        for (uint32_t i = 0; i < sizeof(blk); i++)
-            blk[i] = (uint8_t)(t + i);
-        CHECK_EQ(put(&r, &s, blk, sizeof(blk)), 0);
-        if (t % 50 == 0)
-            CHECK_EQ(sync_done(&r, &s), 0);
-    }
-    DONE(&r);
-    rig_close(&r);
-}
-
 static void spd_enospc_without_erase(void) {
     rig_t r;
-    rig_open(&r, 6, 1, 0);
+    rig_open(&r, 6, 0);
     CHECK_EQ(format_only(&r), 0); /* one sector ready, five dirty */
-    CHECK_EQ(ESTEP(&r), ALFS_OK); /* two ready */
+    CHECK_EQ(ERASE(&r), ALFS_OK); /* two ready */
     alfs_stream_t s;
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 3)), 0);
     uint8_t *d = malloc(6 * SECTOR), *o = malloc(6 * SECTOR);
@@ -496,7 +483,7 @@ static void spd_enospc_without_erase(void) {
     CHECK_EQ(sync_done(&r, &s), ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_ops, 0);
     /* One erase step makes room; the bytes held are written. */
-    CHECK_EQ(ESTEP(&r), ALFS_OK);
+    CHECK_EQ(ERASE(&r), ALFS_OK);
     CHECK_EQ(sync_done(&r, &s), 0);
     CHECK_EQ(close_done(&r, &s), 0);
     CHECK_EQ(slurp(&r, s.id, o, 6 * SECTOR), (int32_t)n);
@@ -507,30 +494,9 @@ static void spd_enospc_without_erase(void) {
     rig_close(&r);
 }
 
-static void spd_busy_erase_resumes(void) {
-    rig_t r;
-    rig_open(&r, 8, 1, 0);
-    r.sim.busy_calls = 5;
-    CHECK_EQ(FORMAT(&r), ALFS_BUSY);
-    int busy = 0, ok = 0, rc;
-    while ((rc = ESTEP(&r)) != ALFS_CLEAN) {
-        CHECK(rc == ALFS_BUSY || rc == ALFS_OK);
-        busy += rc == ALFS_BUSY;
-        ok += rc == ALFS_OK;
-    }
-    /* 8 erases of 5 calls each: format's first call, then 4 + 7 * 5 - 7. */
-    CHECK_EQ(ok, 8);
-    CHECK_EQ(busy, 3 + 7 * 4);
-    alfs_status_t st;
-    alfs_status(&r.fs, &st);
-    CHECK_EQ(st.ready, 8);
-    DONE(&r);
-    rig_close(&r);
-}
-
 static void spd_mount_reads_bounded(void) {
     rig_t r;
-    rig_open(&r, 128, 1, 0);
+    rig_open(&r, 128, 0);
     CHECK_EQ(setup(&r), 0);
     log_t lg;
     log_init(&lg, 1 << 20);
@@ -549,31 +515,10 @@ static void spd_mount_reads_bounded(void) {
     rig_close(&r);
 }
 
-static void spd_reopen_reads_bounded(void) {
-    rig_t r;
-    rig_open(&r, 64, 1, 0);
-    CHECK_EQ(setup(&r), 0);
-    alfs_stream_t s;
-    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 9)), 0);
-    uint8_t b = 0x5A;
-    for (int i = 0; i < 3000; i++) { /* the last sector full of tiny chunks */
-        CHECK_EQ(put(&r, &s, &b, 1), 0);
-        CHECK_EQ(sync_done(&r, &s), 0);
-    }
-    uint32_t id = s.id;
-    CHECK_EQ(MOUNT(&r), 0);
-    CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], id)), 0);
-    CHECK_EQ(r.sim.c_ops, 0);
-    CHECK(r.sim.c_bytes_read <= 68u * 64u + SECTOR);
-    DONE(&r);
-    rig_close(&r);
-}
-
 static void spd_wlog_longest_stall(void) {
-    static const uint32_t units[] = {1, 16, 256};
-    for (unsigned u = 0; u < 3; u++) {
+    {
         rig_t r;
-        rig_open(&r, 256, units[u], 0);
+        rig_open(&r, 256, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -606,7 +551,7 @@ static void spd_read_next_bounded(void) {
     for (uint32_t i = 0; i < CHUNK; i++)
         d[i] = (uint8_t)(i * 7u + 1u);
     rig_t r;
-    rig_open(&r, 512, 1, 0);
+    rig_open(&r, 512, 0);
     CHECK_EQ(setup(&r), 0);
     alfs_stream_t a, b;
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &a, r.pbuf[0], 1)), 0);
@@ -623,7 +568,7 @@ static void spd_read_next_bounded(void) {
     rig_close(&r);
 
     rig_t q;
-    rig_open(&q, 512, 1, 0);
+    rig_open(&q, 512, 0);
     CHECK_EQ(setup(&q), 0);
     alfs_stream_t c;
     CHECK_EQ(CALL(&q, alfs_create(&q.fs, &c, q.pbuf[0], 3)), 0);
@@ -647,7 +592,7 @@ static void spd_cpu_linear(void) {
     static const uint32_t sizes[] = {32, 2048};
     for (int k = 0; k < 2; k++) {
         rig_t r;
-        rig_open(&r, sizes[k], 1, 0);
+        rig_open(&r, sizes[k], 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -686,7 +631,7 @@ static int ring(rig_t *r, uint32_t cycles, uint32_t every, uint32_t max_ticks) {
     uint32_t sectors = r->cfg.region_size / SECTOR;
     uint32_t need = (every * ROW) / (SECTOR - 64) + 2;
     for (uint32_t tick = 1; tick <= max_ticks; tick++) {
-        int rc = ESTEP(r);
+        int rc = ERASE(r);
         if (rc < 0 && rc != ALFS_EIO)
             return -2;
         if (tick % 10 == 0) { /* 200 ms: 10 rows */
@@ -732,7 +677,7 @@ static int ring(rig_t *r, uint32_t cycles, uint32_t every, uint32_t max_ticks) {
 
 static void life_erase_only_dirty(void) {
     rig_t r;
-    rig_open(&r, 32, 1, 0);
+    rig_open(&r, 32, 0);
     CHECK_EQ(setup(&r), 0);
     CHECK_EQ(ring(&r, 3, 800, 5000000), 0);
     CHECK_EQ(r.sim.ready_erases, 0);
@@ -741,12 +686,10 @@ static void life_erase_only_dirty(void) {
 }
 
 static void life_write_amplification(void) {
-    static const uint32_t units[] = {1, 16, 256};
     static const uint32_t rates[] = {1, 50};
-    for (unsigned u = 0; u < 3; u++)
-        for (unsigned k = 0; k < 2; k++) {
+    for (unsigned k = 0; k < 2; k++) {
             rig_t r;
-            rig_open(&r, 256, units[u], 0);
+            rig_open(&r, 256, 0);
             CHECK_EQ(setup(&r), 0);
             uint64_t p0 = r.sim.programs, b0 = r.sim.bytes_programmed;
             alfs_stream_t s;
@@ -759,11 +702,10 @@ static void life_write_amplification(void) {
             alfs_status_t st;
             alfs_status(&r.fs, &st);
             uint64_t used = 256 - st.ready;
-            uint64_t per_sector = units[u] * 3 > 64 ? units[u] * 3 : 64;
-            uint64_t bound = lg.len + progs * (12 + units[u]) + used * per_sector;
+            uint64_t bound = lg.len + progs * 13 + used * 64;
             if (bytes > bound)
-                printf("    unit %u rate %u: %llu programmed, bound %llu\n", units[u], rates[k],
-                       (unsigned long long)bytes, (unsigned long long)bound);
+                printf("    rate %u: %llu programmed, bound %llu\n", rates[k], (unsigned long long)bytes,
+                       (unsigned long long)bound);
             CHECK(bytes <= bound);
             free(lg.exp);
             DONE(&r);
@@ -773,7 +715,7 @@ static void life_write_amplification(void) {
 
 static void life_wlog_erases(void) {
     rig_t r;
-    rig_open(&r, 256, 1, 0);
+    rig_open(&r, 256, 0);
     CHECK_EQ(setup(&r), 0);
     uint64_t b0 = r.sim.bytes_programmed;
     alfs_stream_t s;
@@ -797,7 +739,7 @@ static void life_wlog_erases(void) {
 
 static void life_wear_level(void) {
     rig_t r;
-    rig_open(&r, 32, 1, 0);
+    rig_open(&r, 32, 0);
     CHECK_EQ(setup(&r), 0);
     CHECK_EQ(ring(&r, 10, 800, 20000000), 0);
     uint32_t lo = UINT32_MAX, hi = 0;
@@ -815,7 +757,7 @@ static void life_wear_level(void) {
 
 static void life_erase_count_persists(void) {
     rig_t r;
-    rig_open(&r, 32, 1, 0);
+    rig_open(&r, 32, 0);
     CHECK_EQ(setup(&r), 0);
     CHECK_EQ(ring(&r, 4, 800, 20000000), 0);
     CHECK_EQ(MOUNT(&r), 0);
@@ -839,7 +781,7 @@ static void life_partial_program_cap(void) {
     static const uint8_t caps[] = {0, 4};
     for (int c = 0; c < 2; c++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         r.cfg.max_page_programs = caps[c];
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
@@ -858,7 +800,7 @@ static void life_partial_program_cap(void) {
 
 static void life_large_erase(void) {
     rig_t r;
-    rig_open(&r, 64, 1, LARGE); /* four aligned blocks */
+    rig_open(&r, 64, LARGE); /* four aligned blocks */
     CHECK_EQ(setup(&r), 0);
     /* The first block holds the formatted sector, so it goes sector by
      * sector; the other three each go in one large erase. */
@@ -871,117 +813,56 @@ static void life_large_erase(void) {
     rig_close(&r);
 }
 
-/* LIFE-08: a resume loses under two pages, and settles with one program. */
-static void life_resume_waste(void) {
-    for (int pos = 0; pos <= 40; pos++) {
-        uint32_t unit = pos == 40 ? 16u : 1u; /* the last: a unit over 1 */
-        rig_t r;
-        rig_open(&r, 16, unit, 0);
-        CHECK_EQ(setup(&r), 0);
-        alfs_stream_t s;
-        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 5)), 0);
-        uint32_t total = 3000u + (uint32_t)pos * 137u, n = 0;
-        uint8_t *exp = malloc(total + 10);
-        for (uint32_t i = 0; i < total + 10; i++)
-            exp[i] = (uint8_t)(i * 13u + (uint32_t)pos);
-        while (n < total) {
-            uint32_t k = total - n < 300 ? total - n : 300;
-            CHECK_EQ(put(&r, &s, exp + n, k), 0);
-            CHECK_EQ(sync_done(&r, &s), 0);
-            n += k;
-        }
-        CHECK_EQ(close_done(&r, &s), 0);
-        uint32_t end = r.sim.last_prog_addr + r.sim.last_prog_len;
-        uint32_t id = s.id;
-        CHECK_EQ(MOUNT(&r), 0);
-        CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], id)), 0);
-        uint64_t p0 = r.sim.programs;
-        CHECK_EQ(put(&r, &s, exp + total, 10), 0);
-        CHECK_EQ(sync_done(&r, &s), 0);
-        uint64_t progs = r.sim.programs - p0;
-        uint32_t at = r.sim.last_prog_addr;
-        bool same = at / SECTOR == (end - 1) / SECTOR;
-        uint32_t lost = same ? at - end : ((end - 1) / SECTOR + 1) * SECTOR - end;
-        if (unit == 1) {
-            CHECK(lost < 2 * PAGE);
-            CHECK_EQ(progs, 2); /* the claim again, or the fresh sector's; then the chunk */
-        } else {
-            CHECK(!same);
-            CHECK_EQ(progs, 1);
-        }
-        CHECK_EQ(close_done(&r, &s), 0);
-        uint8_t *got = malloc(total + 1024);
-        CHECK_EQ(slurp(&r, id, got, total + 1024), (int32_t)(total + 10));
-        CHECK(memcmp(got, exp, total + 10) == 0);
-        free(got);
-        free(exp);
-        DONE(&r);
-        rig_close(&r);
-    }
-}
-
 /* ---- SAFE ------------------------------------------------------------- */
 
 /*
- * What a stream may read after a power loss and a resume (SAFE-01): a
- * prefix of what was appended before the loss, at least what was synced
- * then; then a prefix of what was appended after the resume, at least what
- * was synced since. Bytes never synced may be lost, or come back later in
- * their place.
+ * What a file may read after a power loss (SAFE-01): a prefix of what was
+ * appended, at least what was synced. Bytes never synced may be lost, or
+ * come back at a later mount in their place.
  */
 typedef struct {
-    const uint8_t *pre;  /* appended before the loss */
-    uint32_t pre_synced, pre_len;
-    const uint8_t *post; /* appended after the resume */
-    uint32_t post_synced, post_len;
+    const uint8_t *exp;
+    uint32_t synced, len;
 } expect_t;
 
 static bool reads_as_expected(const uint8_t *got, int32_t n, const expect_t *e) {
-    if (n < 0)
-        return false;
-    uint32_t a = 0;
-    while (a < (uint32_t)n && a < e->pre_len && got[a] == e->pre[a])
-        a++;
-    for (uint32_t al = a + 1; al-- > e->pre_synced;) {
-        if (al > (uint32_t)n)
-            continue;
-        uint32_t bl = (uint32_t)n - al;
-        if (bl >= e->post_synced && bl <= e->post_len && !memcmp(got + al, e->post, bl))
-            return true;
-    }
-    return false;
+    if (n < 0 && e->synced == 0)
+        return true; /* nothing synced: the file may be gone */
+    return n >= (int32_t)e->synced && n <= (int32_t)e->len && !memcmp(got, e->exp, (size_t)n);
 }
 
-/* Remounts, runs erase steps until clean, and reads the stream: twice. */
-static void reread(rig_t *r, uint32_t id, const expect_t *e, uint8_t *got, const char *what) {
+/* Remounts, erases until clean, and reads both files: twice. */
+static void reread(rig_t *r, uint32_t old_id, const expect_t *old, uint32_t new_id, const expect_t *now,
+                   uint8_t *got, const char *what) {
     for (int round = 0; round < 2; round++) {
         memset(&r->fs, 0, sizeof(r->fs));
         CHECK_EQ(MOUNT(r), 0);
         CHECK(clean(r) >= 0);
-        int32_t n = slurp(r, id, got, 64 * 1024);
-        if (n < 0 && e->pre_synced == 0 && e->post_synced == 0)
-            n = 0; /* nothing synced: no stream */
-        bool ok = reads_as_expected(got, n, e);
-        if (!ok)
-            printf("    %s, round %d: read %d; before %u (synced %u), after %u (synced %u)\n", what,
-                   round, n, e->pre_len, e->pre_synced, e->post_len, e->post_synced);
-        CHECK(ok);
+        for (int f = 0; f < 2; f++) {
+            const expect_t *e = f ? now : old;
+            int32_t n = slurp(r, f ? new_id : old_id, got, 64 * 1024);
+            bool ok = reads_as_expected(got, n, e);
+            if (!ok)
+                printf("    %s, round %d, %s file: read %d of %u (synced %u)\n", what, round,
+                       f ? "new" : "old", n, e->len, e->synced);
+            CHECK(ok);
+        }
     }
 }
 
 /*
  * Power lost at operation k of a logging run that also erases, with each
- * behaviour; then a remount, a read, a resume, and remounts with erase steps
- * and reads. Some cases lose power a second time during the resume. Sets
- * *past when k is past the run's last operation.
+ * behaviour; then a remount and a read, a new file logged (some cases lose
+ * power a second time there), and remounts with erases and reads of both.
+ * Sets *past when k is past the run's last operation.
  */
-static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, int *past) {
+static void powerloss_case(sim_pl_t pl, int64_t k, bool twice, int *past) {
     rig_t r;
-    rig_open(&r, 10, unit, 0);
+    rig_open(&r, 10, 0);
     *past = 1;
     CHECK_EQ(format_only(&r), 0);
     for (int i = 0; i < 3; i++)
-        CHECK(ESTEP(&r) >= 0);
+        CHECK(ERASE(&r) >= 0);
     *past = 0;
     log_t lg;
     log_init(&lg, 64 * 1024);
@@ -996,35 +877,24 @@ static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, in
         CHECK_EQ(rc, 0);
         return;
     }
-    uint32_t synced = lg.synced, appended = lg.len;
-    uint8_t *pre = malloc(appended + 1);
-    memcpy(pre, lg.exp, appended);
+    uint32_t old_id = s.id;
+    expect_t old = {malloc(lg.len + 1), lg.synced, lg.len};
+    memcpy((uint8_t *)old.exp, lg.exp, lg.len);
     sim_reboot(&r.sim);
     memset(&r.fs, 0, sizeof(r.fs));
     CHECK_EQ(MOUNT(&r), 0);
 
     uint8_t *got = malloc(64 * 1024);
-    alfs_info_t in;
-    uint32_t have = 0;
-    if (CALL(&r, alfs_next(&r.fs, 0, &in)) == 0) {
-        int32_t n = slurp(&r, in.id, got, 64 * 1024);
-        if (n < (int32_t)synced || n > (int32_t)appended || memcmp(got, pre, (size_t)n))
-            printf("    pl %d unit %u k %lld: read %d, synced %u, appended %u\n", pl, unit,
-                   (long long)k, n, synced, appended);
-        CHECK(n >= (int32_t)synced);
-        CHECK(n <= (int32_t)appended);
-        CHECK(memcmp(got, pre, (size_t)n) == 0);
-        have = (uint32_t)n;
-        CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], in.id)), 0);
-    } else {
-        CHECK_EQ(synced, 0);
-        appended = 0;
-        CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 77)), 0);
-    }
+    char what[64];
+    snprintf(what, sizeof(what), "pl %d k %lld", pl, (long long)k);
+    int32_t n = slurp(&r, old_id, got, 64 * 1024);
+    if (!reads_as_expected(got, n, &old))
+        printf("    %s: read %d, synced %u, appended %u\n", what, n, old.synced, old.len);
+    CHECK(reads_as_expected(got, n, &old));
 
-    /* Resume: the survivors, then new rows. */
-    lg.len = have;
-    lg.synced = have;
+    /* A new file after the restart. */
+    CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 78)), 0);
+    lg.len = lg.synced = 0;
     if (twice)
         sim_power_after(&r.sim, (int64_t)(sim_rand(&r.sim) % 40), pl);
     rc = log_run(&r, &s, &lg, 50, 6000, true);
@@ -1035,32 +905,27 @@ static void powerloss_case(sim_pl_t pl, uint32_t unit, int64_t k, bool twice, in
     } else {
         sim_reboot(&r.sim);
     }
-    expect_t e = {pre, synced, appended, lg.exp + have, lg.synced - have, lg.len - have};
-    char what[64];
-    snprintf(what, sizeof(what), "pl %d unit %u k %lld", pl, unit, (long long)k);
-    reread(&r, s.id, &e, got, what);
+    expect_t now = {lg.exp, lg.synced, lg.len};
+    reread(&r, old_id, &old, s.id, &now, got, what);
     free(got);
-    free(pre);
+    free((uint8_t *)old.exp);
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
 }
 
 static void powerloss_all(bool twice) {
-    static const uint32_t units[] = {1, 16};
     for (int pl = 0; pl < PL_COUNT; pl++)
-        for (unsigned u = 0; u < 2; u++)
-            for (int64_t k = 0;; k++) {
-                int past = 0;
-                powerloss_case((sim_pl_t)pl, units[u], k, twice && k % 3 == 0, &past);
-                if (past && !tf_failed)
-                    break;
-                if (tf_failed) {
-                    printf("    behaviour %d, unit %u, power lost at operation %lld\n", pl,
-                           units[u], (long long)k);
-                    return;
-                }
+        for (int64_t k = 0;; k++) {
+            int past = 0;
+            powerloss_case((sim_pl_t)pl, k, twice && k % 3 == 0, &past);
+            if (past && !tf_failed)
+                break;
+            if (tf_failed) {
+                printf("    behaviour %d, power lost at operation %lld\n", pl, (long long)k);
+                return;
             }
+        }
 }
 
 static void safe_powerloss_durable(void) {
@@ -1080,7 +945,7 @@ static void safe_no_program_after_torn(void) {
 static void safe_no_false_data(void) {
     for (int trial = 0; trial < 200; trial++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1113,10 +978,10 @@ static void safe_no_false_data(void) {
     }
 }
 
-static void safe_append_only_verified_ready(void) {
+static void safe_write_only_verified_ready(void) {
     /* An ERASENOOP sector is found out on the ground and never written. */
     rig_t r;
-    rig_open(&r, 8, 1, 0);
+    rig_open(&r, 8, 0);
     CHECK_EQ(format_only(&r), 0);
     sim_mkbad(&r.sim, 1 + 3, BAD_ERASENOOP); /* region sector 3 */
     CHECK(clean(&r) >= 0);
@@ -1141,7 +1006,7 @@ static void safe_prog_failure(void) {
     static const sim_bad_t modes[] = {BAD_PROGERROR, BAD_PROGNOOP, BAD_PROGFLIP};
     for (unsigned m = 0; m < 3; m++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1150,32 +1015,17 @@ static void safe_prog_failure(void) {
         CHECK_EQ(log_run(&r, &s, &lg, 50, 3000, false), 0);
         /* The sector being written goes bad. */
         sim_mkbad(&r.sim, r.cfg.region_start / SECTOR + s.sector, modes[m]);
-        int failures = 0;
         for (int t = 0; t < 40; t++) {
             uint8_t row[ROW];
             make_row(lg.seq, row);
             uint32_t off = 0;
-            for (int guard = 0; off < ROW && guard < 100; guard++) {
-                int32_t k = (int32_t)CALL(&r, alfs_append(&r.fs, &s, row + off, ROW - off));
-                if (k == ALFS_EPROG) {
-                    failures++; /* nothing taken; the held bytes go to a fresh sector */
-                    continue;
-                }
-                CHECK(k >= 0);
-                off += (uint32_t)k;
-            }
-            CHECK_EQ(off, ROW);
+            int32_t k = (int32_t)CALL(&r, alfs_append(&r.fs, &s, row + off, ROW - off));
+            CHECK_EQ(k, (int32_t)ROW); /* a failed program goes to a fresh sector in the call */
             memcpy(lg.exp + lg.len, row, ROW);
             lg.len += ROW;
             lg.seq++;
-            int rc = sync_done(&r, &s);
-            while (rc == ALFS_EPROG || rc == ALFS_BUSY) {
-                failures += rc == ALFS_EPROG;
-                rc = sync_done(&r, &s);
-            }
-            CHECK_EQ(rc, 0);
+            CHECK_EQ(sync_done(&r, &s), 0);
         }
-        CHECK(failures >= 1);
         CHECK_EQ(close_done(&r, &s), 0);
         uint8_t *got = malloc(1 << 16);
         int32_t n = slurp(&r, s.id, got, 1 << 16);
@@ -1193,7 +1043,7 @@ static void safe_prog_failure(void) {
 
     /* With nothing that programs, the bytes are dropped and counted. */
     rig_t r;
-    rig_open(&r, 8, 1, 0);
+    rig_open(&r, 8, 0);
     CHECK_EQ(setup(&r), 0);
     for (uint32_t k = 1; k <= 8; k++)
         sim_mkbad(&r.sim, k, BAD_PROGERROR);
@@ -1201,14 +1051,11 @@ static void safe_prog_failure(void) {
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
     uint8_t row[ROW] = {0};
     CHECK_EQ(put(&r, &s, row, ROW), 0);
-    int rc, tries = 0;
-    while ((rc = sync_done(&r, &s)) == ALFS_EPROG)
-        tries++;
-    CHECK_EQ(rc, ALFS_ELOST);
-    CHECK_EQ(tries, 2);
+    CHECK_EQ(sync_done(&r, &s), ALFS_ELOST);
     alfs_status_t st;
     alfs_status(&r.fs, &st);
     CHECK_EQ(st.n.bytes_lost, ROW);
+    CHECK_EQ(st.n.prog_failures, 3);
     DONE(&r);
     rig_close(&r);
 }
@@ -1217,7 +1064,7 @@ static void safe_bad_sector(void) {
     static const sim_bad_t modes[] = {BAD_ERASEERROR, BAD_ERASENOOP};
     for (unsigned m = 0; m < 2; m++) {
         rig_t r;
-        rig_open(&r, 8, 1, 0);
+        rig_open(&r, 8, 0);
         CHECK_EQ(format_only(&r), 0);
         sim_mkbad(&r.sim, 1 + 5, modes[m]);
         CHECK(clean(&r) >= 0);
@@ -1239,7 +1086,7 @@ static void safe_bad_sector(void) {
 
     /* Wear-out under W-RING: capacity shrinks, logging goes on. */
     rig_t r;
-    rig_open(&r, 32, 1, 0);
+    rig_open(&r, 32, 0);
     CHECK_EQ(setup(&r), 0);
     r.sim.wear_limit = 6;
     int rc = ring(&r, 1000, 400, 400000);
@@ -1253,7 +1100,7 @@ static void safe_bad_sector(void) {
 
 static void safe_read_retry(void) {
     rig_t r;
-    rig_open(&r, 16, 1, 0);
+    rig_open(&r, 16, 0);
     CHECK_EQ(setup(&r), 0);
     alfs_stream_t s;
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1292,7 +1139,7 @@ static void safe_read_retry(void) {
 
 static void safe_foreign_region(void) {
     rig_t r;
-    rig_open(&r, 16, 1, 0);
+    rig_open(&r, 16, 0);
     CHECK_EQ(MOUNT(&r), ALFS_ENOFS); /* random content */
     CHECK_EQ(r.sim.c_ops, 0);
     memset(r.sim.mem + r.cfg.region_start, 0xFF, r.cfg.region_size);
@@ -1313,7 +1160,7 @@ static void safe_foreign_region(void) {
 }
 
 static void build_image(rig_t *r) {
-    rig_open(r, 16, 1, 0);
+    rig_open(r, 16, 0);
     if (setup(r)) {
         tf_failed = 1;
         return;
@@ -1358,7 +1205,7 @@ static void safe_fuzz_mount_read(void) {
             sim_fill_random(&r.sim, r.cfg.region_start + 32, r.cfg.region_size - 32);
             break;
         }
-        memset(r.sim.unit_done, 0, r.sim.chip_size / r.sim.prog_unit); /* bytes changed under it */
+        memset(r.sim.done, 0, r.sim.chip_size); /* bytes changed under it */
         if (MOUNT(&r) == 0) {
             alfs_info_t in;
             uint32_t after = 0;
@@ -1377,7 +1224,7 @@ static void safe_fuzz_mount_read(void) {
 static void safe_delete_atomic(void) {
     for (int pl = 0; pl < PL_COUNT; pl++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1401,7 +1248,7 @@ static void safe_delete_atomic(void) {
     }
     /* A delete that returned is durable, and its sectors become dirty. */
     rig_t r;
-    rig_open(&r, 16, 1, 0);
+    rig_open(&r, 16, 0);
     CHECK_EQ(setup(&r), 0);
     alfs_stream_t s;
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1440,7 +1287,7 @@ static uint8_t *claim_of(rig_t *r, uint32_t id, uint32_t n) {
 static void safe_delete_reclaim(void) {
     for (int64_t k = 0;; k++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t s;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1487,7 +1334,7 @@ static void safe_delete_reclaim(void) {
  * rest reads in order. */
 static void safe_missing_sector(void) {
     rig_t r;
-    rig_open(&r, 16, 1, 0);
+    rig_open(&r, 16, 0);
     CHECK_EQ(setup(&r), 0);
     alfs_stream_t s;
     CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 1)), 0);
@@ -1522,73 +1369,13 @@ static void safe_missing_sector(void) {
     rig_close(&r);
 }
 
-/* SAFE-04: power lost in the claim of a stream's next sector; the stream
- * resumes, fills two sectors, and reads the same through remounts. */
-static void safe_resume_torn_claim(void) {
-    static const sim_pl_t pls[] = {PL_FLICKER, PL_METASTABLE};
-    int cases = 0;
-    for (unsigned b = 0; b < 2; b++)
-        for (int64_t k = 0;; k++) {
-            rig_t r;
-            rig_open(&r, 16, 1, 0);
-            CHECK_EQ(setup(&r), 0);
-            alfs_stream_t s;
-            CHECK_EQ(CALL(&r, alfs_create(&r.fs, &s, r.pbuf[0], 9)), 0);
-            log_t lg;
-            log_init(&lg, 64 * 1024);
-            sim_power_after(&r.sim, k, pls[b]);
-            CHECK_EQ(log_run(&r, &s, &lg, 50, 20000, false), 0);
-            bool claim = r.sim.off && r.sim.cut_prog && r.sim.cut_addr % SECTOR == 0;
-            bool past = !r.sim.off;
-            if (claim) {
-                cases++;
-                uint32_t synced = lg.synced, appended = lg.len;
-                uint8_t *pre = malloc(appended + 1);
-                memcpy(pre, lg.exp, appended);
-                sim_reboot(&r.sim);
-                memset(&r.fs, 0, sizeof(r.fs));
-                CHECK_EQ(MOUNT(&r), 0);
-                uint8_t *got = malloc(64 * 1024);
-                int32_t have = slurp(&r, s.id, got, 64 * 1024);
-                if (have == ALFS_ENOENT && synced == 0) { /* its first claim: no stream to resume */
-                    free(got);
-                    free(pre);
-                    free(lg.exp);
-                    DONE(&r);
-                    rig_close(&r);
-                    continue;
-                }
-                CHECK(have >= (int32_t)synced && have <= (int32_t)appended);
-                CHECK_EQ(CALL(&r, alfs_open_append(&r.fs, &s, r.pbuf[0], s.id)), 0);
-                lg.len = lg.synced = (uint32_t)have;
-                CHECK_EQ(log_run(&r, &s, &lg, 50, 8000, false), 0); /* two sectors and more */
-                CHECK_EQ(close_done(&r, &s), 0);
-                expect_t e = {pre, synced, appended, lg.exp + have, lg.len - (uint32_t)have,
-                              lg.len - (uint32_t)have};
-                char what[64];
-                snprintf(what, sizeof(what), "pl %d k %lld", pls[b], (long long)k);
-                for (int t = 0; t < 4; t++)
-                    reread(&r, s.id, &e, got, what);
-                free(got);
-                free(pre);
-            }
-            free(lg.exp);
-            DONE(&r);
-            rig_close(&r);
-            if (past || tf_failed)
-                break;
-        }
-    printf("    %d power losses in a claim\n", cases);
-    CHECK(cases >= 4);
-}
-
 /* IF-04: a first claim torn by a power loss never shares its identity with
  * a stream made after it. */
 static void if_identity_never_reused(void) {
     static const sim_pl_t pls[] = {PL_FLICKER, PL_METASTABLE, PL_SOMEBITS};
     for (unsigned b = 0; b < 3; b++) {
         rig_t r;
-        rig_open(&r, 16, 1, 0);
+        rig_open(&r, 16, 0);
         CHECK_EQ(setup(&r), 0);
         alfs_stream_t a;
         CHECK_EQ(CALL(&r, alfs_create(&r.fs, &a, r.pbuf[0], 1)), 0);
@@ -1633,7 +1420,7 @@ static void if_identity_never_reused(void) {
 
 static void obs_status(void) {
     rig_t r;
-    rig_open(&r, 32, 1, 0);
+    rig_open(&r, 32, 0);
     CHECK_EQ(setup(&r), 0);
     alfs_status_t st;
     alfs_status(&r.fs, &st);
@@ -1666,13 +1453,9 @@ static void obs_status(void) {
 
 static void obs_clean(void) {
     rig_t r;
-    rig_open(&r, 8, 1, 0);
-    r.sim.busy_calls = 3;
+    rig_open(&r, 8, 0);
     alfs_status_t st;
-    CHECK_EQ(FORMAT(&r), ALFS_BUSY);
-    alfs_status(&r.fs, &st);
-    CHECK(!st.clean);
-    CHECK_EQ(ESTEP(&r), ALFS_BUSY); /* still erasing the first sector */
+    CHECK_EQ(FORMAT(&r), 0);
     alfs_status(&r.fs, &st);
     CHECK(!st.clean);
     CHECK(clean(&r) >= 0);
@@ -1704,17 +1487,15 @@ static void simp_ram(void) {
 
 int main(int argc, char **argv) {
     static const tf_test_t tests[] = {
+        {"sim_torn_obeys_a9", sim_torn_obeys_a9},
         {"if_geometry", if_geometry},
         {"if_endian", if_endian},
         {"if_list_streams", if_list_streams},
         {"if_identity_never_reused", if_identity_never_reused},
         {"basic_round_trip", basic_round_trip},
-        {"spd_no_erase_outside_erase_step", spd_no_erase_outside_erase_step},
-        {"spd_one_operation_per_call", spd_one_operation_per_call},
+        {"spd_no_erase_outside_erase", spd_no_erase_outside_erase},
         {"spd_enospc_without_erase", spd_enospc_without_erase},
-        {"spd_busy_erase_resumes", spd_busy_erase_resumes},
         {"spd_mount_reads_bounded", spd_mount_reads_bounded},
-        {"spd_reopen_reads_bounded", spd_reopen_reads_bounded},
         {"spd_wlog_longest_stall", spd_wlog_longest_stall},
         {"spd_cpu_linear", spd_cpu_linear},
         {"spd_read_next_bounded", spd_read_next_bounded},
@@ -1725,12 +1506,11 @@ int main(int argc, char **argv) {
         {"life_erase_count_persists", life_erase_count_persists},
         {"life_partial_program_cap", life_partial_program_cap},
         {"life_large_erase", life_large_erase},
-        {"life_resume_waste", life_resume_waste},
         {"safe_powerloss_durable", safe_powerloss_durable},
         {"safe_powerloss_bound", safe_powerloss_bound},
         {"safe_no_program_after_torn", safe_no_program_after_torn},
         {"safe_no_false_data", safe_no_false_data},
-        {"safe_append_only_verified_ready", safe_append_only_verified_ready},
+        {"safe_write_only_verified_ready", safe_write_only_verified_ready},
         {"safe_prog_failure", safe_prog_failure},
         {"safe_bad_sector", safe_bad_sector},
         {"safe_read_retry", safe_read_retry},
@@ -1739,10 +1519,14 @@ int main(int argc, char **argv) {
         {"safe_delete_atomic", safe_delete_atomic},
         {"safe_delete_reclaim", safe_delete_reclaim},
         {"safe_missing_sector", safe_missing_sector},
-        {"safe_resume_torn_claim", safe_resume_torn_claim},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},
     };
-    return tf_run(tests, (int)(sizeof(tests) / sizeof(tests[0])), argc > 1 ? argv[1] : NULL) ? 1 : 0;
+    const char *env = getenv("ALFS_SEED");
+    seed = env ? (uint32_t)strtoul(env, NULL, 0) : 0;
+    int failures = tf_run(tests, (int)(sizeof(tests) / sizeof(tests[0])), argc > 1 ? argv[1] : NULL);
+    if (failures)
+        printf("seed %u\n", seed);
+    return failures ? 1 : 0;
 }

@@ -3,19 +3,20 @@
  *
  * It holds the chip in RAM and injects the faults of docs/REQUIREMENTS.md
  * section 4.4: the power-loss behaviours littlefs's emulated device names,
- * the bad-sector behaviours, wear-out, a read that fails once, and bits
- * that read randomly. It also enforces what the requirements forbid, and
- * counts each violation: a program across a page (SPD-03), a prog unit
- * programmed twice between erases (IF-02), and a program into a page an
- * interrupted operation touched (SAFE-04), byte by byte. With a prog unit of
- * 1, a byte that settles is allowed in both cases: what the programs before
- * it meant, or the erase value's complement (A-8, A-9).
+ * limited to bits a program's data moves (A-9), the bad-sector behaviours,
+ * wear-out, a read that fails once, and bits that read randomly. It also
+ * enforces what the requirements forbid, and counts each violation: a
+ * program across a page (SPD-03), a byte programmed twice between erases
+ * (IF-02), and a program into a byte an interrupted operation touched
+ * (SAFE-04). A byte that settles is allowed in both cases: what the
+ * programs before it meant, or the erase value's complement (A-8, A-9).
  *
  * A program is an AND (for erase value 0xFF). A torn program's bit that
  * reads randomly is one its data clears, as the flash probe found; a later
  * program that clears it settles it.
  *
- * Its counters are per test and per call: sim_call_begin() starts a call.
+ * Every random choice comes from the seed given to sim_init. Its counters
+ * are per test and per call: sim_call_begin() starts a call.
  */
 #ifndef SIM_H
 #define SIM_H
@@ -25,16 +26,16 @@
 #include <stdint.h>
 
 typedef enum {
-    PL_ATOMIC,     /* the interrupted operation is not applied             */
-    PL_SOMEBITS,   /* prog: one bit of its first unit; erase: one bit flips */
-    PL_MOSTBITS,   /* applied, then one bit flips                          */
+    PL_ATOMIC,     /* the interrupted operation is not applied              */
+    PL_SOMEBITS,   /* prog: one bit of its first byte its data clears;
+                    * erase: one bit flips */
+    PL_MOSTBITS,   /* applied, then one bit it cleared reads erased again   */
     PL_METASTABLE, /* applied, then one bit reads randomly until erased or,
-                    * for a program, programmed again: a bit its data clears,
-                    * and none with a prog unit over 1, which corrects it */
-    PL_TORNTAIL,   /* prog: first unit erased, a run after it programmed   */
+                    * for a program, programmed again: a bit its data clears */
+    PL_TORNTAIL,   /* prog: first byte as it was, a run after it programmed,
+                    * one bit the run cleared erased again                  */
     PL_FLICKER,    /* not applied, but one bit reads randomly: for a program,
-                    * a bit its data clears (the probe's early abort, P8);
-                    * none with a prog unit over 1 */
+                    * a bit its data clears (the probe's early abort, P8)    */
     PL_COUNT
 } sim_pl_t;
 
@@ -53,13 +54,13 @@ typedef enum {
 
 typedef struct sim {
     /* geometry */
-    uint32_t chip_size, sector_size, page_size, prog_unit, large_size;
+    uint32_t chip_size, sector_size, page_size, large_size;
     uint8_t erase_value;
 
     /* state */
     uint8_t *mem;
     uint8_t *meant;      /* per byte: what every program since its erase meant */
-    uint8_t *unit_done;  /* per prog unit: programmed since its erase   */
+    uint8_t *done;       /* per byte: programmed since its erase        */
     uint8_t *page_progs; /* per page: programs since its erase          */
     uint8_t *torn;       /* per byte: an interrupted operation changed it */
     uint32_t *wear;      /* per sector: completed erases                */
@@ -81,11 +82,6 @@ typedef struct sim {
     sim_pl_t pl;
     bool off;
 
-    /* an erase that takes busy_calls calls: ALFS_BUSY until the last */
-    int busy_calls;
-    int busy_left;
-    uint32_t busy_addr;
-
     int read_fail_once; /* the next n reads fail */
 
     /* the last program that completed, and the operation a power loss cut */
@@ -100,7 +96,7 @@ typedef struct sim {
     unsigned max_page_progs;
 
     /* this call */
-    uint64_t c_ops, c_programs, c_erases, c_bytes_read, c_time_us;
+    uint64_t c_ops, c_programs, c_erases, c_bytes_read, c_time_us, c_max_op_us;
 
     /* violations */
     int violations;
@@ -115,7 +111,7 @@ typedef struct sim {
 #define SIM_T_LARGE_US 150000u
 
 void sim_init(sim_t *s, uint32_t chip_size, uint32_t sector_size, uint32_t page_size,
-              uint32_t prog_unit, uint32_t large_size, uint8_t erase_value);
+              uint32_t large_size, uint8_t erase_value, uint32_t seed);
 void sim_free(sim_t *s);
 alfs_driver_t sim_driver(sim_t *s);
 
