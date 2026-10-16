@@ -67,3 +67,33 @@ A write that fits in its block never leaves the caller's task.
 The use cases come from the pyro flight computer
 (github.com/n9wxu/pyro_fw); the flash fault model from the littlefs v3 work
 (github.com/n9wxu/littlefs). alfs shares no code with either.
+
+## Branches
+
+| Branch | What |
+|---|---|
+| `main` | format version 3 and the flash task |
+| `experiment/format-1` | the first build: streams found by an identity and a tag, one flash operation a call, 5.3 KB |
+| `experiment/format-2` | exact programs, sector numbers and resuming a file after a reset, 6.8 KB; replaced by format 3 |
+| `experiment/v2-safety-rule-cost` | what each of format 2's safety rules costs in code, by building alfs without it |
+| `experiment/v3-requirement-cost` | what each requirement costs in format 3's code, and the simplest alfs that still meets them |
+
+An experiment's branch holds its own `experiments/<name>/RESULTS.md`.
+
+## Tests and releases
+
+Every push runs every test (`.github/workflows/test.yml`):
+- the core and the flash task on 8 seeds under the sanitizers, built with
+  GCC and with Clang;
+- the core on 100 seeds;
+- the Cortex-M0+ size and stack budgets, with the Arm GNU Toolchain
+  release they were measured with (13.2.Rel1).
+
+A release is made by pushing a tag `v*`. The release workflow runs all of
+those tests on the tagged commit first, and makes the release only if every
+one passes.
+
+## License
+
+MIT (`LICENSE`). The datasheets in `docs/datasheets/` are their makers',
+kept here as the sources the figures cite.

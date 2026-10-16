@@ -1,0 +1,59 @@
+# Every test alfs has: the core and the flash task on simulator seeds under
+# the sanitizers, the core on 100 seeds, and the Cortex-M0+ size and stack
+# budgets. release.yml runs this before it makes a release.
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: core, 8 seeds, sanitizers (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's address randomisation is wider than older sanitizers map.
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: make test CC=${{ matrix.cc }} JOBS=4
+
+  soak:
+    name: core, 100 seeds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make soak JOBS=4
+
+  flash-task:
+    name: flash task, 8 seeds, sanitizers (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: make test-rt CC=${{ matrix.cc }} JOBS=4
+
+  budgets:
+    name: Cortex-M0+ size and stack budgets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The budgets were measured with this release; another moves the sizes.
+      - name: Arm GNU Toolchain 13.2.Rel1
+        run: |
+          curl -sSfL https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi/bin" >> "$GITHUB_PATH"
+      - run: make target-rt
