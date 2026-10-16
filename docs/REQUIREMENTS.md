@@ -317,18 +317,23 @@ format.
 
 #### ALFS-SPD-02
 
-A write, sync or close of a file whose block holds B bytes performs at
-most ceil(B / (page − 6)) + 2 programs, plus one for each failed program
-it retries (SAFE-06) and one to zero the fresh sector (SAFE-04 rule 3).
+A write, sync or close that programs X bytes of a file performs at most
+ceil(X / (page − 6)) + 2 programs, plus one for each sector it moves into,
+one for each failed program it retries (SAFE-06), and one to zero the
+fresh sector (SAFE-04 rule 3). A write programs bytes only when the block
+fills, and then all but less than a page's room: X is at most the block's
+size B plus the bytes the write passes.
 
 - Priority: 1.
 - Source: UC-1, UC-2; the stall of 4.3. Amended 2026-10-15: draft 2 did one
   operation a call and left the pacing to the caller; draft 3's write
   blocks until its bytes are covered (the user's words, section 1), so it
   bounds the burst instead. The application chooses B to fit its slack: a
-  block of 4,096 bytes is 19 programs at most, 7.6 ms at the typical time.
-- Measure: programs the simulator counts during each call, under W-LOG and
-  W-HR, with blocks of one page and of 4,096 bytes.
+  sync of a full 4,096-byte block is about 20 programs, 8 ms at the
+  typical time.
+- Measure: programs the simulator counts during each call, against the
+  bytes the call took into and left in the block, with writes of 480 and 22
+  bytes and blocks of one page and of 4,096 bytes.
 - Pass: within the bound. Fail: more.
 - Verified by: `spd_write_burst_bounded`.
 

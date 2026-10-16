@@ -135,7 +135,7 @@ alfs's help.
 | `sim_torn_obeys_a9` | 4.4 | Each power-loss behaviour, 500 torn programs of random data into erased bytes and over programmed ones: no bit the data left 1 ever reads 0, on any of 16 reads. |
 | `if_geometry` | IF-02 | Formats and mounts; refuses seven bad geometries (a page under 128 bytes among them) and a bad erase value with no operation; refuses to mount with another sector or region size. |
 | `if_endian` | IF-03, SIMP-05 | Checks a stamp's, a first claim's, a name's, a close record's and a chunk's bytes against `docs/SPEC.md`: the magic, version 3, the geometry, the words little-endian, the checks. |
-| `if_names` | IF-04, IF-06 | Names of 1 and 31 bytes, and one with `/`, created, listed and opened; 0 and 32 bytes, and one holding 00h, refused with no operation; a name that is a prefix of another is not opened by it. |
+| `if_names` | IF-04, IF-06 | Names of 1 and 31 bytes, and one with `/`, created, listed and opened, before and after a remount; 0 and 32 bytes, and none, refused with no operation; a name that is a prefix of another is not opened by it, nor is a version under another name. A C string cannot hold 00h, so that rule needs no test. |
 | `if_list_files` | IF-08 | Three names, two versions of one, one deleted: listed in growing version, with names, closed flags and sizes; an unclosed file's size unknown; the same after a remount. |
 | `if_version_never_reused` | IF-07 | Versions grow across names; deleting the newest version of a name and creating it again gives a new number; a create torn by FLICKER, METASTABLE or SOMEBITS, then eight remounts and a new create: no two files share a version. |
 | `if_open_version0` | IF-09 | Versions 1 to 3 of a name, the newest left unclosed: version 0 opens the second; an explicit version opens the unclosed one. |
@@ -144,7 +144,7 @@ alfs's help.
 | `if_empty_file` | IF-08, SAFE-13 | A file created and closed with no bytes lists closed with size 0 and reads 0 bytes, before and after a remount. |
 | `basic_round_trip` | IF-12 | Seven sizes, 1 byte to 20,000, with blocks of one page and of 4,096 bytes: written, read, remounted, read. |
 | `spd_no_erase_outside_erase` | SPD-01 | W-LOG at both rates, two minutes, with erase steps. |
-| `spd_write_burst_bounded` | SPD-02, IF-12 | W-HR and W-LOG with blocks of one page and of 4,096 bytes: every write, sync and close within its program bound. |
+| `spd_write_burst_bounded` | SPD-02, IF-12 | 30 seconds of 480-byte writes (W-HR) and of 22-byte writes, with blocks of one page and of 4,096 bytes: every write, sync and close within its program bound for the bytes it programmed. |
 | `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no erase, from write and sync; one erase step later the held bytes are written and read back. |
 | `spd_mount_reads_bounded` | SPD-06 | Four files on 128 sectors: a mount reads at most 60 bytes a sector and does no operation. |
 | `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second: no operation longer than one program. |
