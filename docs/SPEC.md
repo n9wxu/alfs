@@ -1,18 +1,23 @@
-# alfs on-disk format, version 2
+# alfs on-disk format, version 3
 
 Every byte alfs writes, and how it reads them back. Little-endian
 throughout; every check is CRC-32 (reflected, polynomial 0xEDB88320,
 initial value and final XOR 0xFFFFFFFF: the CRC of zlib and Ethernet).
 
 Terms are those of `docs/REQUIREMENTS.md` section 4.1. S is the sector
-size, P the page size, U the prog unit, and RU(x) is x rounded up to a
-multiple of U. "Erased" means every byte equals the configured erase value
-E; "zero" means every byte equals its complement, ~E.
+size, P the page size. "Erased" means every byte equals the configured
+erase value E; "zero" means every byte equals its complement, ~E. The
+prog unit is one byte (requirements A-8, A-9).
 
-Version 2 adds to version 1 a sequence floor in the stamp, a sector number
-in the claim, and the rules of sections 4 and 5 that program a claim or
-dead mark a second time (`docs/V2_STRATEGY.md`). A version 1 region does
-not mount as version 2.
+Version 3 gives files names and versions (requirements draft 3). Against
+version 2:
+- The claim drops its 4-byte tag.
+- A file's first sector holds its name and a close record in its first
+  page, and its data from its second page.
+- The rules that resumed a file after a mount are gone.
+- Prog units over one byte are gone.
+
+A version 2 region does not mount as version 3.
 
 ---
 
@@ -20,30 +25,33 @@ not mount as version 2.
 
 | Offset | Size | Field | Written |
 |---|---|---|---|
-| 0 | 26 | stamp | by the erase step, after the erase and a check that every byte is erased |
-| DM = RU(26) | 1 | dead mark | by `alfs_delete`, in a stream's first sector only |
-| C = DM + RU(1) | 20 | claim | by the stream that takes the sector, in one program with its first chunk |
-| D = C + 20 | | chunks | by appends and syncs |
+| 0 | 26 | stamp | by an erase, after the erase and a check that every byte is erased |
+| 26 | 1 | dead mark | by `alfs_delete`, in a file's first sector only |
+| 27 | 16 | claim | by the file that takes the sector |
+| D = 43 | | chunks | in a sector that is not a file's first |
 
-The claim and its first chunk share one program, so they share a page:
-P must be at least 64 bytes (`ALFS_EGEOMETRY` otherwise), and a sector at
-least four pages.
+A file's first sector has more in its first page, and its chunks start at
+its second:
 
-| U | DM | C | D |
+| Offset | Size | Field | Written |
 |---|---|---|---|
-| 1 | 26 | 27 | 47 |
-| 16 | 32 | 48 | 68 |
-| 256 | 256 | 512 | 532 |
+| 43 | 32 | name | by `alfs_create`, in one program with the stamp, dead mark and claim |
+| 75 | 4 | name check | the same program |
+| 79 | 8 | close record | by `alfs_close` |
+| P | | chunks | by writes and syncs |
+
+P must be at least 128 bytes and S at least four pages (`ALFS_EGEOMETRY`
+otherwise).
 
 ### 1.1 The stamp
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, "alfs" |
-| 4 | 1 | version, 2 |
+| 4 | 1 | version, 3 |
 | 5 | 1 | log2 S |
 | 6 | 1 | log2 P |
-| 7 | 1 | log2 U |
+| 7 | 1 | 0 |
 | 8 | 2 | sectors in the region |
 | 10 | 4 | generation: the format that wrote it |
 | 14 | 4 | erase count: this sector's erases, this one included |
@@ -51,9 +59,9 @@ least four pages.
 | 22 | 4 | CRC of bytes 0 to 21 |
 
 A stamp is **valid** when its magic, version and CRC are right. It
-**matches** when its geometry equals the configuration. A stamp that is
-valid but does not match makes a mount fail with `ALFS_EGEOMETRY`, unless a
-matching one exists.
+**matches** when its geometry (bytes 5 to 9) equals the configuration. A
+stamp that is valid but does not match makes a mount fail with
+`ALFS_EGEOMETRY`, unless a matching one exists.
 
 The **current generation** is the largest generation among the matching
 stamps. `alfs_format` writes one greater than any it finds.
@@ -66,32 +74,55 @@ sectors with one more than the largest valid count among them.
 
 The **next sequence** at mount is two more than the largest of every valid
 claim's sequence and every valid stamp's floor. A power loss can tear a
-claim so that it reads invalid now and valid later; it was given the
-sequence after the largest valid one, and the floors keep that largest
-known after its sector is erased, so the torn claim's sequence is never
-given again.
+claim so that it reads invalid now and valid later. That claim was given
+the sequence after the largest valid one. The floors keep that largest
+sequence known after its sector is erased, so the torn claim's sequence is
+never given again.
 
 ### 1.2 The dead mark
 
-Erased: the stream whose first sector this is lives. Any other value: it
+Erased: the file whose first sector this is lives. Any other value: it
 was deleted. alfs writes ~E, in one program, so a delete is atomic. Only a
-stream's first sector's mark is read.
+file's first sector's mark is read.
 
 ### 1.3 The claim
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 4 | stream identity: the sequence of the stream's first claim |
+| 0 | 4 | identity: the sequence of the file's first claim, and its version |
 | 4 | 4 | sequence: unique in the region, growing, never reused |
-| 8 | 4 | tag: the caller's |
-| 12 | 2 | the stream's first sector, an index into the region |
-| 14 | 2 | sector number: 0 in the stream's first sector, one more in each next |
-| 16 | 4 | CRC of bytes 0 to 15 |
+| 8 | 2 | the file's first sector, an index into the region |
+| 10 | 2 | sector number: 0 in the file's first sector, one more in each next |
+| 12 | 4 | CRC of bytes 0 to 11 |
 
-A sector is a stream's **first** when its claim's sequence equals its
-identity and its sector number is 0.
+A sector k is a file's **first** when its claim is valid, its sequence
+equals its identity, its first sector is k, and its sector number is 0.
 
-### 1.4 A chunk
+### 1.4 The name
+
+The name's 1 to 31 bytes, none 00h, then 00h to fill 32 bytes. The **name
+check** is the CRC of the claim's identity (4 bytes, little-endian) and the
+32 name bytes.
+
+A first sector whose name check is wrong, or whose name bytes break the
+rule, holds a **nameless** file: a create a power loss tore (requirements
+SAFE-13). It lists with an empty name and is deleted by its version.
+
+### 1.5 The close record
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | size: the bytes written to the file |
+| 4 | 4 | CRC of the claim's identity (4 bytes) and the size |
+
+Erased, or with a wrong CRC: the file is **unclosed**. With a right CRC it
+is **closed**, and its size is known.
+
+A file's first page holds no data. It takes the stamp, the create, the
+close record and the dead mark, and in each mount at most once each the
+dead mark again (section 6) and the close record again (section 5).
+
+### 1.6 A chunk
 
 | Offset | Size | Field |
 |---|---|---|
@@ -99,137 +130,158 @@ identity and its sector number is 0.
 | 2 | 4 | CRC of the two length bytes and the payload |
 | 6 | length | payload |
 
-A chunk never crosses a page. The first chunk of a sector starts at D,
-straight after the claim; each later chunk at RU of the end of the one
-before, or at the start of a later page.
+A chunk never crosses a page. A sector's first chunk starts at D, or at P
+in a file's first sector; each later chunk at the end of the one before,
+or at the start of a later page.
 
 ---
 
 ## 2. What a sector is
 
-Decided from at most 68 bytes: the stamp, the dead mark and the claim, and
-for a sector that is not its stream's first, the first sector's dead mark
+Decided from at most 60 bytes: the stamp, the dead mark and the claim, and
+for a sector that is not its file's first, the first sector's dead mark
 and claim.
 
 | State | When |
 |---|---|
 | **ready** | the stamp matches, has the current generation, and the dead mark and the claim are erased |
-| **live** | the stamp matches, has the current generation, the claim is valid, and the stream's first sector has a valid first claim with the same identity and an erased dead mark |
-| **dirty** | anything else: no valid stamp, an old generation, a claim neither erased nor valid (**torn**), a deleted or vanished stream, or anything not alfs's |
+| **live** | the stamp matches, has the current generation, the claim is valid, and the file's first sector has a valid first claim with the same identity and an erased dead mark |
+| **dirty** | anything else: no valid stamp, an old generation, a claim neither erased nor valid (**torn**), a zero claim, a deleted or vanished file, or anything not alfs's |
 | **bad** | an erase or the check after it failed, during this mount; kept in RAM, at most eight |
 
-A bit error in a claim makes its sector dirty, and in a stream's first
-sector makes the whole stream dirty: the next erase steps reclaim it.
-Chunks are protected one by one (section 3); claims are not repaired.
+A bit error in a claim makes its sector dirty. In a file's first sector it
+makes the whole file dirty, and the next erases reclaim it. Chunks are
+protected one by one (section 3); claims are not repaired.
 
-Before a stream takes a ready sector, the rest of the claim's page, from
-the dead mark on, is read and must be erased; otherwise the sector is
-counted dirty and the next ready one is tried.
+Before a file takes a ready sector, the rest of its first page, from the
+dead mark on, is read and must be erased. Otherwise the sector is counted
+dirty and the next ready one is tried.
 
 ---
 
 ## 3. Reading
 
-**A sector's chunks**, from D, at position x:
+**Finding a file.**
+- By version: the live first sector whose identity is that version. If the
+  caller also gives a name, the name must match.
+- With version 0: the closed file of that name whose identity is
+  greatest. Every live first sector's name and close record are read to
+  find it.
+
+**A sector's chunks**, from where its chunks start, at position x:
 
 1. Read the six header bytes at x.
-2. If they are erased: go to the next page start and continue. A blank
-   page does not end the sector, since a resumed stream leaves two pages
-   unwritten (section 4); its chunks end at the sector's end.
+2. If they are erased: go to the next page start and continue. The writer
+   moves to the next page when a chunk does not fit, or when the page has
+   had its programs.
 3. If the length is 0, or the chunk would cross its page, or its CRC fails:
-   count one failed check (when reading for the caller), go to the next
-   page start, and continue. The length cannot be trusted, so nothing else
-   in that page is either.
-4. Otherwise the chunk is good: deliver it, and continue at RU(x + 6 +
-   length).
+   count one failed check, go to the next page start, and continue. The
+   length cannot be trusted, so nothing else in that page is either.
+4. Otherwise the chunk is good: deliver it, and continue at x + 6 + length.
 
-**A stream's sectors**, in order: its first sector, then repeatedly the
-live sector whose claim has the same identity and the next sector number.
-It is found by scanning forward, circularly, from the sector just read,
-and the scan stops there: allocation moves forward, so it is usually a few
-sectors on. When no sector has the next number, the one with the smallest
-larger number follows, and the gap counts one failed check; when none has
-a larger number, the stream ends.
+**A file's sectors, in order.**
+- First the file's first sector.
+- Then, repeatedly, the live sector whose claim has the same identity and
+  the next sector number. alfs finds it by scanning forward, circularly,
+  from the sector just read. Allocation moves forward, so it is usually a
+  few sectors on, and the scan stops there.
+- When no sector has the next number, the one with the smallest larger
+  number follows, and the gap counts one failed check.
+- When none has a larger number, the file ends.
+
+**Listing** visits every live first sector in growing identity. For each
+it reports the name, or none for a nameless file; the identity, as the
+version; whether it is closed; and its size if it is.
 
 ---
 
 ## 4. Writing
 
-- **A new sector:** the ready sector found by scanning forward, circularly,
-  from the sector after the last claimed. One program writes the claim and
-  the first chunk; with U = 1 it starts at byte 0 and writes the stamp
-  again, with the bytes it reads, and the dead mark erased, so that a stamp
-  an erase step left half programmed is completed (A-9). Its sector number
-  is one more than the stream's last.
-- **A sector not used after a mount**, with U = 1: the first sector, as
-  the mount finds them, after the sector of the newest valid claim of any
-  stream, wrapping round, whose stamp is current and whose claim is not
-  valid and not zero: erased or torn, however its bits happen to read. That is where the allocation cursor stood
-  when the power was lost, so it is the sector a torn claim program would
-  have taken, and such a program torn at its start leaves a sector that
-  reads ready but holds a bit that reads either way (the probe's FLICKER).
-  When an allocation reaches it, alfs programs zero over its claim, which
-  makes it dirty, and takes the next.
-- **The next chunk:** at RU of the last one's end, in the same page while
-  it fits and the page has had fewer than `max_page_programs` programs;
-  otherwise at the next page's start; past the sector's end, in a new
-  sector. In a stream's first sector, one program of the dead mark's page
-  is held back for the dead mark.
-- **A failed program:** the stream leaves the sector and writes the same
-  bytes to a new sector on its next call. A sector whose claim program
-  failed is counted dirty.
+**Taking a sector.** alfs scans forward, circularly, from the sector after
+the one taken last, for a ready sector that passes section 2's check. With
+one exception, the fresh sector:
+- What it is: the first sector, as the mount found them, after the sector
+  of the newest valid claim of any file, wrapping round, whose stamp is
+  current and whose claim is not valid and not zero. Its claim is erased or
+  torn, however its bits happen to read.
+- Why: that is where the allocation cursor stood when the power was lost,
+  so it is the sector a torn claim program would have taken. Such a
+  program, torn at its start, leaves a sector that reads ready but holds a
+  bit that reads either way (the probe's FLICKER).
+- What alfs does: when an allocation reaches it, alfs programs zero over
+  its claim, which makes it dirty, and takes the next.
 
-**After a mount** (`alfs_open_append`), with U = 1. The power loss that
-preceded the mount interrupted at most one program: the next chunk in the
-page of the stream's last good chunk, the first chunk of the next page, or
-the claim of a new sector. Its bits may read either way (littlefs's
-METASTABLE, seen on the XT25F128F by the probe), but it cleared only bits
-its data cleared (A-9). So:
+**Creating a file.**
+- alfs takes a sector k and gives the file the next sequence as its
+  identity.
+- One program from byte 0 writes the stamp again, with the bytes it reads;
+  the dead mark, erased; the claim (identity, identity, k, 0); the name;
+  and the name check.
+- Programming the stamp again completes one that an erase left half
+  programmed (A-9).
+- If the program fails, the sector is counted dirty, the file takes a new
+  identity (the failed sector may hold a first claim), and alfs tries the
+  next ready sector, up to the configured number of times.
 
-1. The stream's first program is its last sector's stamp, dead mark and
-   claim again, with the bytes they read. That completes the claim if the
-   interrupted program was it.
-2. Its next chunk starts at the start of the second page after the page of
-   the last good chunk in its last sector (after the claim's page, if no
-   chunk there is good), or in a new sector when there is no such page.
-   Neither page that the interrupted program could have touched takes new
-   data.
-3. Before its first chunk, it scans every sector and programs zero
-   over any claim that reads valid with its identity and a sector number
-   past its last, and any torn claim whose identity, tag, first sector and
-   sector number fields read erased in every bit where its own identity,
-   tag, first sector and next number are erased (a torn program leaves a
-   bit erased only where its data cleared it, A-9). One such claim a call.
-   A torn claim of the sector it was moving into, which might otherwise
-   read valid at a later mount, then cannot put bytes appended before the
-   power loss after those appended since.
+**The next chunk.**
+- Where it goes: straight after the last chunk, in the same page while at
+  least seven bytes are left in it and the page has had fewer than
+  `max_page_programs` programs. Otherwise it goes at the next page's start.
+- Past the sector's end, it goes in a new sector, taken as above. One
+  program from byte 0 then writes the stamp again (as read), the dead mark
+  erased, the claim (identity, next sequence, first sector, number + 1),
+  and the chunk.
+- How big it is: at most the room left in its page. A write programs the
+  block's bytes when the block is full, all but what is left after the last
+  whole page's room (requirements IF-12); a sync programs them all.
 
-A chunk that a power loss tore may read invalid at one mount and valid at
-a later one. Its bytes were appended, though never synced, and they read
-in their place, before anything appended after the mount.
+**A failed program.** The file leaves the sector and programs the same
+bytes in a new sector, in the same call, up to the configured number of
+times in a row. Then the bytes are dropped and counted. A sector whose
+claim program failed is counted dirty.
 
-With U over 1 the chip cannot take a second program, so the stream goes on
-in a new sector, as in version 1.
+**Closing.** One program writes the close record: the bytes written to the
+file over its life, and the check.
+
+**After a mount.** No file found unclosed is written again; a new version
+takes its place. The power loss that preceded the mount interrupted at most
+one program, and every byte that program touched is in the unclosed file's
+last page, a sector no file holds yet, or a stamp.
 
 ---
 
-## 5. Erasing
+## 5. Deleting
 
-The erase step scans forward, circularly, from where it last stopped, for
-a dirty sector that is not bad. With a driver that has `erase_large` and a
-whole aligned block of dirty sectors, it takes the block.
+alfs finds the version's first sector and refuses if any handle has it
+open. Next, if the file has a name, alfs looks for the closed file of the
+same name with the greatest identity above this version. If there is one,
+and it has not had this already in this mount, alfs programs that file's
+close record again with the bytes it reads (A-9): a close a power loss left
+half programmed cannot then read unclosed once this version is gone. Then
+one program writes ~E to the dead mark.
 
-With U = 1, before erasing, it reads each sector to be erased again,
-deciding from one read of its stream's dead mark. One that now reads live
-is left for later: a bit that reads either way can make a sector read
-dirty when chosen and live a moment after. One that belongs to a deleted
-stream, and is not that stream's first, has the stream's dead mark
-programmed with ~E again, one mark a call, unless that mark was the last
-one programmed this mount. A dead mark a power loss left half programmed
-then cannot read erased once some of its stream's sectors are gone.
+---
 
-It erases the sector or block, reads every byte back as erased, programs
-the stamp and reads the stamp back. Any failure makes the sector bad for
-the rest of the mount. The stamp, not the blank check, is what shows an
-erase completed: the probe found erases aborted at a tenth of their time
-already reading blank (`docs/FLASH_PROBE.md` section 4).
+## 6. Erasing
+
+Erasing happens only when the application asks, one step at a time. A
+step scans forward, circularly, from where the last one stopped, for a
+dirty sector that is not bad. With a driver that has `erase_large` and a
+whole aligned block of dirty sectors, the step takes the block.
+
+**Before erasing,** the step reads each sector to be erased again, and
+decides from one read of its file's dead mark:
+- A sector that now reads live is left for later. A bit that reads either
+  way can make a sector read dirty when chosen and live a moment after.
+- A sector that belongs to a deleted file, and is not that file's first,
+  has the file's dead mark programmed with ~E again. That is done once per
+  file per mount. A dead mark a power loss left half programmed then cannot
+  read erased once some of its file's sectors are gone.
+
+**Then** the step erases the sector or block, reads every byte back as
+erased, programs the stamp and reads the stamp back. Any failure makes the
+sector bad for the rest of the mount.
+
+The stamp, not the blank check, is what shows an erase completed. The probe
+found erases aborted at a tenth of their time already reading blank
+(`docs/FLASH_PROBE.md` section 4).

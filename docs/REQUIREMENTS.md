@@ -524,8 +524,8 @@ A page is programmed at most a configured number of times between erases
 - Priority: 2.
 - Source: A-2: no datasheet here limits partial programs, but other NOR
   parts do. Amended 2026-10-15: a file's first page holds no data, and
-  takes at most six programs (SPEC 1.5), so no program of it is held back
-  for its marks.
+  takes four programs and at most two more in each mount (SPEC 1.5), so no
+  program of it is held back for its marks.
 - Measure: programs per page the simulator counts, under W-LOG at 1 row a
   second.
 - Pass: at most the configured number. Fail: more.
