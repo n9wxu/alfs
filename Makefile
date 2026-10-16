@@ -85,8 +85,10 @@ build/rt_kernel.a: | build $(ALFS_RT_KERNEL)
 build/test_rtos: alfs.c alfs.h alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
 	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(SAN) $(RT_INC) -o $@ alfs.c alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
 
+# The tests leave each deleted task's memory allocated, since the idle task
+# may not have run yet; LeakSanitizer (Linux) would report every one.
 test-rt: build/test_rtos
-	$(call run_seeds,./build/test_rtos,$(SEEDS))
+	$(call run_seeds,ASAN_OPTIONS=detect_leaks=0 ./build/test_rtos,$(SEEDS))
 
 # SIMP-02 and SIMP-04 for the task layer, on the kernel's generic Cortex-M0 port.
 RT_M0_INC = -I. -Itests/rtos_m0 -I$(ALFS_RT_KERNEL)/include -I$(ALFS_RT_KERNEL)/portable/GCC/ARM_CM0
