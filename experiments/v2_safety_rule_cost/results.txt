@@ -1,0 +1,29 @@
+format 2: 6845 bytes; format 1: 5301 bytes; format 2 less format 1: 1544
+
+A rules 1-2 resume in last sector       6557  saves   288  life_resume_waste
+B rule 3 clear ahead                    6577  saves   268  safe_resume_torn_claim
+C rule 4 claim from byte 0              6785  saves    60  safe_resume_torn_claim
+D rule 5 fresh sector                   6601  saves   244  life_resume_waste, safe_powerloss_durable, safe_powerloss_bound, safe_no_program_after_torn, safe_resume_torn_claim
+E sequence floor                        6813  saves    32  no test fails
+F delete mark again + re-read           6377  saves   468  no test fails
+ALL v2 power-loss rules A-F             5337  saves  1508  life_resume_waste, safe_powerloss_durable, safe_powerloss_bound, safe_no_program_after_torn, safe_resume_torn_claim
+H program read-back                     6769  saves    76  safe_prog_failure
+I blank check after erase               6749  saves    96  safe_bad_sector
+J claim page check                      6681  saves   164  no test fails
+I+J both blank checks                   6613  saves   232  safe_bad_sector
+K bad sectors                           6717  saves   128  safe_append_only_verified_ready, safe_bad_sector
+L retry cap                             6809  saves    36  safe_prog_failure
+v1-era H+I+J+K+L                        6377  saves   468  safe_append_only_verified_ready, safe_prog_failure, safe_bad_sector
+N large erase                           6537  saves   308  life_large_erase
+everything A-L                          4881  saves  1964  life_resume_waste, safe_powerloss_durable, safe_powerloss_bound, safe_no_program_after_torn, safe_append_only_verified_ready, safe_prog_failure, safe_bad_sector, safe_resume_torn_claim
+
+pairs, against a 6,144-byte budget:
+F+N       6085  saves  760  fits 6 KiB
+A+N       6249  saves  596  over by 105
+B+N       6265  saves  580  over by 121
+D+N       6297  saves  548  over by 153
+J+N       6369  saves  476  over by 225
+F+A       6085  saves  760  fits 6 KiB
+F+J       6209  saves  636  over by 65
+F+B       6109  saves  736  fits 6 KiB
+F+J+H     6133  saves  712  fits 6 KiB
