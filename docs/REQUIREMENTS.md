@@ -771,16 +771,21 @@ programmed lists without a name, and is deleted by its version.
 #### ALFS-SAFE-14
 
 A close is atomic: after a power loss during it, the file is unclosed or
-closed with its true size. Before deleting a version, alfs programs again,
-with the bytes it reads, the close record of the newest closed version of
-the same name above it (A-9), so a close a power loss left half programmed
-cannot read unclosed once an older version is gone.
+closed with its true size. Before deleting a version, alfs completes the
+close record of the newest version of the same name above it whose close
+record is not erased (A-9), so a close a power loss left half programmed
+cannot read unclosed once an older version is gone. A close whose record
+will not program releases the file unclosed.
 
 - Priority: 3.
 - Source: UC-11. A close record torn by METASTABLE can read closed at one
   mount and unclosed at the next; had the application seen it closed and
   deleted the version before, a later mount would find no closed version
-  of its configuration.
+  of its configuration. First written as "the newest closed version": the
+  delete's own read of the record could find it unclosed after the
+  application's listing found it closed (`safe_config_replace`, amended
+  2026-10-15). A close record's place is fixed in the file's first
+  sector, so one that fails cannot move to a fresh sector (SAFE-06).
 - Measure: power loss at every operation of W-CFG; after each, eight
   remounts.
 - Pass: whenever a closed version of the file existed before the loss,
@@ -967,7 +972,9 @@ again, even after a delete or a create a power loss tore.
   newest version was deleted, and twice after a torn create read invalid
   at one mount and valid at a later one. The identity has both covered:
   each stamp records the next sequence, and a mount takes two more than
-  the largest in any claim or stamp (SPEC 1.1).
+  the largest in any claim or stamp, three when it finds a torn claim
+  (SPEC 1.1). Two alone gave a torn create's version again when the create
+  came straight after a mount (found 2026-10-15, seeds 16 and 30).
 - Verified by: `if_version_never_reused`.
 
 #### ALFS-IF-08

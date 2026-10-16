@@ -7,24 +7,23 @@
 
 #include <string.h>
 
-#define VERSION 2u
+#define VERSION 3u
 #define STAMP_LEN 26u
-#define CLAIM_LEN 20u
+#define CLAIM_LEN 16u
 #define HDR_LEN 6u
-#define PIECE 16u /* the most read onto the stack at once */
+#define NAME_LEN 32u
+#define CLOSE_LEN 8u
+#define PIECE 16u     /* the most read onto the stack at once */
+#define OPEN_MAX 255u /* handles a walk of the open list visits at most */
 
 #define OFF_DM STAMP_LEN
 #define OFF_CLAIM (OFF_DM + 1u)
-#define OFF_DATA (OFF_CLAIM + CLAIM_LEN)
+#define OFF_DATA (OFF_CLAIM + CLAIM_LEN) /* a sector that is not a file's first */
+#define OFF_NAME OFF_DATA                /* a file's first sector: SPEC 1 */
+#define OFF_CLOSE (OFF_NAME + NAME_LEN + 4u)
 
-/* A stream's buffer: a sector's first bytes, then the payload. A claim
- * program writes it from byte 0. */
-#define B_CLAIM OFF_CLAIM
-#define B_HDR OFF_DATA
-#define BUF_HEAD (B_HDR + HDR_LEN)
-
-enum { M_CLOSED, M_APPEND, M_READ };
-enum { F_NEW = 1, F_FIRST = 2 }; /* stream flags */
+enum { M_CLOSED, M_WRITE, M_READ };
+enum { F_NEW = 1 }; /* file flags: the next chunk takes a new sector */
 #define NONE 0xFFFFu
 enum { S_READY, S_LIVE, S_DIRTY };
 
@@ -65,6 +64,13 @@ static void put32(uint8_t *p, uint32_t v) {
     put16(p + 2, v >> 16);
 }
 
+/* The CRC of a file's identity, then n bytes: its name or its size. */
+static uint32_t crc_of(uint32_t id, const uint8_t *p, uint32_t n) {
+    uint8_t b[4];
+    put32(b, id);
+    return ~crc32(crc32(0xFFFFFFFFu, b, 4), p, n);
+}
+
 static uint32_t lg2(uint32_t x) {
     uint32_t n = 0;
     while (x > 1u) {
@@ -76,6 +82,14 @@ static uint32_t lg2(uint32_t x) {
 
 static bool pow2(uint32_t x) {
     return x && !(x & (x - 1u));
+}
+
+/* A name's length when it is one (1 to ALFS_NAME_MAX bytes), else 0. */
+static uint32_t name_len(const char *name) {
+    uint32_t n = 0;
+    while (name && n <= ALFS_NAME_MAX && name[n])
+        n++;
+    return n <= ALFS_NAME_MAX ? n : 0;
 }
 
 /* ---- geometry --------------------------------------------------------- */
@@ -95,7 +109,7 @@ static int check_cfg(const alfs_config_t *c, const alfs_driver_t *d) {
     if (c->erase_value != 0xFFu && c->erase_value != 0x00u)
         return ALFS_EINVAL;
     uint32_t s = c->sector_size, p = c->page_size;
-    if (!pow2(s) || !pow2(p) || p < 64u || s < 4u * p || s > 32768u)
+    if (!pow2(s) || !pow2(p) || p < 128u || s < 4u * p || s > 32768u)
         return ALFS_EGEOMETRY;
     if (c->region_start % s || c->region_size % s || !c->region_size ||
         c->region_size / s > 65535u || c->region_start > c->chip_size ||
@@ -163,6 +177,10 @@ typedef struct {
     uint8_t claim[CLAIM_LEN];
 } hdr_t;
 
+/* Headers are read into the scratch page: nothing builds a program there
+ * while a scan runs, and the stamp lands where a claim program wants it. */
+#define HDR(fs) ((hdr_t *)(void *)(fs)->scratch)
+
 static int read_hdr(alfs_t *fs, uint32_t k, hdr_t *h) {
     return rd(fs, addr_of(fs, k), h, sizeof(*h));
 }
@@ -187,25 +205,31 @@ static bool zeroed(const alfs_t *fs, const uint8_t *cl) {
 }
 
 static bool claim_valid(const alfs_t *fs, const uint8_t *cl) {
-    return !is_erased(fs, cl, CLAIM_LEN) && get32(cl + 16) == crc(cl, 16);
+    return !is_erased(fs, cl, CLAIM_LEN) && get32(cl + 12) == crc(cl, 12);
 }
 
-/* A stream's first claim, whatever its dead mark: its sequence is its
- * identity, and its sector number 0. */
+static bool first_fields(const uint8_t *claim, uint32_t k);
+
+/* A file's first claim, whatever its dead mark: its sequence is its
+ * identity, its first sector its own, its sector number 0. */
 static bool first_of(const alfs_t *fs, const uint8_t *claim, uint32_t k) {
-    return claim_valid(fs, claim) && get32(claim) == get32(claim + 4) && get16(claim + 12) == k &&
-           get16(claim + 14) == 0;
+    return claim_valid(fs, claim) && first_fields(claim, k);
 }
 
 static bool is_first(const alfs_t *fs, const hdr_t *h, uint32_t k) {
     return h->dead == fs->cfg->erase_value && first_of(fs, h->claim, k);
 }
 
+/* first_of's fields alone, for a claim already found valid. */
+static bool first_fields(const uint8_t *claim, uint32_t k) {
+    return get32(claim) == get32(claim + 4) && get16(claim + 8) == k && get16(claim + 10) == 0;
+}
+
 static bool current(const alfs_t *fs, const uint8_t *st) {
     return stamp_valid(st) && stamp_matches(fs, st) && get32(st + 10) == fs->gen;
 }
 
-/* SPEC section 2, on a header already read: at most 21 bytes more. */
+/* SPEC section 2, on a header already read: at most 17 bytes more. */
 static int classify_hdr(alfs_t *fs, uint32_t k, const hdr_t *h, int *state) {
     *state = S_DIRTY;
     if (!current(fs, h->stamp))
@@ -216,9 +240,9 @@ static int classify_hdr(alfs_t *fs, uint32_t k, const hdr_t *h, int *state) {
     }
     if (!claim_valid(fs, h->claim))
         return ALFS_OK;
-    uint32_t id = get32(h->claim), first = get16(h->claim + 12);
+    uint32_t id = get32(h->claim), first = get16(h->claim + 8);
     if (get32(h->claim + 4) == id) {
-        if (is_first(fs, h, k))
+        if (h->dead == fs->cfg->erase_value && first_fields(h->claim, k))
             *state = S_LIVE;
         return ALFS_OK;
     }
@@ -227,7 +251,7 @@ static int classify_hdr(alfs_t *fs, uint32_t k, const hdr_t *h, int *state) {
     uint8_t f[1 + CLAIM_LEN]; /* the first sector's dead mark and claim */
     if (rd(fs, addr_of(fs, first) + OFF_DM, f, sizeof(f)))
         return ALFS_EIO;
-    if (f[0] == fs->cfg->erase_value && first_of(fs, f + 1, first) && get32(f + 1) == id)
+    if (f[0] == fs->cfg->erase_value && get32(f + 1) == id && claim_valid(fs, f + 1) && first_fields(f + 1, first))
         *state = S_LIVE;
     return ALFS_OK;
 }
@@ -242,6 +266,78 @@ static bool is_bad(const alfs_t *fs, uint32_t k) {
         if (fs->bad[i] == k)
             return true;
     return false;
+}
+
+/* ---- a file's first sector -------------------------------------------- */
+
+/* File id's name, from first sector k, into out[NAME_LEN]: its length, or 0
+ * when the create that wrote it was torn (SPEC 1.4). */
+static int read_name(alfs_t *fs, uint32_t k, uint32_t id, uint8_t *out, uint32_t *len) {
+    uint8_t c[4];
+    *len = 0;
+    if (rd(fs, addr_of(fs, k) + OFF_NAME, out, NAME_LEN) || rd(fs, addr_of(fs, k) + OFF_NAME + NAME_LEN, c, 4))
+        return ALFS_EIO;
+    if (get32(c) != crc_of(id, out, NAME_LEN))
+        return ALFS_OK;
+    uint32_t n = 0;
+    while (n < NAME_LEN && out[n])
+        n++;
+    for (uint32_t i = n; i < NAME_LEN; i++)
+        if (out[i])
+            return ALFS_OK;
+    *len = n <= ALFS_NAME_MAX ? n : 0;
+    return ALFS_OK;
+}
+
+/* File id's close record, from first sector k, into rec[CLOSE_LEN]: true
+ * in *closed when it is whole (SPEC 1.5). */
+static int read_close(alfs_t *fs, uint32_t k, uint32_t id, uint8_t *rec, bool *closed) {
+    if (rd(fs, addr_of(fs, k) + OFF_CLOSE, rec, CLOSE_LEN))
+        return ALFS_EIO;
+    *closed = get32(rec + 4) == crc_of(id, rec, 4);
+    return ALFS_OK;
+}
+
+/* ---- the open files --------------------------------------------------- */
+
+static bool listed(const alfs_t *fs, const alfs_file_t *f) {
+    uint32_t i = 0;
+    for (const alfs_file_t *o = fs->open; o && i < OPEN_MAX; o = o->next, i++)
+        if (o == f)
+            return true;
+    return false;
+}
+
+static bool is_open(const alfs_t *fs, uint32_t id) {
+    uint32_t i = 0;
+    for (const alfs_file_t *o = fs->open; o && i < OPEN_MAX; o = o->next, i++)
+        if (o->version == id)
+            return true;
+    return false;
+}
+
+static void unlink_file(alfs_t *fs, alfs_file_t *f) {
+    alfs_file_t **p = &fs->open;
+    for (uint32_t i = 0; *p && i < OPEN_MAX; p = &(*p)->next, i++)
+        if (*p == f) {
+            *p = f->next;
+            break;
+        }
+    f->mode = M_CLOSED;
+}
+
+/* A handle made ready for a file, and listed open. */
+static void open_file(alfs_t *fs, alfs_file_t *f, uint8_t *block, uint32_t size, uint32_t id, uint32_t first,
+                      uint8_t mode) {
+    memset(f, 0, sizeof(*f));
+    f->block = block;
+    f->cap = (uint16_t)size;
+    f->version = id;
+    f->sector = f->first = (uint16_t)first;
+    f->off = (uint16_t)fs->cfg->page_size; /* a first sector's chunks start at its second page */
+    f->mode = mode;
+    f->next = fs->open;
+    fs->open = f;
 }
 
 /* ---- mount and format ------------------------------------------------- */
@@ -269,58 +365,62 @@ static void see_wear(alfs_t *fs, uint32_t w) {
  * the next sequence, wear, and where allocation goes on. ALFS_ENOFS or
  * ALFS_EGEOMETRY when no stamp matches; the survey is complete either way.
  */
-static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv) {
+static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    if (fs->cfg && fs->open)
+        return ALFS_EOPEN;
     int rc = check_cfg(cfg, drv);
-    if (rc)
-        return rc;
+    if (rc || !scratch)
+        return rc ? rc : ALFS_EINVAL;
     init(fs, cfg, drv);
-    bool any = false, mismatch = false, live_any = false, newest_any = false;
+    fs->scratch = scratch;
+    bool any = false, mismatch = false, live_any = false, newest_any = false, torn = false;
     uint32_t ready = 0, live = 0, dirty = 0, last_seq = 0, last_k = 0, seq_max = 0;
     uint32_t newest = 0, fresh_after = NONE, fresh_any = NONE; /* SAFE-04 rule 3 */
     for (uint32_t k = 0; k < fs->sectors; k++) {
-        hdr_t h;
+        hdr_t *h = HDR(fs);
         int st = S_DIRTY;
-        if (read_hdr(fs, k, &h))
+        if (read_hdr(fs, k, h))
             return ALFS_EIO;
-        if (claim_valid(fs, h.claim) && get32(h.claim + 4) > seq_max)
-            seq_max = get32(h.claim + 4);
-        if (stamp_valid(h.stamp) && !stamp_matches(fs, h.stamp))
+        if (claim_valid(fs, h->claim) && get32(h->claim + 4) > seq_max)
+            seq_max = get32(h->claim + 4);
+        if (stamp_valid(h->stamp) && !stamp_matches(fs, h->stamp))
             mismatch = true;
-        if (stamp_valid(h.stamp) && stamp_matches(fs, h.stamp)) {
-            uint32_t g = get32(h.stamp + 10);
-            see_wear(fs, get32(h.stamp + 14));
-            if (get32(h.stamp + 18) > seq_max)
-                seq_max = get32(h.stamp + 18);
+        if (stamp_valid(h->stamp) && stamp_matches(fs, h->stamp)) {
+            uint32_t g = get32(h->stamp + 10);
+            see_wear(fs, get32(h->stamp + 14));
+            if (get32(h->stamp + 18) > seq_max)
+                seq_max = get32(h->stamp + 18);
             if (!any || g > fs->gen) { /* a newer generation: all before it is dirty */
                 dirty += ready + live;
                 ready = live = 0;
-                live_any = newest_any = false;
+                live_any = newest_any = torn = false;
                 fresh_after = fresh_any = NONE;
                 fs->gen = g;
                 any = true;
             }
-            if (classify_hdr(fs, k, &h, &st))
+            if (classify_hdr(fs, k, h, &st))
                 return ALFS_EIO;
-            if (g == fs->gen && claim_valid(fs, h.claim) && (!newest_any || get32(h.claim + 4) > newest)) {
-                newest = get32(h.claim + 4);
+            if (g == fs->gen && claim_valid(fs, h->claim) && (!newest_any || get32(h->claim + 4) > newest)) {
+                newest = get32(h->claim + 4);
                 newest_any = true;
                 fresh_after = NONE;
             }
             /* a sector a claim program could have been taking: erased or torn,
              * however its bits read now, and not one alfs zeroed */
-            if (g == fs->gen && !claim_valid(fs, h.claim) && !zeroed(fs, h.claim)) {
+            if (g == fs->gen && !claim_valid(fs, h->claim) && !zeroed(fs, h->claim)) {
                 if (fresh_any == NONE)
                     fresh_any = k;
                 if (fresh_after == NONE && newest_any)
                     fresh_after = k;
+                torn |= !is_erased(fs, h->claim, CLAIM_LEN);
             }
         }
         if (st == S_READY) {
             ready++;
         } else if (st == S_LIVE) {
             live++;
-            if (!live_any || get32(h.claim + 4) > last_seq) {
-                last_seq = get32(h.claim + 4);
+            if (!live_any || get32(h->claim + 4) > last_seq) {
+                last_seq = get32(h->claim + 4);
                 last_k = k;
                 live_any = true;
             }
@@ -328,7 +428,7 @@ static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv
             dirty++;
         }
     }
-    fs->next_seq = seq_max + 2u; /* past a torn claim's: SPEC 1.1 */
+    fs->next_seq = seq_max + (torn ? 3u : 2u); /* past a torn claim's: SPEC 1.1 */
     fs->fresh = (uint16_t)(fresh_after != NONE ? fresh_after : fresh_any);
     fs->ready = (uint16_t)ready;
     fs->dirty = (uint16_t)dirty;
@@ -337,9 +437,9 @@ static int survey(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv
     return any ? ALFS_OK : mismatch ? ALFS_EGEOMETRY : ALFS_ENOFS;
 }
 
-int alfs_mount(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv) {
-    int rc = survey(fs, cfg, drv);
-    if (rc)
+int alfs_mount(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    int rc = survey(fs, cfg, drv, scratch);
+    if (rc && rc != ALFS_EOPEN)
         fs->cfg = NULL; /* not mounted */
     return rc;
 }
@@ -428,9 +528,10 @@ static int wipe(alfs_t *fs, uint32_t k, uint32_t n) {
     return ALFS_OK;
 }
 
-int alfs_format(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv) {
-    int rc = survey(fs, cfg, drv);
-    if (rc == ALFS_EIO || rc == ALFS_EINVAL || (rc == ALFS_EGEOMETRY && check_cfg(cfg, drv)))
+int alfs_format(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    int rc = survey(fs, cfg, drv, scratch);
+    if (rc == ALFS_EIO || rc == ALFS_EINVAL || rc == ALFS_EOPEN ||
+        (rc == ALFS_EGEOMETRY && check_cfg(cfg, drv)))
         return rc;
     fs->gen++;
     fs->fresh = NONE;
@@ -442,8 +543,8 @@ int alfs_format(alfs_t *fs, const alfs_config_t *cfg, const alfs_driver_t *drv) 
 }
 
 /*
- * What sector k is now, from one read of its stream's dead mark: 2 when it
- * reads live, 1 when it belongs to a deleted stream and is not its first
+ * What sector k is now, from one read of its file's dead mark: 2 when it
+ * reads live, 1 when it belongs to a deleted file and is not its first
  * (*first set), 0 when it is dirty otherwise. A bit that reads either way
  * can make a sector read dirty when chosen and live a moment later.
  */
@@ -452,7 +553,7 @@ static int reclaim_kind(alfs_t *fs, uint32_t k, hdr_t *h, uint32_t *first) {
         return ALFS_EIO;
     if (!current(fs, h->stamp) || !claim_valid(fs, h->claim))
         return 0;
-    uint32_t id = get32(h->claim), f = get16(h->claim + 12);
+    uint32_t id = get32(h->claim), f = get16(h->claim + 8);
     if (get32(h->claim + 4) == id)
         return is_first(fs, h, k) ? 2 : 0;
     if (f >= fs->sectors)
@@ -487,29 +588,29 @@ static int large_here(alfs_t *fs, uint32_t k, hdr_t *h, bool *yes) {
 }
 
 /*
- * SPEC 5: the next dirty sector or block, read again just before it is
- * erased. One that reads live is left for later; a deleted stream's dead
- * mark is programmed again before the first of its sectors goes.
+ * SPEC 6: the next dirty sector or block, read again just before it is
+ * erased. One that reads live is left for later; a deleted file's dead mark
+ * is programmed again before the first of its sectors goes.
  */
 static int erase_step(alfs_t *fs) {
     for (uint32_t i = 0; i < fs->sectors; i++) {
         uint32_t k = (fs->erase_cursor + i) % fs->sectors;
-        hdr_t h;
+        hdr_t *h = HDR(fs);
         int s;
         bool large;
         if (is_bad(fs, k))
             continue;
-        if (classify(fs, k, &h, &s))
+        if (classify(fs, k, h, &s))
             return ALFS_EIO;
         if (s != S_DIRTY)
             continue;
-        if (large_here(fs, k, &h, &large))
+        if (large_here(fs, k, h, &large))
             return ALFS_EIO;
         uint32_t n = large ? large_sectors(fs) : 1u;
         fs->erase_cursor = (uint16_t)((k + n) % fs->sectors);
         for (uint32_t j = 0; j < n; j++) {
             uint32_t first = 0;
-            int rc = reclaim_kind(fs, k + j, &h, &first);
+            int rc = reclaim_kind(fs, k + j, h, &first);
             if (rc < 0)
                 return rc;
             if (rc == 2) {
@@ -540,7 +641,10 @@ int alfs_erase(alfs_t *fs, uint32_t steps) {
     return fs->dirty ? ALFS_OK : ALFS_CLEAN;
 }
 
-/* ---- finding streams -------------------------------------------------- */
+/* ---- finding files ---------------------------------------------------- */
+
+static int next_sector(alfs_t *fs, uint32_t id, uint32_t n, uint32_t *k_out, uint32_t *n_out);
+static int scan_chunk(alfs_t *fs, uint32_t k, uint32_t *pos, uint32_t *len, uint8_t *buf);
 
 /* 1 when sector k holds a current, valid claim, 0 when not, or ALFS_EIO. */
 static int claimed(alfs_t *fs, uint32_t k, hdr_t *h) {
@@ -549,28 +653,120 @@ static int claimed(alfs_t *fs, uint32_t k, hdr_t *h) {
     return current(fs, h->stamp) && claim_valid(fs, h->claim);
 }
 
-/* The stream's first sector, and how many sectors it holds. */
-static int find_stream(alfs_t *fs, uint32_t id, uint32_t *first, uint32_t *count) {
+/*
+ * File id's name, in first sector k, read in pieces. ALFS_OK when it is
+ * whole (SPEC 1.4) and, when name is given, is name; ALFS_ENOENT otherwise.
+ * *key: the CRC of its 32 bytes, to match it against another file's.
+ */
+static int name_is(alfs_t *fs, uint32_t k, uint32_t id, const char *name, uint32_t *key) {
+    uint8_t b[PIECE];
+    uint32_t a = addr_of(fs, k) + OFF_NAME, n = name_len(name), c, kc = 0xFFFFFFFFu;
+    bool same = !name || n;
+    put32(b, id);
+    c = crc32(0xFFFFFFFFu, b, 4);
+    for (uint32_t i = 0; i < NAME_LEN; i += PIECE) {
+        if (rd(fs, a + i, b, PIECE))
+            return ALFS_EIO;
+        c = crc32(c, b, PIECE);
+        kc = crc32(kc, b, PIECE);
+        for (uint32_t j = 0; name && j < PIECE; j++)
+            same &= b[j] == (i + j < n ? (uint8_t)name[i + j] : 0u);
+    }
+    if (rd(fs, a + NAME_LEN, b, 4))
+        return ALFS_EIO;
+    *key = ~kc;
+    return get32(b) == ~c && same ? ALFS_OK : ALFS_ENOENT;
+}
+
+/*
+ * File v's first sector, and how many sectors it holds. With a name, the
+ * file must have it.
+ */
+static int find_file(alfs_t *fs, uint32_t v, const char *name, uint32_t *first, uint32_t *count) {
     bool found = false;
     *count = 0;
     for (uint32_t k = 0; k < fs->sectors; k++) {
-        hdr_t h;
-        int c = claimed(fs, k, &h);
+        hdr_t *h = HDR(fs);
+        int c = claimed(fs, k, h);
         if (c < 0)
             return c;
-        if (!c || get32(h.claim) != id)
+        if (!c || get32(h->claim) != v)
             continue;
         (*count)++;
-        if (is_first(fs, &h, k)) {
+        if (is_first(fs, h, k)) {
             *first = k;
             found = true;
         }
     }
-    return found ? ALFS_OK : ALFS_ENOENT;
+    uint32_t key;
+    if (!found)
+        return ALFS_ENOENT;
+    return name ? name_is(fs, *first, v, name, &key) : ALFS_OK;
 }
 
 /*
- * SPEC 3: the stream's sector with the least number greater than n, found
+ * The file called name, or without a name whose name's key is key, with the
+ * greatest identity above `above` that is closed, or with `marked`, whose
+ * close record is not erased: its version and first sector, its close
+ * record in rec, and in *whole whether that record is whole. ALFS_ENOENT
+ * when there is none.
+ */
+static int newest_closed(alfs_t *fs, const char *name, uint32_t key, uint32_t above, bool marked, uint32_t *v,
+                         uint32_t *first, uint8_t *rec, bool *whole) {
+    bool found = false;
+    for (uint32_t k = 0; k < fs->sectors; k++) {
+        hdr_t *h = HDR(fs);
+        bool closed;
+        int c = claimed(fs, k, h);
+        if (c < 0)
+            return c;
+        uint32_t id = get32(h->claim);
+        if (!c || !is_first(fs, h, k) || id <= above || (found && id < *v))
+            continue;
+        if (read_close(fs, k, id, h->stamp, &closed))
+            return ALFS_EIO;
+        if (!closed && !(marked && !is_erased(fs, h->stamp, CLOSE_LEN)))
+            continue;
+        uint32_t ck;
+        int rc = name_is(fs, k, id, name, &ck); /* reads past the scratch page */
+        if (rc == ALFS_EIO)
+            return rc;
+        if (rc || (!name && ck != key))
+            continue;
+        memcpy(rec, h->stamp, CLOSE_LEN);
+        *whole = closed;
+        *v = id;
+        *first = k;
+        found = true;
+    }
+    return found ? ALFS_OK : ALFS_ENOENT;
+}
+
+/* File id's size, from the chunks it holds: what a torn close record was
+ * recording, since a close programs its record only after its last chunk. */
+static int size_of(alfs_t *fs, uint32_t id, uint32_t first, uint32_t *size) {
+    uint32_t k = first, index = 0, x = fs->cfg->page_size, l;
+    *size = 0;
+    for (uint32_t guard = 0; guard <= fs->sectors; guard++) {
+        int rc;
+        while ((rc = scan_chunk(fs, k, &x, &l, fs->scratch)) == 1) {
+            *size += l;
+            x += HDR_LEN + l;
+        }
+        if (rc < 0)
+            return rc;
+        uint32_t n = 0;
+        rc = next_sector(fs, id, index, &k, &n);
+        if (rc)
+            return rc == ALFS_ENOENT ? ALFS_OK : rc;
+        index = n;
+        x = OFF_DATA;
+    }
+    return ALFS_OK;
+}
+
+/*
+ * SPEC 3: the file's sector with the least number greater than n, found
  * forward from *k_out; the scan stops at n + 1, usually a few sectors on.
  */
 static int next_sector(alfs_t *fs, uint32_t id, uint32_t n, uint32_t *k_out, uint32_t *n_out) {
@@ -578,12 +774,12 @@ static int next_sector(alfs_t *fs, uint32_t id, uint32_t n, uint32_t *k_out, uin
     uint32_t from = *k_out;
     for (uint32_t i = 0; i < fs->sectors; i++) {
         uint32_t k = (from + 1u + i) % fs->sectors;
-        hdr_t h;
-        int c = claimed(fs, k, &h);
+        hdr_t *h = HDR(fs);
+        int c = claimed(fs, k, h);
         if (c < 0)
             return c;
-        uint32_t m = get16(h.claim + 14);
-        if (!c || get32(h.claim) != id || m <= n)
+        uint32_t m = get16(h->claim + 10);
+        if (!c || get32(h->claim) != id || m <= n)
             continue;
         if (!found || m < *n_out) {
             *n_out = m;
@@ -636,28 +832,63 @@ static int scan_chunk(alfs_t *fs, uint32_t k, uint32_t *pos, uint32_t *len, uint
     return 0;
 }
 
-int alfs_next(alfs_t *fs, uint32_t after, alfs_info_t *info) {
+int alfs_list(alfs_t *fs, uint32_t after, alfs_info_t *info) {
+    uint32_t first = 0, len;
     bool found = false;
+    if (!fs->cfg || !info)
+        return ALFS_EINVAL;
     for (uint32_t k = 0; k < fs->sectors; k++) {
-        hdr_t h;
-        int c = claimed(fs, k, &h);
+        hdr_t *h = HDR(fs);
+        int c = claimed(fs, k, h);
         if (c < 0)
             return c;
-        uint32_t id = get32(h.claim);
-        if (c && is_first(fs, &h, k) && id > after && (!found || id < info->id)) {
-            info->id = id;
-            info->tag = get32(h.claim + 8);
+        uint32_t id = get32(h->claim);
+        if (c && is_first(fs, h, k) && id > after && (!found || id < info->version)) {
+            info->version = id;
+            first = k;
             found = true;
         }
     }
-    return found ? ALFS_OK : ALFS_ENOENT;
+    if (!found)
+        return ALFS_ENOENT;
+    uint8_t rec[CLOSE_LEN];
+    if (read_name(fs, first, info->version, (uint8_t *)info->name, &len) ||
+        read_close(fs, first, info->version, rec, &info->closed))
+        return ALFS_EIO;
+    memset(info->name + len, 0, sizeof(info->name) - len); /* nothing, for a torn create */
+    info->size = info->closed ? get32(rec) : ALFS_SIZE_UNKNOWN;
+    return ALFS_OK;
 }
 
-int alfs_delete(alfs_t *fs, uint32_t id) {
-    uint32_t first, count;
-    int rc = find_stream(fs, id, &first, &count);
+/* SPEC 5: the newest closed version above v firmed, then v's dead mark. */
+int alfs_delete(alfs_t *fs, const char *name, uint32_t version) {
+    uint32_t first, count, newer, nfirst, key;
+    uint8_t rec[CLOSE_LEN];
+    bool whole;
+    if (!fs->cfg || !version)
+        return ALFS_EINVAL;
+    int rc = find_file(fs, version, name, &first, &count);
     if (rc)
         return rc;
+    if (is_open(fs, version))
+        return ALFS_EOPEN;
+    rc = name_is(fs, first, version, NULL, &key); /* a torn create has no newer versions */
+    if (!rc)
+        rc = newest_closed(fs, NULL, key, version, true, &newer, &nfirst, rec, &whole);
+    if (rc == ALFS_EIO)
+        return rc;
+    if (!rc && newer != fs->cfirmed) {
+        if (!whole) { /* torn: the record it was writing (SPEC 5) */
+            uint32_t size;
+            if (size_of(fs, newer, nfirst, &size))
+                return ALFS_EIO;
+            put32(rec, size);
+            put32(rec + 4, crc_of(newer, rec, 4));
+        }
+        fs->cfirmed = newer;
+        if (prog(fs, addr_of(fs, nfirst) + OFF_CLOSE, rec, CLOSE_LEN))
+            fs->n.prog_failures++;
+    }
     uint8_t mark = (uint8_t)~fs->cfg->erase_value;
     if (prog(fs, addr_of(fs, first) + OFF_DM, &mark, 1)) {
         fs->n.prog_failures++;
@@ -667,37 +898,31 @@ int alfs_delete(alfs_t *fs, uint32_t id) {
     return ALFS_OK;
 }
 
-/* ---- appending -------------------------------------------------------- */
-
-static uint32_t page_limit(const alfs_t *fs, const alfs_stream_t *s, uint32_t page) {
-    uint32_t lim = fs->cfg->max_page_programs ? fs->cfg->max_page_programs : 16u;
-    if (s->sector == s->first && page == 0)
-        lim--; /* the dead mark's program */
-    return lim;
-}
+/* ---- writing ---------------------------------------------------------- */
 
 /* Moves the next chunk's place on until a byte of payload fits there. */
-static void place(alfs_t *fs, alfs_stream_t *s) {
-    uint32_t p = fs->cfg->page_size;
-    while (!(s->flags & F_NEW)) {
-        if (s->off + HDR_LEN + 1u > fs->cfg->sector_size) {
-            s->flags |= F_NEW;
+static void place(alfs_t *fs, alfs_file_t *f) {
+    uint32_t lim = fs->cfg->max_page_programs ? fs->cfg->max_page_programs : 16u;
+    while (!(f->flags & F_NEW)) {
+        if (f->off + HDR_LEN + 1u > fs->cfg->sector_size) {
+            f->flags |= F_NEW;
             return;
         }
-        uint32_t np = next_page(fs, s->off);
-        if (np - s->off < HDR_LEN + 1u || s->page_progs >= page_limit(fs, s, s->off / p)) {
-            s->off = (uint16_t)np;
-            s->page_progs = 0;
+        uint32_t np = next_page(fs, f->off);
+        if (np - f->off < HDR_LEN + 1u || f->page_progs >= lim) {
+            f->off = (uint16_t)np;
+            f->page_progs = 0;
             continue;
         }
         return;
     }
 }
 
-static uint32_t capacity(const alfs_t *fs, const alfs_stream_t *s) {
-    if (s->flags & F_NEW)
+/* The payload that fits where the next chunk goes. */
+static uint32_t room(const alfs_t *fs, const alfs_file_t *f) {
+    if (f->flags & F_NEW)
         return fs->cfg->page_size - OFF_DATA - HDR_LEN;
-    return next_page(fs, s->off) - s->off - HDR_LEN;
+    return next_page(fs, f->off) - f->off - HDR_LEN;
 }
 
 /* Zero over sector k's claim, which makes it dirty for good (A-9). */
@@ -708,17 +933,21 @@ static void zero_claim(alfs_t *fs, uint32_t k) {
         fs->n.prog_failures++;
 }
 
-/* A ready sector for a new claim, its claim page checked erased. */
-static int find_ready(alfs_t *fs, uint32_t *out) {
+/*
+ * A ready sector for a claim, its first page checked erased. Its stamp goes
+ * to the scratch page, with its dead mark erased after it, for a claim
+ * program from byte 0 (SAFE-04 rule 2).
+ */
+static int take_sector(alfs_t *fs, uint32_t *out) {
     uint32_t p = fs->cfg->page_size;
     for (uint32_t i = 0; fs->ready && i < fs->sectors; i++) {
         uint32_t k = (fs->alloc_cursor + i) % fs->sectors;
-        hdr_t h;
+        hdr_t *h = HDR(fs);
         int s;
         bool ok;
         if (is_bad(fs, k))
             continue;
-        if (classify(fs, k, &h, &s))
+        if (classify(fs, k, h, &s))
             return ALFS_EIO;
         if (s != S_READY)
             continue;
@@ -726,6 +955,8 @@ static int find_ready(alfs_t *fs, uint32_t *out) {
             return ALFS_EIO;
         fs->ready--;
         if (ok && k != fs->fresh) {
+            fs->scratch[OFF_DM] = fs->cfg->erase_value; /* the stamp is there already */
+            fs->alloc_cursor = (uint16_t)((k + 1u) % fs->sectors);
             *out = k;
             return ALFS_OK;
         }
@@ -738,203 +969,245 @@ static int find_ready(alfs_t *fs, uint32_t *out) {
     return ALFS_ENOSPC;
 }
 
-/* The claim of the stream's sector numbered n, built at buf + B_CLAIM. */
-static void build_claim(alfs_stream_t *s, uint32_t seq, uint32_t first, uint32_t n) {
-    uint8_t *c = s->buf + B_CLAIM;
-    put32(c, s->id);
+/* A claim at the scratch page's OFF_CLAIM. */
+static void build_claim(alfs_t *fs, uint32_t id, uint32_t seq, uint32_t first, uint32_t n) {
+    uint8_t *c = fs->scratch + OFF_CLAIM;
+    put32(c, id);
     put32(c + 4, seq);
-    put32(c + 8, s->tag);
-    put16(c + 12, first);
-    put16(c + 14, n);
-    put32(c + 16, crc(c, 16));
-}
-
-/* Sector k's stamp, which must be valid, and an erased dead mark, at buf. */
-static int head_of(alfs_t *fs, uint32_t k, uint8_t *buf) {
-    if (rd(fs, addr_of(fs, k), buf, STAMP_LEN))
-        return ALFS_EIO;
-    if (!current(fs, buf))
-        return ALFS_EIO; /* a bit that reads either way: read again */
-    buf[STAMP_LEN] = fs->cfg->erase_value;
-    return ALFS_OK;
+    put16(c + 8, first);
+    put16(c + 10, n);
+    put32(c + 12, crc(c, 12));
 }
 
 /*
- * One program of the chunk being built, as much of it as fits where it goes:
- * in the current page, or with the claim of a new sector, from its byte 0
- * (SAFE-04 rule 2). ALFS_EPROG when the program failed.
+ * One program of up to n bytes from p: in the file's current page, or
+ * after the claim of a new sector, from its byte 0. The bytes it took,
+ * ALFS_EPROG when the program failed, or another error with nothing done.
  */
-static int prog_chunk(alfs_t *fs, alfs_stream_t *s) {
-    uint8_t *h = s->buf + B_HDR;
-    uint32_t n = capacity(fs, s) < s->used ? capacity(fs, s) : s->used;
-    put16(h, n);
-    put32(h + 2, ~crc32(crc32(0xFFFFFFFFu, h, 2), s->buf + BUF_HEAD, n));
-    uint32_t p = fs->cfg->page_size;
-
-    if (!(s->flags & F_NEW)) {
-        uint32_t page = s->off / p;
-        if (prog(fs, addr_of(fs, s->sector) + s->off, h, HDR_LEN + n))
-            return ALFS_EPROG;
-        s->off = (uint16_t)(s->off + HDR_LEN + n);
-        s->page_progs = s->off / p == page ? (uint8_t)(s->page_progs + 1u) : 0u;
-    } else {
-        uint32_t k;
-        int rc = find_ready(fs, &k);
+static int32_t prog_chunk(alfs_t *fs, alfs_file_t *f, const uint8_t *p, uint32_t n) {
+    bool fresh = f->flags & F_NEW;
+    uint32_t k = f->sector, at = f->off, pg = fs->cfg->page_size;
+    if (n > room(fs, f))
+        n = room(fs, f);
+    if (fresh) {
+        int rc = take_sector(fs, &k);
         if (rc)
             return rc;
-        if (head_of(fs, k, s->buf)) {
-            fs->ready++;
-            return ALFS_EIO;
-        }
-        uint32_t seq = (s->flags & F_FIRST) ? s->id : fs->next_seq++;
-        uint32_t first = (s->flags & F_FIRST) ? k : s->first;
-        uint32_t num = (s->flags & F_FIRST) ? 0u : s->index + 1u;
-        build_claim(s, seq, first, num);
-        fs->alloc_cursor = (uint16_t)((k + 1u) % fs->sectors);
-        if (prog(fs, addr_of(fs, k), s->buf, BUF_HEAD + n)) {
-            fs->dirty++;
-            if (s->flags & F_FIRST)
-                s->id = fs->next_seq++; /* the failed sector may hold a first claim */
-            return ALFS_EPROG;
-        }
-        s->sector = (uint16_t)k;
-        s->first = (uint16_t)first;
-        s->index = (uint16_t)num;
-        s->flags = 0;
-        s->off = (uint16_t)(OFF_DATA + HDR_LEN + n);
-        s->page_progs = 2; /* the stamp, then the claim */
+        build_claim(fs, f->version, fs->next_seq++, f->first, f->index + 1u);
+        at = 0;
     }
-    memmove(s->buf + BUF_HEAD, s->buf + BUF_HEAD + n, s->used - n);
-    s->used = (uint16_t)(s->used - n);
-    place(fs, s);
-    return ALFS_OK;
+    uint8_t *h = fs->scratch + (fresh ? OFF_DATA : 0u);
+    put16(h, n);
+    put32(h + 2, ~crc32(crc32(0xFFFFFFFFu, h, 2), p, n));
+    memcpy(h + HDR_LEN, p, n);
+    uint32_t len = (uint32_t)(h - fs->scratch) + HDR_LEN + n;
+    if (prog(fs, addr_of(fs, k) + at, fs->scratch, len)) {
+        if (fresh)
+            fs->dirty++;
+        return ALFS_EPROG;
+    }
+    if (fresh) {
+        f->sector = (uint16_t)k;
+        f->index++;
+        f->flags = 0;
+        f->page_progs = 2; /* the stamp, then the claim */
+        f->off = (uint16_t)len;
+    } else {
+        f->off = (uint16_t)(at + len);
+        f->page_progs = f->off / pg == at / pg ? (uint8_t)(f->page_progs + 1u) : 0u;
+    }
+    return (int32_t)n;
 }
 
 /* SAFE-06: a failed program's bytes go to a fresh sector, in this call,
  * up to max_prog_retries times in a row; then they are dropped. */
-static int put_chunk(alfs_t *fs, alfs_stream_t *s) {
+static int32_t put_chunk(alfs_t *fs, alfs_file_t *f, const uint8_t *p, uint32_t n) {
     uint32_t max = fs->cfg->max_prog_retries ? fs->cfg->max_prog_retries : 3u;
     for (;;) {
-        int rc = prog_chunk(fs, s);
-        if (rc != ALFS_EPROG) {
-            if (!rc)
-                s->fails = 0;
-            return rc;
+        int32_t m = prog_chunk(fs, f, p, n);
+        if (m != ALFS_EPROG) {
+            if (m > 0) {
+                f->fails = 0;
+                f->size += (uint32_t)m;
+            }
+            return m;
         }
         fs->n.prog_failures++;
-        s->flags |= F_NEW;
-        if (++s->fails >= max) {
-            fs->n.bytes_lost += s->used;
-            s->used = 0;
-            s->fails = 0;
+        f->flags |= F_NEW;
+        if (++f->fails >= max) {
+            f->fails = 0;
+            fs->n.bytes_lost += n;
             return ALFS_ELOST;
         }
     }
 }
 
-int alfs_create(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t tag) {
-    if (!fs->cfg || !s || !buf)
-        return ALFS_EINVAL;
-    memset(s, 0, sizeof(*s));
-    s->id = fs->next_seq++;
-    s->tag = tag;
-    s->buf = buf;
-    s->mode = M_APPEND;
-    s->flags = F_NEW | F_FIRST;
-    return ALFS_OK;
-}
-
-int32_t alfs_append(alfs_t *fs, alfs_stream_t *s, const void *data, uint32_t len) {
-    if (!s || s->mode != M_APPEND || (len && !data))
-        return ALFS_EINVAL;
-    const uint8_t *d = data;
-    uint32_t taken = 0;
-    while (taken < len) {
-        uint32_t cap = capacity(fs, s);
-        if (s->used >= cap) {
-            int rc = put_chunk(fs, s);
-            if (rc)
-                return taken ? (int32_t)taken : rc;
-            continue;
+/*
+ * Programs the block's bytes as chunks, each filling its page: all of them,
+ * or all but what is left after the last whole page's room (IF-12).
+ */
+static int spill(alfs_t *fs, alfs_file_t *f, bool all) {
+    uint32_t done = 0;
+    int rc = ALFS_OK;
+    while (done < f->used) {
+        place(fs, f);
+        uint32_t left = f->used - done, n = room(fs, f);
+        if (!all && left < n)
+            break;
+        int32_t m = put_chunk(fs, f, f->block + done, left < n ? left : n);
+        if (m < 0) {
+            if (m == ALFS_ELOST)
+                done += left < n ? left : n;
+            rc = m;
+            break;
         }
-        uint32_t n = cap - s->used < len - taken ? cap - s->used : len - taken;
-        memcpy(s->buf + BUF_HEAD + s->used, d + taken, n);
-        s->used = (uint16_t)(s->used + n);
-        taken += n;
+        done += (uint32_t)m;
     }
-    return (int32_t)taken;
+    memmove(f->block, f->block + done, f->used - done);
+    f->used = (uint16_t)(f->used - done);
+    return rc;
 }
 
-int alfs_sync(alfs_t *fs, alfs_stream_t *s) {
-    if (!s || s->mode != M_APPEND)
+static bool block_ok(const alfs_t *fs, const uint8_t *block, uint32_t size) {
+    return block && size >= fs->cfg->page_size && size <= 65535u;
+}
+
+int alfs_create(alfs_t *fs, alfs_file_t *f, const char *name, uint8_t *block, uint32_t size) {
+    uint32_t n = name_len(name), max, k;
+    if (!fs->cfg || !f || !n || !block_ok(fs, block, size) || listed(fs, f))
         return ALFS_EINVAL;
-    while (s->used) {
-        int rc = put_chunk(fs, s);
+    memset(f, 0, sizeof(*f));
+    max = fs->cfg->max_prog_retries ? fs->cfg->max_prog_retries : 3u;
+    for (uint32_t tries = 0;;) {
+        int rc = take_sector(fs, &k);
         if (rc)
             return rc;
+        uint32_t id = fs->next_seq++;
+        f->version = id; /* the version a torn create may leave */
+        uint8_t *nm = fs->scratch + OFF_NAME;
+        build_claim(fs, id, id, k, 0);
+        memset(nm, 0, NAME_LEN);
+        memcpy(nm, name, n);
+        put32(nm + NAME_LEN, crc_of(id, nm, NAME_LEN));
+        if (!prog(fs, addr_of(fs, k), fs->scratch, OFF_CLOSE)) {
+            open_file(fs, f, block, size, id, k, M_WRITE);
+            return ALFS_OK;
+        }
+        fs->dirty++;
+        fs->n.prog_failures++;
+        if (++tries >= max)
+            return ALFS_EPROG;
     }
+}
+
+int alfs_open_read(alfs_t *fs, alfs_file_t *f, const char *name, uint32_t version, uint8_t *block,
+                   uint32_t size) {
+    uint32_t first, count;
+    uint8_t rec[CLOSE_LEN];
+    bool whole;
+    if (!fs->cfg || !f || !block_ok(fs, block, size) || listed(fs, f) || (name && !name_len(name)) ||
+        (!name && !version))
+        return ALFS_EINVAL;
+    memset(f, 0, sizeof(*f));
+    int rc = version ? find_file(fs, version, name, &first, &count)
+                     : newest_closed(fs, name, 0, 0, false, &version, &first, rec, &whole);
+    if (rc)
+        return rc;
+    open_file(fs, f, block, size, version, first, M_READ);
     return ALFS_OK;
 }
 
-int alfs_close(alfs_t *fs, alfs_stream_t *s) {
-    int rc = alfs_sync(fs, s);
-    if (!rc)
-        s->mode = M_CLOSED;
-    return rc;
+uint32_t alfs_take(alfs_file_t *f, const void *data, uint32_t len) {
+    uint32_t n = f->mode == M_WRITE ? (uint32_t)(f->cap - f->used) : 0u;
+    if (n > len)
+        n = len;
+    memcpy(f->block + f->used, data, n);
+    f->used = (uint16_t)(f->used + n);
+    return n;
+}
+
+uint32_t alfs_give(alfs_file_t *f, void *out, uint32_t len) {
+    uint32_t n = f->mode == M_READ ? f->used : 0u;
+    if (n > len)
+        n = len;
+    memcpy(out, f->block + f->pos, n);
+    f->pos = (uint16_t)(f->pos + n);
+    f->used = (uint16_t)(f->used - n);
+    return n;
+}
+
+int32_t alfs_write(alfs_t *fs, alfs_file_t *f, const void *data, uint32_t len) {
+    if (!fs->cfg || !f || f->mode != M_WRITE || (len && !data))
+        return ALFS_EINVAL;
+    uint32_t taken = 0;
+    for (;;) {
+        if (f->used == f->cap) {
+            int rc = spill(fs, f, false);
+            if (rc)
+                return taken ? (int32_t)taken : rc;
+        }
+        if (taken == len)
+            return (int32_t)taken;
+        taken += alfs_take(f, (const uint8_t *)data + taken, len - taken);
+    }
+}
+
+int alfs_sync(alfs_t *fs, alfs_file_t *f) {
+    if (!fs->cfg || !f || f->mode != M_WRITE)
+        return ALFS_EINVAL;
+    return spill(fs, f, true);
+}
+
+int alfs_close(alfs_t *fs, alfs_file_t *f) {
+    if (!fs->cfg || !f || f->mode == M_CLOSED || !listed(fs, f))
+        return ALFS_EINVAL;
+    if (f->mode == M_WRITE) {
+        int rc = spill(fs, f, true);
+        if (rc)
+            return rc;
+        uint8_t *rec = fs->scratch;
+        put32(rec, f->size);
+        put32(rec + 4, crc_of(f->version, rec, 4));
+        if (prog(fs, addr_of(fs, f->first) + OFF_CLOSE, rec, CLOSE_LEN)) {
+            fs->n.prog_failures++;
+            unlink_file(fs, f); /* its place is fixed: the file stays unclosed */
+            return ALFS_EPROG;
+        }
+    }
+    unlink_file(fs, f);
+    return ALFS_OK;
 }
 
 /* ---- reading ---------------------------------------------------------- */
 
-int alfs_open_read(alfs_t *fs, alfs_stream_t *s, uint8_t *buf, uint32_t id) {
-    uint32_t first, count;
-    if (!fs->cfg || !s || !buf)
-        return ALFS_EINVAL;
-    int rc = find_stream(fs, id, &first, &count);
-    if (rc)
-        return rc;
-    memset(s, 0, sizeof(*s));
-    s->id = id;
-    s->seq = id;
-    s->index = 0;
-    s->buf = buf;
-    s->sector = (uint16_t)first;
-    s->off = (uint16_t)OFF_DATA;
-    s->mode = M_READ;
-    return ALFS_OK;
-}
-
-int32_t alfs_read(alfs_t *fs, alfs_stream_t *s, void *out, uint32_t len) {
-    if (!s || s->mode != M_READ || (len && !out))
+int32_t alfs_read(alfs_t *fs, alfs_file_t *f, void *out, uint32_t len) {
+    if (!fs->cfg || !f || f->mode != M_READ || (len && !out))
         return ALFS_EINVAL;
     for (uint32_t guard = 0; guard <= fs->sectors; guard++) {
-        if (s->used) {
-            uint32_t n = s->used < len ? s->used : len;
-            memcpy(out, s->buf + (s->first - s->used), n);
-            s->used = (uint16_t)(s->used - n);
-            return (int32_t)n;
-        }
-        uint32_t x = s->off, l = 0;
-        int rc = scan_chunk(fs, s->sector, &x, &l, s->buf);
+        if (f->used)
+            return (int32_t)alfs_give(f, out, len);
+        uint32_t x = f->off, l = 0;
+        int rc = scan_chunk(fs, f->sector, &x, &l, f->block);
         if (rc < 0)
             return rc;
         if (rc == 1) {
-            s->off = (uint16_t)(x + HDR_LEN + l);
-            s->first = (uint16_t)l;
-            s->used = (uint16_t)l;
+            f->off = (uint16_t)(x + HDR_LEN + l);
+            f->pos = 0;
+            f->used = (uint16_t)l;
             guard--;
             continue;
         }
-        uint32_t k = s->sector, n = 0;
-        rc = next_sector(fs, s->id, s->index, &k, &n);
+        uint32_t k = f->sector, n = 0;
+        rc = next_sector(fs, f->version, f->index, &k, &n);
         if (rc == ALFS_ENOENT)
             return 0;
         if (rc)
             return rc;
-        if (n != s->index + 1u)
+        if (n != f->index + 1u)
             fs->n.check_failures++; /* SAFE-12: a sector missing */
-        s->sector = (uint16_t)k;
-        s->index = (uint16_t)n;
-        s->off = (uint16_t)OFF_DATA;
+        f->sector = (uint16_t)k;
+        f->index = (uint16_t)n;
+        f->off = (uint16_t)OFF_DATA;
     }
     return 0;
 }
@@ -946,7 +1219,7 @@ void alfs_status(const alfs_t *fs, alfs_status_t *st) {
     st->ready = fs->ready;
     st->dirty = fs->dirty;
     st->bad = fs->nbad;
-    st->appendable = fs->ready * per;
+    st->writable = fs->ready * per;
     st->min_wear = fs->min_wear == UINT32_MAX ? 0 : fs->min_wear;
     st->max_wear = fs->max_wear;
     st->clean = !fs->dirty;

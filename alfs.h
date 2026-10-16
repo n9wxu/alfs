@@ -212,7 +212,9 @@ int alfs_sync(alfs_t *fs, alfs_file_t *f);
 
 /*
  * Releases the file. A file being written is synced and closed: its size
- * is recorded, and it takes no more bytes. On an error it stays open.
+ * is recorded, and it takes no more bytes. When the sync fails it stays
+ * open, its bytes in its block: retry. ALFS_EPROG: its close record would
+ * not program, and it is released unclosed, every byte synced readable.
  */
 int alfs_close(alfs_t *fs, alfs_file_t *f);
 

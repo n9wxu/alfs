@@ -1201,11 +1201,13 @@ static void powerloss_case(sim_pl_t pl, int64_t k, bool twice, int *past) {
         rc = log_run(&r, &f, &lg, 50, 6000, true);
     if (!r.sim.off) {
         CHECK_EQ(rc, 0);
-        CHECK_EQ(close_done(&r, &f), 0);
-        lg.synced = lg.len;
-    } else {
-        sim_reboot(&r.sim);
+        rc = close_done(&r, &f); /* the second loss may land here */
+        if (!r.sim.off) {
+            CHECK_EQ(rc, 0);
+            lg.synced = lg.len;
+        }
     }
+    sim_reboot(&r.sim); /* a second loss the run outlasted does not happen */
     expect_t now = {lg.exp, lg.synced, lg.len};
     reread(&r, old_v, &old, f.version, &now, got, what);
     free(got);
@@ -1315,7 +1317,8 @@ static void safe_prog_failure(void) {
         CHECK_EQ(create(&r, &f, "log", 0), 0);
         log_t lg;
         log_init(&lg, 1 << 16);
-        CHECK_EQ(log_run(&r, &f, &lg, 50, 3000, false), 0);
+        CHECK_EQ(log_run(&r, &f, &lg, 50, 6000, false), 0);
+        CHECK(f.sector != f.first);
         /* The sector being written goes bad. */
         sim_mkbad(&r.sim, r.cfg.region_start / SECTOR + f.sector, modes[m]);
         for (int t = 0; t < 40; t++) {
@@ -1337,6 +1340,32 @@ static void safe_prog_failure(void) {
         alfs_status(&r.fs, &st);
         CHECK(st.n.prog_failures >= 1);
         CHECK_EQ(st.n.bytes_lost, 0);
+        free(got);
+        free(lg.exp);
+        DONE(&r);
+        rig_close(&r);
+    }
+
+    /* A first sector that goes bad: the close cannot be recorded, so the
+     * file is released unclosed, every byte readable. */
+    {
+        rig_t r;
+        rig_open(&r, 16, 0);
+        CHECK_EQ(setup(&r), 0);
+        alfs_file_t f;
+        CHECK_EQ(create(&r, &f, "log", 0), 0);
+        log_t lg;
+        log_init(&lg, 1 << 16);
+        CHECK_EQ(log_run(&r, &f, &lg, 50, 6000, false), 0);
+        sim_mkbad(&r.sim, r.cfg.region_start / SECTOR + f.first, BAD_PROGERROR);
+        CHECK_EQ(close_done(&r, &f), ALFS_EPROG);
+        CHECK_EQ(close_done(&r, &f), ALFS_EINVAL); /* released */
+        alfs_info_t in;
+        CHECK_EQ(info_of(&r, f.version, &in), 0);
+        CHECK(!in.closed);
+        uint8_t *got = malloc(1 << 16);
+        CHECK_EQ(slurp(&r, NULL, f.version, got, 1 << 16), (int32_t)lg.len);
+        CHECK(memcmp(got, lg.exp, lg.len) == 0);
         free(got);
         free(lg.exp);
         DONE(&r);
@@ -1392,7 +1421,8 @@ static void safe_bad_sector(void) {
     CHECK_EQ(setup(&r), 0);
     r.sim.wear_limit = 6;
     int rc = ring(&r, 1000, 400, 400000);
-    CHECK(rc == -3 || rc == -10 || rc == 0); /* worn out: no room, time up, or all bad */
+    /* worn out: no room for a write or a create, time up, or all bad */
+    CHECK(rc == -3 || rc == -7 || rc == -10 || rc == 0);
     alfs_status_t st;
     alfs_status(&r.fs, &st);
     CHECK(st.bad > 0);
@@ -1721,6 +1751,9 @@ static void safe_create_atomic(void) {
                 CHECK(rc == 0 || rc == ALFS_ENOENT);
             }
             CHECK_EQ(create(&r, &f, "cfg", 0), 0);
+            if (f.version <= torn)
+                printf("    behaviour %d, power lost at operation %lld: version %u after torn %u\n", pl,
+                       (long long)k, f.version, torn);
             CHECK(f.version > torn);
             CHECK_EQ(close_done(&r, &f), 0);
             DONE(&r);

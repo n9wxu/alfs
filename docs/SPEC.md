@@ -73,11 +73,18 @@ known in the region, or 1 if none is. A large erase stamps each of its
 sectors with one more than the largest valid count among them.
 
 The **next sequence** at mount is two more than the largest of every valid
-claim's sequence and every valid stamp's floor. A power loss can tear a
-claim so that it reads invalid now and valid later. That claim was given
-the sequence after the largest valid one. The floors keep that largest
-sequence known after its sector is erased, so the torn claim's sequence is
-never given again.
+claim's sequence and every valid stamp's floor, and three more when the
+mount finds a torn claim.
+- **Why:** a power loss can tear a claim so that it reads invalid now and
+  valid later.
+- **The bound:** that claim's sequence is at most two more than the largest
+  known. Either it was the first sequence its mount gave, two more than the
+  largest then, or it followed a claim that is still valid. The floors keep
+  the largest sequence known after its sector is erased.
+- **So** starting three more past a torn claim never gives its sequence
+  again. Two more is not enough: a mount followed by a create torn at once
+  left the next mount starting exactly at the torn claim's sequence (found
+  with seeds 16 and 30, 2026-10-15).
 
 ### 1.2 The dead mark
 
@@ -241,7 +248,9 @@ times in a row. Then the bytes are dropped and counted. A sector whose
 claim program failed is counted dirty.
 
 **Closing.** One program writes the close record: the bytes written to the
-file over its life, and the check.
+file over its life, and the check. A close record that will not program
+cannot move, since its place is fixed: the file is released unclosed, and
+reads as one a reset cut short.
 
 **After a mount.** No file found unclosed is written again; a new version
 takes its place. The power loss that preceded the mount interrupted at most
@@ -252,13 +261,24 @@ last page, a sector no file holds yet, or a stamp.
 
 ## 5. Deleting
 
-alfs finds the version's first sector and refuses if any handle has it
-open. Next, if the file has a name, alfs looks for the closed file of the
-same name with the greatest identity above this version. If there is one,
-and it has not had this already in this mount, alfs programs that file's
-close record again with the bytes it reads (A-9): a close a power loss left
-half programmed cannot then read unclosed once this version is gone. Then
-one program writes ~E to the dead mark.
+1. alfs finds the version's first sector, and refuses if any handle has it
+   open.
+2. If the file has a whole name, alfs finds the file of the same name with
+   the greatest identity above this version whose close record is not
+   erased. Names are matched by the CRC of their 32 bytes; a chance match
+   only completes another file's close record, which it was writing anyway.
+3. If there is such a file, and it has not had this already in this mount,
+   alfs programs that file's close record again (A-9). It uses the bytes it
+   reads if they are whole. Otherwise it uses the record that close was
+   writing: the bytes the file's chunks hold, since a close programs its
+   record only after its last chunk.
+4. One program writes ~E to the dead mark.
+
+Step 3 means a close a power loss left half programmed cannot read unclosed
+once this version is gone. It completes any close record that is not
+erased, not only one that reads whole: the application may have seen it
+whole in a listing a moment before, and a second read can differ (found by
+`safe_config_replace`, 2026-10-15).
 
 ---
 
