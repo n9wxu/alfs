@@ -806,13 +806,18 @@ static void if_log_numbers_never_reused(void) {
     CHECK_EQ(lclose(&r, &w), 0);
 
     static const sim_pl_t torn[] = {PL_FLICKER, PL_METASTABLE, PL_SOMEBITS};
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < 6; t++) {
         CHECK(lclean(&r) >= 0);
-        CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
-        CHECK(note(&seen, w.log));
-        sim_power_after(&r.sim, 0, torn[t]); /* the first claim's program */
-        put(&r, &w, row, ROW);
-        lsync(&r, &w);
+        if (t < 3) { /* the log's first claim, programmed by its open */
+            sim_power_after(&r.sim, 0, torn[t]);
+            CHECK(lopen(&r, &w, 0, 1, 0) != 0);
+        } else { /* its first chunk */
+            CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
+            CHECK(note(&seen, w.log));
+            sim_power_after(&r.sim, 0, torn[t - 3]);
+            put(&r, &w, row, ROW);
+            lsync(&r, &w);
+        }
         CHECK(r.sim.off);
         sim_reboot(&r.sim);
         for (int m = 0; m < 8; m++) {

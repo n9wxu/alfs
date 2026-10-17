@@ -141,7 +141,7 @@ test can tell good data from bad without alfs's help.
 | `if_put_one_at_a_time` | IF-06 | A second put, and a delete, during a put are refused with `ALFS_EOPEN`; after an abandon the old object reads and a put succeeds. |
 | `if_get_snapshot` | IF-07 | A reader opened before a put commits reads the old bytes to the end; a put, delete or erase that would erase its half meanwhile is refused with `ALFS_EOPEN`, and succeeds after it closes. |
 | `if_object_list` | IF-08 | Three objects, one deleted and one put again: listed with names and sizes, the same after a remount. |
-| `if_log_numbers_never_reused` | IF-09 | Numbers grow; erasing the newest log and remounting does not give its number again; a claim torn by FLICKER, METASTABLE or SOMEBITS in a log's first chunk, then eight remounts each starting a log: no number is given twice. |
+| `if_log_numbers_never_reused` | IF-09 | Numbers grow; erasing the newest log and remounting does not give its number again; a log's first claim, and its first chunk, torn by FLICKER, METASTABLE or SOMEBITS, each followed by eight remounts each starting a log: no number is given twice. |
 | `if_log_streams` | IF-10 | Two writers of one log, tags 1 and 2, interleaved: each stream reads back its own bytes, a third tag reads none; the same after a remount. |
 | `if_log_new_after_mount` | IF-10, SAFE-04 | After a remount, writing to the log written before is refused; a new log starts in a sector of its own, and the old one reads whole. |
 | `if_log_list` | IF-11 | Three logs of different lengths: listed in growing number with the sectors each holds, against the simulator's flash. |
