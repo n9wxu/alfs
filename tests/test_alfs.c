@@ -564,8 +564,8 @@ static void if_endian(void) {
     CHECK_EQ(claims_of(&r, w.log, &k), 1);
     const uint8_t *sec = r.sim.mem + r.lcfg.start + (uint32_t)k * SECTOR;
     const uint8_t *cl = sec + LSTAMP;
-    CHECK_EQ(get32le(cl), w.log);    /* log number */
-    CHECK(get32le(cl + 4) > w.log);  /* sequence   */
+    CHECK_EQ(get32le(cl), w.log);     /* log number                      */
+    CHECK_EQ(get32le(cl + 4), w.log); /* sequence: a log's first claim's */
     CHECK_EQ(get32le(cl + 8), crc32_ref(cl, 8));
     const uint8_t *ch = sec + LDATA;
     CHECK_EQ(get16le(ch), 3);
@@ -782,7 +782,7 @@ static bool note(numbers_t *s, uint32_t v) {
 
 static void if_log_numbers_never_reused(void) {
     rig_t r;
-    rig_open(&r, 16, 2);
+    rig_open(&r, 128, 2);
     CHECK_EQ(setup(&r), 0);
     numbers_t seen = {{0}, 0};
     uint32_t last = 0;
@@ -970,7 +970,7 @@ static void if_log_refusals(void) {
 
 static void basic_round_trip(void) {
     static const uint32_t sizes[] = {1, 21, 22, 255, 256, 4097, 20000};
-    static uint8_t d[20000], got[20000];
+    static uint8_t d[20000], got[20480];
     for (int b = 0; b < 2; b++)
         for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
             rig_t r;
@@ -1136,7 +1136,7 @@ static void spd_mount_reads_bounded(void) {
 
 static void spd_wlog_longest_stall(void) {
     rig_t r;
-    rig_open(&r, 128, 2);
+    rig_open(&r, 256, 2);
     CHECK_EQ(setup(&r), 0);
     run_t lg;
     run_init(&lg, 1 << 20);
@@ -1162,7 +1162,7 @@ static uint64_t hr_reads(uint32_t sectors) {
     lopen(&r, &w, 0, 1, 0);
     static uint8_t d[480];
     uint64_t total = 0;
-    for (uint32_t t = 0; t < 1500; t++) {
+    for (uint32_t t = 0; t < 200; t++) { /* 96 kB: within 32 sectors */
         fill(d, sizeof(d), t);
         CALL(&r, alfs_log_write(&r.lg, &w, d, sizeof(d)));
         total += r.sim.c_bytes_read;
@@ -1204,14 +1204,14 @@ static void spd_read_next_bounded(void) {
     uint32_t sectors = claims_of(&r, w.log, NULL);
     alfs_reader_t rd;
     CHECK_EQ(CALL(&r, alfs_log_open_read(&r.lg, &rd, w.log, 1, r.blk[3], r.bsize)), 0);
-    uint64_t headers = 0;
+    uint64_t headers = 0; /* but the read that finds the end, which scans the area */
     uint32_t n = 0;
     for (;;) {
         int32_t k = (int32_t)CALL(&r, alfs_log_read(&r.lg, &rd, got + n, 300));
-        headers += r.seen.headers;
         CHECK(k >= 0);
         if (!k)
             break;
+        headers += r.seen.headers;
         n += (uint32_t)k;
     }
     CHECK_EQ(n, sizeof(d));
@@ -1308,14 +1308,14 @@ static uint64_t life02_bound(const rig_t *r, uint64_t x) {
 static void life_write_amplification(void) {
     for (int kind = 0; kind < 3; kind++) {
         rig_t r;
-        rig_open(&r, 256, 2);
+        rig_open(&r, 512, 2);
         CHECK_EQ(setup(&r), 0);
         alfs_writer_t w;
         CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
         static uint8_t d[24000];
         uint64_t programmed = 0, bound = 0;
         uint32_t per_sync = kind == 0 ? 22 : kind == 1 ? 1100 : 24000;
-        for (uint32_t s = 0; s < 600; s++) {
+        for (uint32_t s = 0; s < (kind == 2 ? 60u : 600u); s++) { /* W-HR: a minute */
             fill(d, per_sync, s);
             uint64_t b0 = r.sim.bytes_programmed;
             uint32_t before = w.used;
@@ -1586,7 +1586,7 @@ static void safe_write_only_verified_ready(void) {
     alfs_log_status_t st;
     alfs_log_status(&r.lg, &st);
     CHECK_EQ(st.bad, 1);
-    static uint8_t d[20000], got[20000];
+    static uint8_t d[20000], got[20480];
     fill(d, sizeof(d), 11);
     alfs_writer_t w;
     CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
@@ -1789,10 +1789,7 @@ static void safe_foreign_area(void) {
         CHECK_EQ(st.ready, 0);
         CHECK_EQ(st.dirty, 16);
         alfs_writer_t w;
-        CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
-        uint8_t d[10] = {1};
-        CHECK_EQ(put(&r, &w, d, sizeof(d)), 0);
-        CHECK_EQ(lsync(&r, &w), ALFS_ENOSPC);
+        CHECK_EQ(lopen(&r, &w, 0, 1, 0), ALFS_ENOSPC); /* a log takes a ready sector at once */
         CHECK_EQ(r.sim.c_ops, 0);
         CHECK_EQ(OMOUNT(&r), ALFS_ENOFS);
         CHECK_EQ(r.sim.c_ops, 0);

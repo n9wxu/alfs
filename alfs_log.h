@@ -84,8 +84,10 @@ int alfs_log_erase(alfs_log_t *lg, uint32_t log, uint32_t steps);
 /*
  * Opens a writer of stream `tag`: of a new log when log is 0, or of the
  * log being written (w->log of another writer). A new log starts only when
- * no writer is open. block: at least one page and at most 65,535 bytes.
- * Its number is w->log. ALFS_EINVAL, ALFS_EOPEN.
+ * no writer is open, and takes its first sector at once, so its number is
+ * on the flash before it is given. block: at least one page and at most
+ * 65,535 bytes. Its number is w->log. ALFS_EINVAL, ALFS_EOPEN; for a new
+ * log ALFS_ENOSPC, ALFS_EPROG (retry), ALFS_EIO.
  */
 int alfs_log_open(alfs_log_t *lg, alfs_writer_t *w, uint32_t log, uint8_t tag, uint8_t *block, uint32_t size);
 
