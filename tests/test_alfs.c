@@ -2373,7 +2373,7 @@ static void if_kv_full(void) {
     uint8_t v[200];
     int i = 0, rc = 0;
     for (; i < 100; i++) {
-        char key[8];
+        char key[16];
         snprintf(key, sizeof(key), "f%d", i);
         fill(v, sizeof(v), (uint32_t)i);
         if ((rc = kset(&r, key, v, sizeof(v))) != 0)
@@ -2383,13 +2383,13 @@ static void if_kv_full(void) {
     CHECK(i >= 10);
     for (int pass = 0; pass < 2; pass++) {
         for (int j = 0; j < i; j++) {
-            char key[8];
+            char key[16];
             snprintf(key, sizeof(key), "f%d", j);
             fill(v, sizeof(v), (uint32_t)j);
             CHECK(kreads(&r, key, v, sizeof(v)));
         }
         uint8_t got[PAGE];
-        char key[8];
+        char key[16];
         snprintf(key, sizeof(key), "f%d", i);
         CHECK_EQ(kget(&r, key, got, sizeof(got)), ALFS_ENOENT);
         CHECK_EQ(remount(&r), 0);
