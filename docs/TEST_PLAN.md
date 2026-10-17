@@ -141,7 +141,7 @@ test can tell good data from bad without alfs's help.
 | `if_put_one_at_a_time` | IF-06 | A second put, and a delete, during a put are refused with `ALFS_EOPEN`; after an abandon the old object reads and a put succeeds. |
 | `if_get_snapshot` | IF-07 | A reader opened before a put commits reads the old bytes to the end; a put, delete or erase that would erase its half meanwhile is refused with `ALFS_EOPEN`, and succeeds after it closes. |
 | `if_object_list` | IF-08 | Three objects, one deleted and one put again: listed with names and sizes, the same after a remount. |
-| `if_log_numbers_never_reused` | IF-09 | Numbers grow; erasing the newest log and remounting does not give its number again; a first claim torn by FLICKER, METASTABLE or SOMEBITS, then eight remounts each starting a log: no two logs share a number. |
+| `if_log_numbers_never_reused` | IF-09 | Numbers grow; erasing the newest log and remounting does not give its number again; a claim torn by FLICKER, METASTABLE or SOMEBITS in a log's first chunk, then eight remounts each starting a log: no number is given twice. |
 | `if_log_streams` | IF-10 | Two writers of one log, tags 1 and 2, interleaved: each stream reads back its own bytes, a third tag reads none; the same after a remount. |
 | `if_log_new_after_mount` | IF-10, SAFE-04 | After a remount, writing to the log written before is refused; a new log starts in a sector of its own, and the old one reads whole. |
 | `if_log_list` | IF-11 | Three logs of different lengths: listed in growing number with the sectors each holds, against the simulator's flash. |
@@ -153,7 +153,7 @@ test can tell good data from bad without alfs's help.
 | `spd_mount_reads_bounded` | SPD-05 | A mount of a 128-sector log area holding logs reads at most 30 bytes a sector; of an object area holding objects, at most 29 bytes a half; neither does an operation. |
 | `spd_wlog_longest_stall` | SPD-06 | Ten minutes of W-LOG at 50 rows a second: no operation longer than one program. |
 | `spd_cpu_linear` | SPD-07 | The same writes and syncs on 32 and 2,048 sectors read the same bytes. |
-| `spd_read_next_bounded` | SPD-08 | A log written across dirty sectors left in its way: reading it reads at most one header for each of its sectors and each sector between them, plus two. |
+| `spd_read_next_bounded` | SPD-08 | A log written across dirty sectors left in its way: reading it reads at most one header for each of its sectors and each sector between them, plus two. The read that finds the log's end scans every header, and is not counted. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. W-CFG: a put erases nothing when the spare is ready, and each sector of a half once when not. |
 | `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and W-HR, against the bound computed from the counts the driver wrapper keeps. |
 | `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, then the log erased: erases at most the sectors the log filled, plus one. Prints the count. |

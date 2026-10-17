@@ -18,7 +18,7 @@ other.
 | Offset | Size | Field | Written |
 |---|---|---|---|
 | 0 | 18 | stamp | by an erase, after the erase and a check that every byte is erased |
-| 18 | 12 | claim | by the log that takes the sector, in one program with the stamp again and the sector's first chunk |
+| 18 | 12 | claim | by the log that takes the sector, in one program with the stamp again and, but in a log's first sector, the sector's first chunk |
 | D = 30 | | chunks | by writes and syncs |
 
 P must be at least 128 bytes and S at least four pages (`ALFS_EGEOMETRY`
@@ -66,8 +66,8 @@ mount finds a torn claim (section 2).
 A claim is **valid** when it is not erased and its CRC is right, and
 **zero** when all 12 bytes are 00h.
 
-A log's number is the sequence alfs gave when the log started. Its
-sectors' sequences are greater, and grow in the order the log took them.
+A log's number is the sequence of its first claim. Its other sectors'
+sequences are greater, and grow in the order the log took them.
 
 ### 1.3 A chunk
 
@@ -121,8 +121,10 @@ The sector ends at its last page.
 
 ## 4. Writing a log
 
-**Starting a log** gives it the next sequence as its number. It takes no
-sector until its first chunk.
+**Starting a log** takes its first sector at once: one program of the
+stamp again and a claim whose sequence is also the log's number. So the
+number is on the flash before the application has it, and a mount gives
+it to no other log.
 
 **Allocation** scans forward, circularly, from the sector after the one
 holding the newest claim the mount found, or after the last sector taken.
@@ -139,9 +141,9 @@ It takes the first sector that:
 A ready sector that fails the second check is dirty: something touched it
 since its erase.
 
-**A sector's first program** starts at byte 0: the stamp again with the
-bytes it reads (A-9), the claim with the next sequence, and the first
-chunk.
+**Each later sector's first program** starts at byte 0: the stamp again
+with the bytes it reads (A-9), the claim with the next sequence, and the
+sector's first chunk.
 
 **Chunks** fill pages. A writer's block is programmed as chunks, each as
 long as the room left in the current page allows. Two writers of one log

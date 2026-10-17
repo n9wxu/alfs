@@ -556,9 +556,10 @@ reclaiming what was synced:
 
 - Priority: 3.
 - Source: A-3, A-9; METASTABLE and FLICKER (4.4). The program a power loss
-  interrupts is a chunk, a claim with its sector's first chunk, or a
-  stamp. Rule 1: the torn chunk is in the cut-short log's last sector,
-  which nothing writes again. Rule 2: a stamp that an erase's power loss
+  interrupts is a chunk, a log's first claim, a claim with its sector's
+  first chunk, or a stamp. Rule 1: the torn chunk is in the cut-short
+  log's last sector, which nothing writes again. Rule 2: a stamp that an
+  erase's power loss
   left half programmed can read valid at one mount and invalid at a later
   one. Rule 3: a claim program torn at its start leaves a sector that reads
   ready but holds a bit that reads either way; it is the first ready
@@ -902,9 +903,11 @@ started, and is never used again, even after the log is erased or a power
 loss tears its first claim.
 
 - Priority: S.
-- Source: UC-3, UC-4: the application names flights by number. Each stamp
-  records the next sequence, and a mount takes two more than the largest
-  in any claim or stamp, three when it finds a torn claim (SPEC 1.1).
+- Source: UC-3, UC-4: the application names flights by number. A log's
+  number is the sequence of its first claim, programmed before the number
+  is given. Each stamp records the next sequence, and a mount takes two
+  more than the largest in any claim or stamp, three when it finds a torn
+  claim (SPEC 1.1).
   Three, because a claim torn straight after a mount holds the sequence
   that mount gave, two more than the largest valid one.
 - Verified by: `if_log_numbers_never_reused`.
