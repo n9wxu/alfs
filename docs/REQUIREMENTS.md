@@ -1,8 +1,8 @@
 # alfs requirements
 
-alfs, the append-log flash store: on serial NOR flash, an object area of
-named objects, each written and read whole, and a log area where logs are
-appended around a ring of sectors.
+alfs, the append-log flash store: on serial NOR flash, a configuration
+store of key-value pairs, an object area of named objects written and read
+whole, and a log area where logs are appended around a ring of sectors.
 
 **Status: draft 4.** Requirements come first, then the tests that verify
 them (`docs/TEST_PLAN.md`), then the code.
@@ -36,6 +36,13 @@ The user, on the layout:
 > slowly so they could be read-modify-write from the config area. LUA
 > programs are separate objects. Since the UI is simply GET and PUT of
 > whole files, we are effectively making an object store."
+>
+> "config data could be a round-robin key-value store. Writes would zero
+> the old key/value pair while appending the new key/value pair. It would
+> require a O(N) search to find any specific key, but there are not that
+> many keys in the system. The UI code could cache a full copy after one
+> scan of the config store. LUA programs should still be a full file
+> write."
 
 The user, on the flash task and on writes:
 
@@ -59,10 +66,12 @@ And the user's choices: in the log area, erasing happens only when the
 application asks; after a reset the application starts a new log rather
 than resuming the old one.
 
-**The two areas.**
-- **The object area** holds configuration objects and Lua programs, each
-  under its name. An object is replaced whole (PUT) and read whole (GET).
-  Objects are saved on the ground and slowly, so a save may erase.
+**The three areas.**
+- **The configuration store** holds key-value pairs. A set appends the new
+  pair and zeroes the one it replaces; a get or a listing scans one
+  sector. Pairs are saved on the ground and slowly, so a set may erase.
+- **The object area** holds Lua programs, each under its name. An object
+  is replaced whole (PUT) and read whole (GET), and a put may erase.
 - **The log area** holds the logs, appended at one place that moves
   around a ring of sectors. Nothing in it erases unless the application
   asks.
@@ -91,20 +100,22 @@ writes less and has fewer ways to fail. Its requirements are budgets.
 
 **In scope:**
 
-- **Objects** on raw serial NOR flash, found by name: put (replace
-  whole), get (read whole), delete, list.
+- **Configuration pairs** on raw serial NOR flash, found by key: set
+  (replace one value), get, delete, list.
+- **Objects**, found by name: put (replace whole), get (read whole),
+  delete, list.
 - **Logs** in a ring of sectors: start, append to one or more streams of
   the newest log, sync, read a stream sequentially, list, and delete a
   log by erasing it.
-- One task that performs every flash operation of both areas for the
-  application's tasks, on FreeRTOS; and the same code, without the task,
-  for a caller with no RTOS.
+- One task that performs every flash operation of the three areas for
+  the application's tasks, on FreeRTOS; and the same code, without the
+  task, for a caller with no RTOS.
 - Erasing the log area when the application asks, and reporting how much
   of each area is ready.
 - Power loss at any moment; the bad-sector and power-loss behaviours of
   section 4.4.
-- A chip shared with executing code: alfs owns only the two areas it is
-  given.
+- A chip shared with executing code: alfs owns only the three areas it
+  is given.
 
 **Out of scope:**
 
@@ -113,7 +124,10 @@ writes less and has fewer ways to fail. Its requirements are budgets.
 - Reopening a log to append after a reset. The application starts a new
   log (the user's choice); the rest of the cut-short log's last sector
   stays unused until that log is erased.
-- An object larger than half the object area.
+- An object larger than half the object area; a configuration pair
+  larger than a page, or more pairs than one sector holds.
+- Erasing the configuration store and the object area ahead of time: they
+  are written on the ground, and erase when they need room.
 - NAND, SD cards, eMMC: any medium with a write-back cache or its own
   translation layer. The reordering such a cache makes is not modelled.
 - A part whose prog unit is over one byte (one with error correction
@@ -141,9 +155,9 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | UC-8 | **The wrong geometry.** An image built for an 8 MB chip, run on a 2 MB one. | Nothing may be written past the chip's end or outside the areas, where the bootloader and the code lie (DD-098). |
 | UC-9 | **Write failures.** A program that fails part-way. | Nothing is written twice, and every byte lost is counted (L4). |
 | UC-10 | **Unattended, soldered-in flash.** Replacing the chip loses everything; the unit may be out of reach. | Degrade gracefully, shrink with bad sectors, stay readable at end of life, report health. |
-| UC-11 | **Configuration objects.** Saved on the ground, a few hundred bytes each, each save replacing the object whole; read whole at boot. | The user's words on the object area (section 1). pyro's settings are files of under 1 kB (`pins.ini`, `beep.ini`, `pad.mkr`). |
-| UC-12 | **Lua programs.** Each its own object, saved whole from the web interface, read whole when loaded. | The user's words (section 1). |
-| UC-13 | **Many tasks, one flash.** The flight log from a storage task, objects and downloads from a network task, each blocking only itself. | pyro runs FreeRTOS on both cores (DD-073); its flash operations go through one routine that stops both cores for one operation at a time (DD-074, `src/flash_op.c`). |
+| UC-11 | **Configuration.** Settings saved on the ground as key-value pairs, a few hundred bytes in all, each save replacing one value; all read at boot, and by the web interface, which keeps a copy after one scan. | The user's words on the configuration store (section 1). pyro's settings are files of under 1 kB (`pins.ini`, `beep.ini`, `pad.mkr`). |
+| UC-12 | **Lua programs.** Each its own object, saved whole from the web interface, read whole when loaded. | The user: "LUA programs should still be a full file write." |
+| UC-13 | **Many tasks, one flash.** The flight log from a storage task, settings, programs and downloads from a network task, each blocking only itself. | pyro runs FreeRTOS on both cores (DD-073); its flash operations go through one routine that stops both cores for one operation at a time (DD-074, `src/flash_op.c`). |
 
 ---
 
@@ -152,7 +166,11 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 ### 4.1 Terms
 
 - **area:** a sector-aligned range of the chip given to one store: the
-  object area or the log area.
+  configuration store, the object area or the log area.
+- **pair:** a key of 1 to 31 bytes and its value, in the configuration
+  store.
+- **head sector:** the configuration store's sector that holds its pairs;
+  the others hold pairs it has replaced.
 - **sector:** the erase unit, a power of two (4,096 bytes on every part
   here).
 - **page:** the most one program operation writes; a program never
@@ -287,9 +305,9 @@ of one page unless a workload says otherwise.
   the oldest log erased whenever fewer than two logs' worth of sectors are
   ready; one erase step requested every 20 ms; until every sector has been
   erased at least 10 times.
-- **W-CFG:** a configuration object of 300 bytes put again and again,
-  beside a 4,096-byte Lua program object and a second configuration
-  object that is deleted and put back.
+- **W-CFG:** a script of sets and deletes of ten configuration keys with
+  values of 1 to 60 bytes, and puts of a 4,096-byte and a 300-byte Lua
+  program object, one of them deleted and put back.
 
 ---
 
@@ -315,7 +333,9 @@ The requirement, one sentence where possible.
 
 Nothing erases in the log area but `alfs_log_erase`. Nothing erases in the
 object area but `alfs_obj_erase`, `alfs_obj_format`, and a put or delete
-that finds the spare half not ready.
+that finds the spare half not ready. Nothing erases in the configuration
+store but a set or delete that finds no room in the head sector, or the
+first one after a mount that finds a copy cut short (SAFE-16).
 
 - Priority: 1.
 - Source: the rulings; UC-1; the user's choice that the log area erases
@@ -375,12 +395,14 @@ may have programmed part of its bytes before it found no ready sector.
 #### ALFS-SPD-05
 
 Mounting the log area reads at most 30 bytes of each sector; mounting the
-object area reads at most 29 bytes of each half. Neither performs a flash
-operation.
+object area reads at most 29 bytes of each half; mounting the
+configuration store reads at most 19 bytes of each sector. None performs
+a flash operation.
 
 - Priority: 1.
 - Source: UC-3. 30 bytes are a log sector's stamp (18) and claim (12); 29
-  are a half's stamp (16), begun mark (1) and commit (12).
+  are a half's stamp (16), begun mark (1) and commit (12); 19 are a
+  configuration sector's claim (18) and complete mark (1).
 - Measure: bytes the simulator reads during each mount.
 - Pass: at most those. Fail: more, or any operation.
 - Verified by: `spd_mount_reads_bounded`.
@@ -443,6 +465,22 @@ flash holds.
 - Pass: every call returns. Fail: any that does not.
 - Verified by: `safe_fuzz`; review.
 
+#### ALFS-SPD-10
+
+A configuration set or delete that finds room in the head sector performs
+two programs, the pair and the zero over the pair it replaces, and no
+erase. One that finds no room erases one sector and copies the current
+pairs into it. The first in a mount also programs the head's complete
+mark again (SAFE-16).
+
+- Priority: 1.
+- Source: UC-11; the user: "Writes would zero the old key/value pair
+  while appending the new key/value pair."
+- Measure: programs and erases the simulator counts during each set of
+  W-CFG.
+- Pass: as stated. Fail: more.
+- Verified by: `spd_kv_set_bounded`.
+
 ### 6.2 Flash life (LIFE)
 
 #### ALFS-LIFE-01
@@ -498,6 +536,20 @@ by at most 2.
   simulator.
 - Pass: largest minus smallest at most 2. Fail: more.
 - Verified by: `life_wear_level`.
+
+#### ALFS-LIFE-05
+
+The configuration store's head moves to the next sector round the ring
+each time it fills, so its sectors wear evenly: under repeated sets their
+erase counts differ by at most 1.
+
+- Priority: 2.
+- Source: the user: "a round-robin key-value store"; 100K-cycle
+  endurance (4.3).
+- Measure: each sector's erase count after the head has gone round the
+  ring ten times.
+- Pass: largest minus smallest at most 1. Fail: more.
+- Verified by: `life_kv_round_robin`.
 
 ### 6.3 Safety (SAFE)
 
@@ -680,7 +732,7 @@ whole as it was, or after a power loss, either as it was or as the put or
 delete makes it; once it returns, as it makes it, after any power loss.
 
 - Priority: 3.
-- Source: UC-11, UC-12. A put writes every other object again into the
+- Source: UC-12. A put writes every other object again into the
   spare half, then the new object, then the commit; a mount takes the half
   with the newer valid commit.
 - Measure: power loss at every operation of W-CFG; after each, eight
@@ -710,8 +762,8 @@ object's size is where the next object begins, so damage to a size hides
 the objects after it in the half.
 
 - Priority: 3.
-- Source: UC-11, UC-12: a configuration or program partly wrong is worse
-  than one missing, which the application replaces with its default.
+- Source: UC-12: a program partly wrong is worse than one missing, which
+  the application replaces with its default.
 - Measure: objects with bits flipped in their name, size, payload and
   check.
 - Pass: no damaged byte returned: `ALFS_ECHECK` for the damaged object,
@@ -720,14 +772,61 @@ the objects after it in the half.
   byte returned.
 - Verified by: `safe_obj_check`.
 
+#### ALFS-SAFE-15
+
+A configuration set or delete is atomic: until it returns, every key reads
+as it was, or after a power loss, as it was or as the call makes it; once
+it returns, as the call makes it, after any power loss. Where a power
+loss leaves two live pairs of a key, the later one is its value.
+
+- Priority: 3.
+- Source: UC-11. A set appends before it zeroes; a full head is copied
+  into the next sector, which becomes the head only when its complete
+  mark is programmed, after the last copy.
+- Measure: power loss at every operation of W-CFG's sets and deletes,
+  under each behaviour; after each, eight remounts and a get of every
+  key; then a set and eight more.
+- Pass: as stated. Fail: a key missing, wrong, or reading a value it never
+  had.
+- Verified by: `safe_kv_atomic`.
+
+#### ALFS-SAFE-16
+
+Before the head sector takes a pair in a mount, alfs programs its complete
+mark again (A-9), and erases the sector after it if that sector's claim is
+newer than the head's.
+
+- Priority: 3.
+- Source: METASTABLE: a complete mark a power cut left half programmed can
+  read set at one mount and not at the next. A pair written into the head
+  must not lose to a copy cut short that later reads complete.
+- Measure: as SAFE-15, with the loss at the complete mark's program under
+  each behaviour, then sets.
+- Pass: as SAFE-15. Fail: otherwise.
+- Verified by: `safe_kv_atomic`.
+
+#### ALFS-SAFE-17
+
+A get or a listing returns no pair whose check fails; such a pair is
+passed over, and counted.
+
+- Priority: 3.
+- Source: UC-11: a setting partly wrong is worse than one missing, which
+  the application replaces with its default.
+- Measure: a bit flipped in a pair's key, length, value and check.
+- Pass: the damaged pair is not returned; the other pairs are. Fail: a
+  damaged byte returned.
+- Verified by: `safe_kv_check`.
+
 ### 6.4 Simplicity (SIMP)
 
 #### ALFS-SIMP-01
 
-The stores are C99: `alfs.h` (what both share), `alfs_flash.c` and
-`alfs_flash.h` (the checked flash operations both use), `alfs_log.c` and
-`alfs_log.h`, `alfs_obj.c` and `alfs_obj.h`. They use no dynamic memory, no
-recursion, no floating point, and no library beyond `<stdint.h>`,
+The stores are C99: `alfs.h` (what they share), `alfs_flash.c` and
+`alfs_flash.h` (the checked flash operations they use), `alfs_kv.c` and
+`alfs_kv.h`, `alfs_obj.c` and `alfs_obj.h`, `alfs_log.c` and
+`alfs_log.h`. They use no dynamic memory, no recursion, no floating
+point, and no library beyond `<stdint.h>`,
 `<stddef.h>`, `<stdbool.h>` and `<string.h>`. The task layer is one more
 source and header (`alfs_rtos.c`, `alfs_rtos.h`), which adds only the
 FreeRTOS kernel's headers.
@@ -862,8 +961,8 @@ An object is found by its name: 1 to 31 bytes, none of them 00h, compared
 byte for byte. A `/` is an ordinary byte.
 
 - Priority: S.
-- Source: the user: "configuration objects", "LUA programs are separate
-  objects". pyro's longest file path is 15 bytes (`/www/index.html`).
+- Source: the user: "LUA programs are separate objects". pyro's longest
+  file path is 15 bytes (`/www/index.html`).
 - Verified by: `if_object_names` (names of 1 and 31 bytes; 0 and 32 bytes
   refused).
 
@@ -961,6 +1060,37 @@ of its handles is open.
   another log.
 - Verified by: `if_log_refusals`.
 
+#### ALFS-IF-14
+
+A key is 1 to 31 bytes, none of them 00h, compared byte for byte; a value
+is 0 to (page − 8 − the key's length) bytes. Setting a key's value empty
+deletes the key.
+
+- Priority: S.
+- Source: UC-11. A pair is one program, never across a page.
+- Verified by: `if_kv_keys`.
+
+#### ALFS-IF-15
+
+A listing returns each current pair once, key and value, in one pass over
+the head sector. A set or delete between two calls of one listing makes
+the next call return `ALFS_EINVAL`: the listing starts again.
+
+- Priority: S.
+- Source: the user: "The UI code could cache a full copy after one scan
+  of the config store."
+- Verified by: `if_kv_list`.
+
+#### ALFS-IF-16
+
+The current pairs fit in one sector: a set that would not fit after the
+head is copied returns `ALFS_ENOSPC`, and every key reads as it did.
+
+- Priority: S.
+- Source: the user: "there are not that many keys in the system". A get
+  and a listing read one sector.
+- Verified by: `if_kv_full`.
+
 ### 6.6 Observability and errors (OBS)
 
 #### ALFS-OBS-01
@@ -969,7 +1099,9 @@ The log area reports, at any moment: sectors ready, dirty and bad; bytes
 writable without an erase; the log being written; and its counts of
 programs, erases, failed programs, failed erases, failed checks and bytes
 lost. The object area reports the bytes its objects take and the bytes
-it can hold, whether the spare half is ready, and the same counts.
+it can hold, whether the spare half is ready, and the same counts. The
+configuration store reports its head sector and its sequence, and the
+same counts.
 
 - Priority: 3.
 - Source: UC-5 (the gate), UC-9, UC-10.
@@ -997,13 +1129,14 @@ remains, the object area when its spare half is ready.
 
 ### 6.7 The flash task (RT)
 
-The task layer serves one log area and one object area; every requirement
-above holds through it.
+The task layer serves one configuration store, one object area and one
+log area; every requirement above holds through it.
 
 #### ALFS-RT-01
 
-One task performs every flash operation of both areas; the application's
-tasks reach the flash only through requests to it, served one at a time.
+One task performs every flash operation of the three areas; the
+application's tasks reach the flash only through requests to it, served
+one at a time.
 
 - Priority: 1.
 - Source: "Serializing in the flash ops task ensures no collisions and
@@ -1106,8 +1239,8 @@ its steps.
 | UC-8 wrong geometry | SAFE-09, IF-02 |
 | UC-9 write failures | SAFE-06, OBS-01 |
 | UC-10 unattended flash | LIFE-04, SAFE-07, SAFE-10, SPD-09, OBS-01, OBS-02 |
-| UC-11 configuration objects | IF-05 to IF-08, SAFE-12 to SAFE-14 |
-| UC-12 Lua programs | IF-05 to IF-08, SAFE-12, SAFE-14 |
+| UC-11 configuration | SPD-10, LIFE-05, SAFE-15 to SAFE-17, IF-14 to IF-16 |
+| UC-12 Lua programs | IF-05 to IF-08, SAFE-12 to SAFE-14 |
 | UC-13 many tasks | RT-01 to RT-07 |
 
 ---
