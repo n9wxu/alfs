@@ -32,4 +32,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: test -f alfs_fs.c || { echo "alfs_fs.c is not written: the tests cannot run"; exit 1; }
+      - run: |
+          test -f alfs_fs.c || { echo "alfs_fs.c is not written, so the tests cannot run"; exit 1; }
