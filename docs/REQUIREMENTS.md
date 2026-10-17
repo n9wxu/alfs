@@ -512,12 +512,16 @@ and 12 for each claim it zeroes.
 
 #### ALFS-LIFE-03
 
-On W-LOG, alfs erases no more sectors than the bytes it programmed fill.
+On W-LOG, alfs erases no more sectors than the bytes it programmed fill,
+a page counting as full once less than a row and its length is left in
+it: for B bytes programmed in rows of L bytes, at most
+ceil(B / (S − (S / P) × L)) sectors, S the sector and P the page size.
 
 - Priority: 2.
-- Source: the brief; UC-1.
-- Measure: erases over 10 minutes against the bytes programmed divided by
-  the sector size, after the log is erased.
+- Source: the brief; UC-1. A chunk holds whole rows, so the end of a page
+  stays unused when the next row does not fit there: at most L bytes.
+- Measure: erases over 10 minutes against that bound, after the log is
+  erased.
 - Pass: erases at most the sectors filled, plus one. Fail: more.
 - Verified by: `life_wlog_erases`.
 
@@ -798,12 +802,14 @@ or delete made it, or as the one cut short would; and after the next set,
 as one of the two on every later mount.
 
 - Priority: 3.
-- Source: UC-11. The application appends a row for each change. Each new
+- Source: UC-11. The application appends a row for each change. A new
   log starts with a row for every current setting and a row that marks
-  them complete; the application erases older logs only once that mark is
-  synced. At boot it applies every row in order, and at a mark keeps only
-  the settings its log has set. So it relies on SAFE-01, SAFE-02 and
-  SAFE-15, and on logs growing in number (IF-09).
+  them complete. The newest log with a mark holds every setting, so the
+  application erases the other logs before it starts one, and that log
+  only once the new mark is synced. At boot it applies every row in
+  order, and at a mark keeps only the settings its log has set. So it
+  relies on SAFE-01, SAFE-02 and SAFE-15, and on logs growing in number
+  (IF-09).
 - Measure: power loss at every operation of W-CFG's sets and deletes,
   under each behaviour; after each, eight reloads reading every key; then
   a set and eight more.

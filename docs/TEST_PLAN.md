@@ -165,7 +165,7 @@ without alfs's help. Tests that write a run of bytes write it as rows of
 | `spd_read_next_bounded` | SPD-08 | A log written across dirty sectors left in its way: reading it reads at most one header for each of its sectors and each sector between them, plus two. The read that finds the log's end scans every header, and is not counted. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. W-CFG: a put erases nothing when the spare is ready, and each sector of a half once when not. |
 | `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and a minute of W-HR, against the bound computed from the counts the driver wrapper keeps. |
-| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, then the log erased: erases at most the sectors the log filled, plus one. Prints the count. |
+| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, then the log erased: erases at most the sectors its bytes fill, each page full but for a row, plus one. Prints the count. |
 | `life_wear_level` | LIFE-04 | W-RING until every sector is erased ten times: counts within 2. |
 | `safe_powerloss_durable` | SAFE-01 | Each behaviour, power lost at every operation of a 20-second W-LOG with erase steps. Then the rest of the case runs as below. |
 | `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss after the restart in every third case. |

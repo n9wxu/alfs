@@ -1461,7 +1461,8 @@ static void life_wlog_erases(void) {
     uint64_t p0 = r.sim.bytes_programmed, e0 = r.sim.erases;
     CHECK_EQ(log_run(&r, &w, &lg, 50, 600000, false), 0);
     CHECK_EQ(lclose(&r, &w), 0);
-    uint64_t filled = (r.sim.bytes_programmed - p0 + SECTOR - 1) / SECTOR;
+    uint64_t full = SECTOR - SECTOR / PAGE * ROW; /* each page full but for a row */
+    uint64_t filled = (r.sim.bytes_programmed - p0 + full - 1) / full;
     CHECK(lclean_log(&r, w.log) >= 0);
     uint64_t erases = r.sim.erases - e0;
     printf("    W-LOG: %llu sector erases for %llu sectors filled\n", (unsigned long long)erases,

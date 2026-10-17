@@ -53,6 +53,7 @@ static int apply(kv_t *kv, const uint8_t *row, uint32_t len, uint32_t log) {
         for (uint32_t i = 0; i < kv->n; i++)
             if (kv->slots[i].log != log)
                 kv->slots[i].len = 0;
+        kv->base = log;
         return ALFS_OK;
     }
     if (!k || k > KV_KEY_MAX || 1 + k > len)
@@ -87,7 +88,10 @@ int kv_load(kv_t *kv, alfs_log_t *lg, kv_slot_t *slots, uint32_t n, uint8_t *blo
         alfs_reader_t r;
         uint8_t row[ROW_CAP];
         int32_t len;
-        if ((rc = alfs_log_open_read(lg, &r, in.log, KV_TAG, block, size)) != ALFS_OK)
+        rc = alfs_log_open_read(lg, &r, in.log, KV_TAG, block, size);
+        if (rc == ALFS_ENOENT)
+            continue; /* its one claim, torn, read valid to the listing */
+        if (rc)
             return rc;
         while ((len = alfs_log_read(lg, &r, row, sizeof(row))) > 0 &&
                (rc = apply(kv, row, (uint32_t)len, in.log)) == ALFS_OK)
@@ -144,16 +148,31 @@ static int erase_all(kv_t *kv, uint32_t log) {
     return ALFS_OK;
 }
 
-/* Erases every log older than the one being written. */
-static int erase_older(kv_t *kv) {
+static bool any_set(const kv_t *kv) {
+    for (uint32_t i = 0; i < kv->n; i++)
+        if (kv->slots[i].len)
+            return true;
+    return false;
+}
+
+/* Erases the dirty sectors and every log but the base, none of which holds
+ * a setting of its own (kv.h). With no base, a setting read comes from logs
+ * a mark never followed, which stay. */
+static int erase_others(kv_t *kv) {
+    int rc = erase_all(kv, 0);
+    if (rc || (!kv->base && any_set(kv)))
+        return rc;
     alfs_log_status_t st;
     alfs_log_status(kv->lg, &st);
-    for (uint32_t i = 0; i < st.sectors; i++) {
+    uint32_t after = 0;
+    for (uint32_t i = 0; i <= st.sectors; i++) {
         alfs_log_info_t in;
-        int rc = alfs_log_list(kv->lg, 0, &in);
-        if (rc || in.log == kv->w.log)
-            return rc;
-        if ((rc = erase_all(kv, in.log)) != ALFS_OK)
+        rc = alfs_log_list(kv->lg, after, &in);
+        if (rc)
+            return rc == ALFS_ENOENT ? ALFS_OK : rc;
+        if (in.log == kv->base)
+            after = in.log;
+        else if ((rc = erase_all(kv, in.log)) != ALFS_OK)
             return rc;
     }
     return ALFS_OK;
@@ -181,10 +200,10 @@ static bool low(const kv_t *kv, uint32_t len) {
 }
 
 /*
- * A new log: a row for every setting, then the mark, each synced, then
- * every older log erased. Until the mark is on the flash the older logs
- * hold the settings. A failed program drops rows, so the next try starts
- * another log.
+ * A new base: the other logs erased, then a row for every setting and the
+ * mark, each synced, then the old base erased. Until the mark is on the
+ * flash the old base holds the settings. A failed program drops rows, so
+ * the next try starts another log.
  */
 static int compact(kv_t *kv) {
     int rc = ALFS_EPROG;
@@ -192,7 +211,7 @@ static int compact(kv_t *kv) {
     for (uint32_t t = 0; t < TRIES; t++) {
         if (kv->w.open && (rc = alfs_log_close(kv->lg, &kv->w)) != ALFS_OK)
             return rc;
-        if ((rc = erase_all(kv, 0)) != ALFS_OK)
+        if ((rc = erase_others(kv)) != ALFS_OK)
             return rc;
         rc = alfs_log_open(kv->lg, &kv->w, 0, KV_TAG, kv->block, kv->size);
         if (rc == ALFS_ENOSPC || rc == ALFS_EPROG)
@@ -209,7 +228,8 @@ static int compact(kv_t *kv) {
             rc = lost(kv) == was ? append(kv, &mark, 1) : ALFS_EPROG;
         if (!rc) {
             kv->whole = true;
-            return erase_older(kv);
+            kv->base = kv->w.log;
+            return erase_others(kv);
         }
         if (rc != ALFS_EPROG)
             return rc;

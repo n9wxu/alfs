@@ -1,5 +1,5 @@
 /*
- * alfs_log: the log area. See alfs_log.h; the format is docs/SPEC.md 1 to 5.
+ * alfs_log: a log area. See alfs_log.h; the format is docs/SPEC.md 1 to 5.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -14,6 +14,7 @@
 #define OFF_CLAIM STAMP_LEN
 #define OFF_DATA (OFF_CLAIM + CLAIM_LEN)
 #define HDR_LEN 7u /* a chunk's: length, tag, CRC */
+#define MIN_PAYLOAD 2u /* a row of one byte, after its length */
 #define NONE ALFS_NONE
 
 enum { S_READY, S_USED, S_DIRTY };
@@ -296,15 +297,16 @@ static int start_log(alfs_log_t *lg) {
     return ALFS_OK;
 }
 
-/* Moves the next chunk's place on until a byte of payload fits there. */
-static void place(alfs_log_t *lg) {
+/* Moves the next chunk's place on until `need` bytes of payload fit
+ * there. */
+static void place(alfs_log_t *lg, uint32_t need) {
     while (lg->head != NONE) {
         uint32_t np = next_page(lg, lg->off);
-        if (lg->off + HDR_LEN + 1u > sector_size(lg)) {
+        if (lg->off + HDR_LEN + need > sector_size(lg)) {
             lg->head = NONE;
             return;
         }
-        if (np - lg->off < HDR_LEN + 1u) {
+        if (np - lg->off < HDR_LEN + need) {
             lg->off = (uint16_t)np;
             continue;
         }
@@ -320,15 +322,14 @@ static uint32_t room(const alfs_log_t *lg) {
 }
 
 /*
- * One program of up to n bytes of stream tag: in the current page, or with
- * the claim of a new sector, from its byte 0. The bytes it took, or an
- * error with nothing done. A program that fails drops its bytes (SAFE-06).
+ * One program of a chunk of stream tag, n bytes holding `rows` rows that
+ * fit room(): in the current page, or with the claim of a new sector, from
+ * its byte 0. ALFS_OK, or an error with nothing done. A program that fails
+ * drops its rows (SAFE-06).
  */
-static int32_t prog_chunk(alfs_log_t *lg, uint8_t tag, const uint8_t *p, uint32_t n) {
+static int prog_chunk(alfs_log_t *lg, uint8_t tag, const uint8_t *p, uint32_t n, uint32_t rows) {
     bool fresh = lg->head == NONE;
     uint32_t k = lg->head, at = lg->off;
-    if (n > room(lg))
-        n = room(lg);
     if (fresh) {
         int rc = take_sector(lg, &k);
         if (rc)
@@ -343,35 +344,39 @@ static int32_t prog_chunk(alfs_log_t *lg, uint8_t tag, const uint8_t *p, uint32_
     memcpy(h + HDR_LEN, p, n);
     uint32_t len = (uint32_t)(h - lg->d.scratch) + HDR_LEN + n;
     if (alfs_prog(&lg->d, alfs_addr(&lg->d, k) + at, lg->d.scratch, len)) {
-        lg->d.n.bytes_lost += n;
+        lg->d.n.bytes_lost += n - rows;
         if (fresh)
             lg->dirty++;
         lg->head = NONE; /* a page that fails is a sector that is failing */
-        return (int32_t)n;
+        return ALFS_OK;
     }
     lg->head = (uint16_t)k;
     lg->off = (uint16_t)(at + len);
-    return (int32_t)n;
+    return ALFS_OK;
 }
 
 /*
- * Programs the block's bytes as chunks, each filling its page: all of them,
- * or all but what is left after the last whole page's room (IF-12).
+ * Programs the block's rows as chunks, each holding the rows that fit in
+ * its page: all of them, or those of the chunks they fill (IF-12). A row
+ * is at most the room a fresh sector's first page leaves, so every chunk
+ * takes one.
  */
 static int spill(alfs_log_t *lg, alfs_writer_t *w, bool all) {
     uint32_t done = 0;
     int rc = ALFS_OK;
     while (done < w->used) {
-        place(lg);
-        uint32_t left = w->used - done, n = room(lg);
-        if (!all && left < n)
-            break;
-        int32_t m = prog_chunk(lg, w->tag, w->block + done, left < n ? left : n);
-        if (m < 0) {
-            rc = m;
-            break;
+        place(lg, 1u + w->block[done]);
+        uint32_t n = room(lg), m = 0, rows = 0;
+        while (done + m < w->used && m + 1u + w->block[done + m] <= n) {
+            m += 1u + w->block[done + m];
+            rows++;
         }
-        done += (uint32_t)m;
+        if (!all && done + m == w->used)
+            break; /* not full: a later row may join it */
+        rc = prog_chunk(lg, w->tag, w->block + done, m, rows);
+        if (rc)
+            break;
+        done += m;
     }
     memmove(w->block, w->block + done, w->used - done);
     w->used = (uint16_t)(w->used - done);
@@ -400,6 +405,7 @@ int alfs_log_open(alfs_log_t *lg, alfs_writer_t *w, uint32_t log, uint8_t tag, u
     w->log = lg->cur;
     w->tag = tag;
     w->open = 1;
+    w->max = (uint8_t)ALFS_ROW_MAX(page(lg));
     lg->writers++;
     return ALFS_OK;
 }
@@ -408,30 +414,29 @@ static bool writing(const alfs_log_t *lg, const alfs_writer_t *w) {
     return lg && lg->d.cfg && w && w->open && w->log == lg->cur;
 }
 
-uint32_t alfs_log_take(alfs_writer_t *w, const void *data, uint32_t len) {
-    uint32_t n = w->open ? (uint32_t)(w->cap - w->used) : 0u;
-    if (n > len)
-        n = len;
-    if (n)
-        memcpy(w->block + w->used, data, n);
-    w->used = (uint16_t)(w->used + n);
-    return n;
+bool alfs_log_take(alfs_writer_t *w, const void *row, uint32_t len) {
+    if (!w->open || !len || len > w->max || 1u + len > (uint32_t)(w->cap - w->used))
+        return false;
+    w->block[w->used] = (uint8_t)len;
+    memcpy(w->block + w->used + 1u, row, len);
+    w->used = (uint16_t)(w->used + 1u + len);
+    return true;
 }
 
-int32_t alfs_log_write(alfs_log_t *lg, alfs_writer_t *w, const void *data, uint32_t len) {
-    if (!writing(lg, w) || (len && !data))
+int alfs_log_write(alfs_log_t *lg, alfs_writer_t *w, const void *row, uint32_t len) {
+    if (!writing(lg, w) || !row || !len || len > w->max)
         return ALFS_EINVAL;
-    uint32_t taken = 0;
-    for (;;) {
-        if (w->used == w->cap) {
-            int rc = spill(lg, w, false);
-            if (rc)
-                return taken ? (int32_t)taken : rc;
-        }
-        if (taken == len)
-            return (int32_t)taken;
-        taken += alfs_log_take(w, (const uint8_t *)data + taken, len - taken);
-    }
+    if (alfs_log_take(w, row, len))
+        return ALFS_OK;
+    int rc = spill(lg, w, false);
+    if (rc || alfs_log_take(w, row, len))
+        return rc;
+    /* What the block keeps fits one chunk's room, which is under a page:
+     * with the row, it does not. */
+    rc = spill(lg, w, true);
+    if (!rc)
+        alfs_log_take(w, row, len);
+    return rc;
 }
 
 int alfs_log_sync(alfs_log_t *lg, alfs_writer_t *w) {
@@ -470,6 +475,17 @@ static int next_sector(alfs_log_t *lg, uint32_t log, uint32_t *k, uint32_t *seq)
     return ALFS_ENOENT;
 }
 
+/* SPEC 1.3: the rows' lengths fill the payload exactly. */
+static bool rows_fill(const uint8_t *p, uint32_t n) {
+    uint32_t i = 0;
+    while (i < n) {
+        if (!p[i])
+            return false;
+        i += 1u + p[i];
+    }
+    return i == n;
+}
+
 /*
  * SPEC 3: from *pos in sector k, the next good chunk of stream tag. 1 with
  * *pos and *len set and its payload in buf, 0 at the end, or ALFS_EIO.
@@ -479,7 +495,7 @@ static int scan_chunk(alfs_log_t *lg, uint32_t k, uint8_t tag, uint32_t *pos, ui
     while (x + HDR_LEN < sector_size(lg)) {
         uint8_t h[HDR_LEN];
         uint32_t np = next_page(lg, x);
-        if (np - x < HDR_LEN + 1u) {
+        if (np - x < HDR_LEN + MIN_PAYLOAD) {
             x = np;
             continue;
         }
@@ -490,7 +506,7 @@ static int scan_chunk(alfs_log_t *lg, uint32_t k, uint8_t tag, uint32_t *pos, ui
             continue;
         }
         uint32_t l = alfs_get16(h);
-        if (!l || x + HDR_LEN + l > np) {
+        if (l < MIN_PAYLOAD || x + HDR_LEN + l > np) {
             lg->d.n.check_failures++;
             x = np;
             continue;
@@ -507,7 +523,7 @@ static int scan_chunk(alfs_log_t *lg, uint32_t k, uint8_t tag, uint32_t *pos, ui
             c = alfs_crc(c, buf + i, n);
             i += n;
         }
-        if (~c == alfs_get32(h + 3)) {
+        if (~c == alfs_get32(h + 3) && rows_fill(buf, l)) {
             *pos = x;
             *len = l;
             return 1;
@@ -550,23 +566,25 @@ int alfs_log_open_read(alfs_log_t *lg, alfs_reader_t *r, uint32_t log, uint8_t t
     return ALFS_OK;
 }
 
-uint32_t alfs_log_give(alfs_reader_t *r, void *out, uint32_t len) {
-    uint32_t n = r->open ? r->used : 0u;
-    if (n > len)
-        n = len;
-    if (n)
-        memcpy(out, r->block + r->pos, n);
-    r->pos = (uint16_t)(r->pos + n);
-    r->used = (uint16_t)(r->used - n);
-    return n;
+/* The block holds a chunk's rows, which rows_fill checked. */
+int32_t alfs_log_give(alfs_reader_t *r, void *out, uint32_t cap) {
+    if (!r->open || !r->used)
+        return 0;
+    uint32_t n = r->block[r->pos];
+    if (n > cap)
+        return ALFS_EINVAL;
+    memcpy(out, r->block + r->pos + 1u, n);
+    r->pos = (uint16_t)(r->pos + 1u + n);
+    r->used = (uint16_t)(r->used - 1u - n);
+    return (int32_t)n;
 }
 
-int32_t alfs_log_read(alfs_log_t *lg, alfs_reader_t *r, void *out, uint32_t len) {
-    if (!lg || !lg->d.cfg || !r || !r->open || (len && !out))
+int32_t alfs_log_read(alfs_log_t *lg, alfs_reader_t *r, void *out, uint32_t cap) {
+    if (!lg || !lg->d.cfg || !r || !r->open || !out)
         return ALFS_EINVAL;
     for (uint32_t guard = 0; guard <= lg->d.sectors; guard++) {
-        if (r->used || !len)
-            return (int32_t)alfs_log_give(r, out, len);
+        if (r->used)
+            return alfs_log_give(r, out, cap);
         uint32_t x = r->off, l = 0;
         int rc = scan_chunk(lg, r->sector, r->tag, &x, &l, r->block);
         if (rc < 0)
@@ -631,6 +649,7 @@ void alfs_log_status(const alfs_log_t *lg, alfs_log_status_t *st) {
     st->ready = lg->ready;
     st->dirty = lg->dirty;
     st->bad = lg->nbad;
+    st->row_max = (uint16_t)ALFS_ROW_MAX(page(lg));
     st->writable = (uint32_t)lg->ready * (sector_size(lg) - OFF_DATA - HDR_LEN);
     st->writing = lg->cur;
     st->clean = !lg->dirty;

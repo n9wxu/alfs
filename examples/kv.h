@@ -9,12 +9,16 @@
  *
  * The settings live in RAM, one to a slot the caller gives. Loading reads
  * every row of every log in order: a setting replaces its key's, and a mark
- * keeps only the settings its own log set. A set appends its row and syncs
- * it. The first set after loading, and a set that would leave too little
- * ready room to write every setting again, first starts a new log: a row
- * for every setting, then the mark, synced, and only then are the logs
- * before it erased. So after a power loss at any moment each setting reads
- * as it was, or as the set cut short would make it.
+ * keeps only the settings its own log set. The newest log with a mark, the
+ * base, holds every setting: a log before it holds older ones, and a log
+ * after it, which has no mark, a part of the base's.
+ *
+ * A set appends its row and syncs it. The first set after loading, and a
+ * set that would leave too little ready room to write every setting again,
+ * first starts a new log: it erases every log but the base, writes a row
+ * for every setting, then the mark, synced, and only then erases the base.
+ * So after a power loss at any moment each setting reads as it was, or as
+ * the set cut short would make it.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -39,7 +43,8 @@ typedef struct kv {
     uint8_t *block; /* the writer's, and the reader's while loading */
     uint32_t size;
     alfs_writer_t w;
-    bool whole;     /* the log being written starts with every setting */
+    uint32_t base;  /* the newest log with a mark, or 0 */
+    bool whole;     /* the log being written is the base */
 } kv_t;
 
 /*
