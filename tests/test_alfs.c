@@ -2,19 +2,18 @@
  * alfs's tests, one or more for each requirement of docs/REQUIREMENTS.md.
  * Each is named in the requirement's "Verified by".
  *
- * Every call a test makes goes through CALL, OCALL, KCALL or an erase
- * wrapper,
+ * Every call a test makes goes through CALL, OCALL or an erase wrapper,
  * which hold it to SPD-01 (no erase outside an erase) and record the
- * longest single operation (SPD-06). Every test ends with DONE, which
- * fails it if the simulator saw a violation (a program across a page, a
- * byte programmed twice, or a program into a byte a power loss touched,
- * each but a program that settles, docs/TEST_PLAN.md 2), or if a byte
- * outside the two areas changed. The simulator's seed comes from
- * ALFS_SEED.
+ * longest single operation (SPD-06); the configuration application's own
+ * calls are its own. Every test ends with DONE, which fails it if the
+ * simulator saw a violation (a program across a page, a byte programmed
+ * twice, or a program into a byte a power loss touched, each but a
+ * program that settles, docs/TEST_PLAN.md 2), or if a byte outside the
+ * areas changed. The simulator's seed comes from ALFS_SEED.
  */
-#include "alfs_kv.h"
 #include "alfs_log.h"
 #include "alfs_obj.h"
+#include "kv.h"
 #include "sim.h"
 #include "tf.h"
 
@@ -23,15 +22,18 @@
 
 #define SECTOR 4096u
 #define PAGE 256u
-#define ROW 22u
+#define ROW 22u      /* W-LOG's */
+#define HR_ROW 48u   /* W-HR's */
+#define RUN_ROW 200u /* the rows a run of bytes is written as */
+#define ROW_MAX ALFS_ROW_MAX(PAGE)
 #define BLOCK_MAX 4096u
 #define LSTAMP 18u /* a log sector's stamp, then its claim (docs/SPEC.md 1) */
 #define LDATA 30u  /* its first chunk */
 #define CHUNK 7u   /* a chunk's header */
 #define OBEGUN 16u /* a half's begun mark, then its commit (SPEC 6) */
 #define OCOMMIT 17u
-#define KV_SECTORS 3u /* the configuration store's */
-#define KPAIRS 19u    /* where its pairs start (SPEC 11) */
+#define CFG_SECTORS 3u /* the configuration area's */
+#define KV_SLOTS 12u
 
 /* ---- the rig ---------------------------------------------------------- */
 
@@ -45,17 +47,17 @@ typedef struct {
 typedef struct {
     sim_t sim;
     alfs_driver_t raw, drv;
-    alfs_area_t lcfg, ocfg, kcfg;
-    alfs_log_t lg;
+    alfs_area_t lcfg, ocfg, ccfg;
+    alfs_log_t lg, cg; /* the flight log area, the configuration area */
     alfs_obj_t ob;
-    alfs_kv_t kv;
+    kv_t kv;
+    kv_slot_t slots[KV_SLOTS];
     uint32_t bsize; /* the blocks', a page unless a test says */
-    uint8_t lscratch[PAGE], oscratch[PAGE], kscratch[PAGE];
+    uint8_t lscratch[PAGE], oscratch[PAGE], cscratch[PAGE], kblock[PAGE];
     uint8_t blk[4][BLOCK_MAX];
     uint8_t gap[2][SECTOR]; /* the sectors around the areas, as filled */
     seen_t seen;
     bool oready_was; /* OCALL's: the spare half was ready before the call */
-    uint32_t kseq_was; /* KCALL's: the head's sequence before the call */
 } rig_t;
 
 static int call_bad;           /* calls that broke SPD-01 */
@@ -101,10 +103,10 @@ static void area(alfs_area_t *a, uint32_t start, uint32_t sectors, uint32_t chip
     a->page_size = PAGE;
 }
 
-/* The chip: a gap sector, the configuration store, the object area, the
- * log area, a gap sector. */
+/* The chip: a gap sector, the configuration area, the object area, the
+ * flight log area, a gap sector. */
 static void rig_open(rig_t *r, uint32_t log_sectors, uint32_t obj_sectors) {
-    uint32_t chip = (2u + KV_SECTORS + obj_sectors + log_sectors) * SECTOR;
+    uint32_t chip = (2u + CFG_SECTORS + obj_sectors + log_sectors) * SECTOR;
     memset(r, 0, sizeof(*r));
     sim_init(&r->sim, chip, SECTOR, PAGE, 0xFF, seed);
     sim_fill_random(&r->sim, 0, chip); /* what a used chip holds */
@@ -115,9 +117,9 @@ static void rig_open(rig_t *r, uint32_t log_sectors, uint32_t obj_sectors) {
     r->drv.read = w_read;
     r->drv.prog = w_prog;
     r->drv.erase = w_erase;
-    area(&r->kcfg, SECTOR, KV_SECTORS, chip);
-    area(&r->ocfg, (1u + KV_SECTORS) * SECTOR, obj_sectors, chip);
-    area(&r->lcfg, (1u + KV_SECTORS + obj_sectors) * SECTOR, log_sectors, chip);
+    area(&r->ccfg, SECTOR, CFG_SECTORS, chip);
+    area(&r->ocfg, (1u + CFG_SECTORS) * SECTOR, obj_sectors, chip);
+    area(&r->lcfg, (1u + CFG_SECTORS + obj_sectors) * SECTOR, log_sectors, chip);
     r->bsize = PAGE;
     call_bad = 0;
     call_why[0] = 0;
@@ -160,37 +162,23 @@ static bool spare_ready(rig_t *r) {
     ((int)(begin(r), chk((r), alfs_obj_format(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch), true, "format")))
 #define LMOUNT(r) ((int)CALL((r), alfs_log_mount(&(r)->lg, &(r)->lcfg, &(r)->drv, (r)->lscratch)))
 #define OMOUNT(r) ((int)CALL((r), alfs_obj_mount(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch)))
-#define KMOUNT(r) ((int)CALL((r), alfs_kv_mount(&(r)->kv, &(r)->kcfg, &(r)->drv, (r)->kscratch)))
+#define CMOUNT(r) ((int)CALL((r), alfs_log_mount(&(r)->cg, &(r)->ccfg, &(r)->drv, (r)->cscratch)))
 
-static uint32_t kv_seq(rig_t *r) {
-    alfs_kv_status_t st;
-    alfs_kv_status(&r->kv, &st);
-    return st.seq;
+/* The configuration area mounted and its settings loaded. */
+static int cload(rig_t *r) {
+    memset(&r->cg, 0, sizeof(r->cg));
+    int rc = CMOUNT(r);
+    return rc ? rc : kv_load(&r->kv, &r->cg, r->slots, KV_SLOTS, r->kblock, PAGE);
 }
 
-/* SPD-01, SPD-10: a set or delete erases one sector, and only when the
- * head moves, or was moving when the power went. */
-static int64_t kchk(rig_t *r, int64_t rc, const char *what) {
-    uint64_t erases = r->sim.c_ops - r->sim.c_programs;
-    uint64_t allowed = kv_seq(r) != r->kseq_was || r->sim.off ? 1u : 0u;
-    if (erases > allowed) {
-        call_bad++;
-        snprintf(call_why, sizeof(call_why), "%s: %llu erases", what, (unsigned long long)erases);
-    }
-    return rc;
-}
-
-#define KCALL(r, e) ((r)->kseq_was = kv_seq(r), begin(r), kchk((r), (int64_t)(e), #e))
-
-/* A reboot: every handle gone, both areas mounted again. ALFS_ENOFS from
- * the object area is not an error here. */
+/* A reboot: every handle gone, every area mounted again, the settings
+ * loaded. ALFS_ENOFS from the object area is not an error here. */
 static int remount(rig_t *r) {
     memset(&r->lg, 0, sizeof(r->lg));
     memset(&r->ob, 0, sizeof(r->ob));
-    memset(&r->kv, 0, sizeof(r->kv));
     int rc = LMOUNT(r);
     int ro = OMOUNT(r);
-    int rk = KMOUNT(r);
+    int rk = cload(r);
     return rc ? rc : rk ? rk : ro == ALFS_ENOFS ? 0 : ro;
 }
 
@@ -222,9 +210,10 @@ static int oclean(rig_t *r) {
     return -1;
 }
 
-/* The areas mounted, the log area erased, the object area formatted. */
+/* The areas mounted, the flight log area erased, the settings loaded, the
+ * object area formatted. */
 static int setup(rig_t *r) {
-    if (LMOUNT(r) || lclean(r) < 0 || KMOUNT(r))
+    if (LMOUNT(r) || lclean(r) < 0 || cload(r))
         return -1;
     return OFORMAT(r) ? -1 : 0;
 }
@@ -293,22 +282,23 @@ static int lopen(rig_t *r, alfs_writer_t *w, uint32_t log, uint8_t tag, int b) {
     return (int)CALL(r, alfs_log_open(&r->lg, w, log, tag, r->blk[b], r->bsize));
 }
 
-/* Writes d, adding what alfs took to *taken. 0, or the error. */
-static int put_n(rig_t *r, alfs_writer_t *w, const uint8_t *d, uint32_t n, uint32_t *taken) {
-    while (n) {
-        int32_t k = (int32_t)CALL(r, alfs_log_write(&r->lg, w, d, n));
-        if (k <= 0)
-            return k ? (int)k : -100;
-        d += k;
-        n -= (uint32_t)k;
-        *taken += (uint32_t)k;
+/* Writes d as rows of `row` bytes, the last one shorter, adding the bytes
+ * of the rows alfs took to *taken. 0, or the error. */
+static int put_rows(rig_t *r, alfs_writer_t *w, const uint8_t *d, uint32_t n, uint32_t row, uint32_t *taken) {
+    for (uint32_t i = 0; i < n;) {
+        uint32_t k = n - i < row ? n - i : row;
+        int rc = (int)CALL(r, alfs_log_write(&r->lg, w, d + i, k));
+        if (rc)
+            return rc;
+        i += k;
+        *taken += k;
     }
     return 0;
 }
 
 static int put(rig_t *r, alfs_writer_t *w, const uint8_t *d, uint32_t n) {
     uint32_t taken = 0;
-    return put_n(r, w, d, n, &taken);
+    return put_rows(r, w, d, n, RUN_ROW, &taken);
 }
 
 static int lsync(rig_t *r, alfs_writer_t *w) {
@@ -319,7 +309,8 @@ static int lclose(rig_t *r, alfs_writer_t *w) {
     return (int)CALL(r, alfs_log_close(&r->lg, w));
 }
 
-/* Reads a whole stream. Its length, or an error. */
+/* Reads a whole stream, row after row, end to end. Its length, or an
+ * error. */
 static int32_t slurp(rig_t *r, uint32_t log, uint8_t tag, uint8_t *out, uint32_t cap) {
     alfs_reader_t rd;
     int rc = (int)CALL(r, alfs_log_open_read(&r->lg, &rd, log, tag, r->blk[3], r->bsize));
@@ -328,8 +319,11 @@ static int32_t slurp(rig_t *r, uint32_t log, uint8_t tag, uint8_t *out, uint32_t
     uint32_t n = 0;
     int32_t result = -201;
     for (int guard = 0; guard < 1000000; guard++) {
-        uint32_t want = cap - n < 300 ? cap - n : 300;
-        int32_t k = (int32_t)CALL(r, alfs_log_read(&r->lg, &rd, out + n, want));
+        int32_t k = (int32_t)CALL(r, alfs_log_read(&r->lg, &rd, out + n, cap - n));
+        if (k == ALFS_EINVAL) {
+            result = -200; /* a row past what was ever written */
+            break;
+        }
         if (k <= 0) {
             result = k < 0 ? k : (int32_t)n;
             break;
@@ -400,7 +394,7 @@ static int log_run(rig_t *r, alfs_writer_t *w, run_t *lg, uint32_t rate, uint32_
         }
         if (n) {
             uint32_t taken = 0;
-            int rc = put_n(r, w, lg->exp + lg->len, n * ROW, &taken);
+            int rc = put_rows(r, w, lg->exp + lg->len, n * ROW, ROW, &taken);
             lg->len += taken;
             if (r->sim.off)
                 return 0;
@@ -477,21 +471,27 @@ static bool reads_as(rig_t *r, const char *name, const uint8_t *d, uint32_t n) {
     return m == (int32_t)n && !memcmp(got, d, n);
 }
 
-/* ---- the configuration store ------------------------------------------ */
+/* ---- the configuration application ------------------------------------ */
 
 static int kset(rig_t *r, const char *key, const uint8_t *v, uint32_t n) {
-    return (int)KCALL(r, alfs_kv_set(&r->kv, key, v, n));
+    return kv_set(&r->kv, key, v, n);
 }
 
 static int kdel(rig_t *r, const char *key) {
-    return (int)KCALL(r, alfs_kv_delete(&r->kv, key));
+    return kv_set(&r->kv, key, NULL, 0);
 }
 
 /* A key's value into out: its length, or an error. */
 static int32_t kget(rig_t *r, const char *key, uint8_t *out, uint32_t cap) {
+    const uint8_t *v;
     uint32_t len = 0;
-    int rc = (int)CALL(r, alfs_kv_get(&r->kv, key, out, cap, &len));
-    return rc ? rc : (int32_t)len;
+    int rc = kv_get(&r->kv, key, &v, &len);
+    if (rc)
+        return rc;
+    if (len > cap)
+        return -200;
+    memcpy(out, v, len);
+    return (int32_t)len;
 }
 
 static bool kreads(rig_t *r, const char *key, const uint8_t *v, uint32_t n) {
@@ -642,7 +642,7 @@ static void if_endian(void) {
     CHECK_EQ(setup(&r), 0);
     const uint8_t *st = r.sim.mem + r.lcfg.start;
     CHECK(memcmp(st, "alfl", 4) == 0);
-    CHECK_EQ(st[4], 4);  /* version           */
+    CHECK_EQ(st[4], 5);  /* version           */
     CHECK_EQ(st[5], 12); /* log2(sector size) */
     CHECK_EQ(st[6], 8);  /* log2(page size)   */
     CHECK_EQ(st[7], 0);
@@ -663,11 +663,12 @@ static void if_endian(void) {
     CHECK_EQ(get32le(cl + 4), w.log); /* sequence: a log's first claim's */
     CHECK_EQ(get32le(cl + 8), crc32_ref(cl, 8));
     const uint8_t *ch = sec + LDATA;
-    CHECK_EQ(get16le(ch), 3);
-    CHECK_EQ(ch[2], 5); /* tag */
-    uint8_t body[6] = {ch[0], ch[1], ch[2], 7, 8, 9};
-    CHECK_EQ(get32le(ch + 3), crc32_ref(body, 6));
-    CHECK(memcmp(ch + 7, data, 3) == 0);
+    CHECK_EQ(get16le(ch), 4); /* the row and its length */
+    CHECK_EQ(ch[2], 5);       /* tag */
+    uint8_t body[7] = {ch[0], ch[1], ch[2], 3, 7, 8, 9};
+    CHECK_EQ(get32le(ch + 3), crc32_ref(body, 7));
+    CHECK_EQ(ch[7], 3); /* the row's length */
+    CHECK(memcmp(ch + 8, data, 3) == 0);
 
     uint8_t obj[5] = {1, 2, 3, 4, 5};
     CHECK_EQ(oput(&r, "ab", obj, 5), 0);
@@ -675,7 +676,7 @@ static void if_endian(void) {
     alfs_obj_status(&r.ob, &os);
     const uint8_t *h = r.sim.mem + r.ocfg.start + (os.seq % 2 ? 0 : SECTOR); /* commit 1 in half 0, 2 in 1 */
     CHECK(memcmp(h, "alfo", 4) == 0);
-    CHECK_EQ(h[4], 4);
+    CHECK_EQ(h[4], 5);
     CHECK_EQ(h[5], 12);
     CHECK_EQ(h[6], 8);
     CHECK_EQ(h[7], 0);
@@ -946,11 +947,11 @@ static void if_log_streams(void) {
     CHECK_EQ(lopen(&r, &wa, 0, 1, 0), 0);
     CHECK_EQ(lopen(&r, &wb, wa.log, 2, 1), 0);
     CHECK_EQ(wb.log, wa.log);
-    uint32_t ia = 0, ib = 0;
+    uint32_t ia = 0, ib = 0, taken = 0;
     for (int i = 0; ia < sizeof(a) || ib < sizeof(b); i++) {
-        uint32_t ka = sizeof(a) - ia < 22 ? sizeof(a) - ia : 22, kb = sizeof(b) - ib < 480 ? sizeof(b) - ib : 480;
-        CHECK_EQ(put(&r, &wa, a + ia, ka), 0);
-        CHECK_EQ(put(&r, &wb, b + ib, kb), 0);
+        uint32_t ka = sizeof(a) - ia < 22 ? sizeof(a) - ia : 22, kb = sizeof(b) - ib < 160 ? sizeof(b) - ib : 160;
+        CHECK_EQ(put_rows(&r, &wa, a + ia, ka, 22, &taken), 0);
+        CHECK_EQ(put_rows(&r, &wb, b + ib, kb, 160, &taken), 0);
         ia += ka;
         ib += kb;
         if (i % 7 == 6) {
@@ -1153,30 +1154,29 @@ static void spd_write_burst_bounded(void) {
             CHECK_EQ(setup(&r), 0);
             alfs_writer_t w;
             CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
-            static uint8_t d[480];
-            uint32_t each = kind ? 480 : ROW, every = kind ? 1 : 10; /* writes a 20 ms tick */
+            static uint8_t d[HR_ROW];
+            uint32_t each = kind ? HR_ROW : ROW, full = PAGE - 37 - each; /* the least a full chunk holds */
             for (uint32_t t = 0; t < 1500; t++) {
-                fill(d, each, t);
-                for (uint32_t j = 0; j < every; j++) {
+                for (uint32_t j = 0; j < 10; j++) { /* rows a 20 ms tick */
+                    fill(d, each, t * 10 + j);
                     uint32_t before = w.used;
-                    int32_t k = (int32_t)CALL(&r, alfs_log_write(&r.lg, &w, d, each));
-                    CHECK_EQ(k, (int32_t)each);
-                    uint32_t x = before + each - w.used;
-                    uint64_t bound = (x + PAGE - 38) / (PAGE - 37) + 2 + 1;
+                    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, each)), 0);
+                    uint32_t x = before + 1 + each - w.used;
+                    uint64_t bound = (x + full - 1) / full + 2 + 1;
                     if (r.sim.c_programs > bound)
-                        printf("    write of %u: %llu programs for %u bytes\n", each,
+                        printf("    row of %u: %llu programs for %u bytes\n", each,
                                (unsigned long long)r.sim.c_programs, x);
                     CHECK(r.sim.c_programs <= bound);
                 }
                 if (t % 50 == 49) {
                     uint32_t x = w.used;
                     CHECK_EQ(lsync(&r, &w), 0);
-                    CHECK(r.sim.c_programs <= (x + PAGE - 38) / (PAGE - 37) + 2 + 1);
+                    CHECK(r.sim.c_programs <= (x + full - 1) / full + 2 + 1);
                 }
             }
             uint32_t x = w.used;
             CHECK_EQ(lclose(&r, &w), 0);
-            CHECK(r.sim.c_programs <= (x + PAGE - 38) / (PAGE - 37) + 2 + 1);
+            CHECK(r.sim.c_programs <= (x + full - 1) / full + 2 + 1);
             DONE(&r);
             rig_close(&r);
         }
@@ -1195,9 +1195,10 @@ static void spd_enospc_without_erase(void) {
     CHECK_EQ(lclose(&r, &w), 0);
     CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
     uint32_t taken = 0;
-    int rc = put_n(&r, &w, d, sizeof(d), &taken);
+    int rc = put_rows(&r, &w, d, sizeof(d), RUN_ROW, &taken);
     CHECK_EQ(rc, ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_erases, 0);
+    CHECK(taken < sizeof(d)); /* the refused row not taken */
     CHECK_EQ(lsync(&r, &w), ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_erases, 0);
     CHECK(w.used > 0); /* held in the block */
@@ -1232,9 +1233,9 @@ static void spd_mount_reads_bounded(void) {
     CHECK_EQ(r.sim.c_ops, 0);
     for (int i = 0; i < 100; i++)
         CHECK_EQ(kv_do(&r, kv_step(i, 150)) <= 0, 1);
-    memset(&r.kv, 0, sizeof(r.kv));
-    CHECK_EQ(KMOUNT(&r), 0);
-    CHECK(r.sim.c_bytes_read <= 19u * KV_SECTORS);
+    memset(&r.cg, 0, sizeof(r.cg));
+    CHECK_EQ(CMOUNT(&r), 0);
+    CHECK(r.sim.c_bytes_read <= 30u * CFG_SECTORS);
     CHECK_EQ(r.sim.c_ops, 0);
     DONE(&r);
     rig_close(&r);
@@ -1266,12 +1267,14 @@ static uint64_t hr_reads(uint32_t sectors) {
     }
     alfs_writer_t w;
     lopen(&r, &w, 0, 1, 0);
-    static uint8_t d[480];
+    static uint8_t d[HR_ROW];
     uint64_t total = 0;
-    for (uint32_t t = 0; t < 200; t++) { /* 96 kB: within 32 sectors */
-        fill(d, sizeof(d), t);
-        CALL(&r, alfs_log_write(&r.lg, &w, d, sizeof(d)));
-        total += r.sim.c_bytes_read;
+    for (uint32_t t = 0; t < 200; t++) { /* 98 kB: within 32 sectors */
+        for (uint32_t j = 0; j < 10; j++) {
+            fill(d, sizeof(d), t * 10 + j);
+            CALL(&r, alfs_log_write(&r.lg, &w, d, sizeof(d)));
+            total += r.sim.c_bytes_read;
+        }
         if (t % 50 == 49) {
             lsync(&r, &w);
             total += r.sim.c_bytes_read;
@@ -1340,7 +1343,8 @@ static void spd_read_next_bounded(void) {
  * or `max_ms` passes. 0, or the first error.
  */
 static int ring(rig_t *r, uint32_t every, uint32_t laps, uint64_t max_ms) {
-    uint32_t sectors = r->lcfg.size / SECTOR, per_log = (every * ROW) / (SECTOR - 64) + 2;
+    uint32_t per_sector = SECTOR / PAGE * ((PAGE - CHUNK) / (ROW + 1)) - 1; /* rows, at least */
+    uint32_t sectors = r->lcfg.size / SECTOR, per_log = every / per_sector + 2;
     uint8_t rows[10 * ROW];
     uint32_t seq = 0, in_log = 0;
     alfs_writer_t w;
@@ -1360,7 +1364,8 @@ static int ring(rig_t *r, uint32_t every, uint32_t laps, uint64_t max_ms) {
             continue;
         for (int i = 0; i < 10; i++)
             make_row(seq++, rows + i * ROW);
-        rc = put(r, &w, rows, sizeof(rows));
+        uint32_t taken = 0;
+        rc = put_rows(r, &w, rows, sizeof(rows), ROW, &taken);
         if (rc && rc != ALFS_ENOSPC)
             return rc;
         in_log += 10;
@@ -1418,26 +1423,25 @@ static void life_write_amplification(void) {
         CHECK_EQ(setup(&r), 0);
         alfs_writer_t w;
         CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
-        static uint8_t d[24000];
+        static uint8_t d[HR_ROW];
         uint64_t programmed = 0, bound = 0;
-        uint32_t per_sync = kind == 0 ? 22 : kind == 1 ? 1100 : 24000;
+        uint32_t rows = kind == 0 ? 1 : kind == 1 ? 50 : 500, len = kind == 2 ? HR_ROW : ROW; /* a sync's */
         for (uint32_t s = 0; s < (kind == 2 ? 60u : 600u); s++) { /* W-HR: a minute */
-            fill(d, per_sync, s);
-            uint64_t b0 = r.sim.bytes_programmed;
-            uint32_t before = w.used;
-            int32_t k = (int32_t)CALL(&r, alfs_log_write(&r.lg, &w, d, per_sync));
-            CHECK_EQ(k, (int32_t)per_sync);
-            uint64_t x = before + per_sync - w.used;
-            programmed += r.sim.bytes_programmed - b0;
-            bound += life02_bound(&r, x);
-            b0 = r.sim.bytes_programmed;
-            x = w.used;
+            for (uint32_t i = 0; i < rows; i++) {
+                fill(d, len, s * rows + i);
+                uint64_t b0 = r.sim.bytes_programmed;
+                uint32_t before = w.used;
+                CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, len)), 0);
+                programmed += r.sim.bytes_programmed - b0;
+                bound += life02_bound(&r, before + 1u + len - w.used);
+            }
+            uint64_t b0 = r.sim.bytes_programmed, x = w.used;
             CHECK_EQ(lsync(&r, &w), 0);
             programmed += r.sim.bytes_programmed - b0;
             bound += life02_bound(&r, x);
         }
         if (programmed > bound)
-            printf("    %u a sync: %llu programmed, bound %llu\n", per_sync, (unsigned long long)programmed,
+            printf("    %u rows a sync: %llu programmed, bound %llu\n", rows, (unsigned long long)programmed,
                    (unsigned long long)bound);
         CHECK(programmed <= bound);
         CHECK_EQ(lclose(&r, &w), 0);
@@ -1676,6 +1680,7 @@ static void safe_no_false_data(void) {
             CHECK(n >= 0);
             CHECK(one_cut(got, (uint32_t)n, exp, sizeof(a)));
             CHECK(sizeof(a) - (uint32_t)n <= PAGE); /* a page's chunks at most */
+            CHECK_EQ((sizeof(a) - (uint32_t)n) % 100, 0); /* in whole rows */
         }
         alfs_log_status(&r.lg, &st);
         CHECK(st.n.check_failures - fails0 <= 2);
@@ -1720,6 +1725,16 @@ static void safe_write_only_verified_ready(void) {
     rig_close(&r);
 }
 
+/* got[n] is W-LOG rows end to end, each whole. */
+static bool rows_whole(const uint8_t *got, uint32_t n) {
+    if (n % ROW)
+        return false;
+    for (uint32_t i = 0; i < n; i += ROW)
+        if (get32le(got + i + ROW - 4) != crc32_ref(got + i, ROW - 4))
+            return false;
+    return true;
+}
+
 /* got[n] is exp[len] with runs cut out, as greedy matching finds them. */
 static bool runs_cut(const uint8_t *got, uint32_t n, const uint8_t *exp, uint32_t len) {
     uint32_t j = 0;
@@ -1759,6 +1774,7 @@ static void safe_prog_failure(void) {
         CHECK_EQ((uint32_t)n + st.n.bytes_lost, lg.len);
         CHECK(st.n.prog_failures >= 1);
         CHECK(runs_cut(got, (uint32_t)n, lg.exp, lg.len));
+        CHECK(rows_whole(got, (uint32_t)n));
         free(lg.exp);
         DONE(&r);
         rig_close(&r);
@@ -1899,8 +1915,11 @@ static void safe_foreign_area(void) {
         CHECK_EQ(r.sim.c_ops, 0);
         CHECK_EQ(OMOUNT(&r), ALFS_ENOFS);
         CHECK_EQ(r.sim.c_ops, 0);
-        CHECK_EQ(KMOUNT(&r), 0); /* no store: no pairs */
-        CHECK_EQ(r.sim.c_ops, 0);
+        CHECK_EQ(cload(&r), 0); /* no log: no settings */
+        alfs_log_status(&r.cg, &st);
+        CHECK_EQ(st.ready, 0);
+        CHECK_EQ(st.dirty, CFG_SECTORS);
+        CHECK_EQ(r.sim.ops, 0);
         uint8_t got[8];
         CHECK_EQ(kget(&r, "k0", got, sizeof(got)), ALFS_ENOENT);
         DONE(&r);
@@ -1925,7 +1944,7 @@ static void plant(rig_t *r, uint32_t addr, bool log) {
         h[i] = (uint8_t)sim_rand(&r->sim);
     if (log) {
         memcpy(h, "alfl", 4);
-        h[4] = 4;
+        h[4] = 5;
         h[5] = 12;
         h[6] = 8;
         h[7] = 0;
@@ -1939,7 +1958,7 @@ static void plant(rig_t *r, uint32_t addr, bool log) {
         }
     } else {
         memcpy(h, "alfo", 4);
-        h[4] = 4;
+        h[4] = 5;
         h[5] = 12;
         h[6] = 8;
         h[7] = 0;
@@ -2010,13 +2029,15 @@ static void safe_fuzz(void) {
                     if (alfs_log_open_read(&r.lg, &rd, in.log, t, r.blk[3], r.bsize) == 0) {
                         for (int j = 0; j < 400 && alfs_log_read(&r.lg, &rd, got, 300) > 0; j++)
                             ;
+                        alfs_log_read(&r.lg, &rd, got, 1); /* a row it cannot hold */
                         alfs_log_close_read(&r.lg, &rd);
                     }
                 }
             }
             alfs_writer_t w;
             if (alfs_log_open(&r.lg, &w, 0, 1, r.blk[0], r.bsize) == 0) {
-                alfs_log_write(&r.lg, &w, d, 2000);
+                for (uint32_t i = 0; i < 2000; i += 100)
+                    alfs_log_write(&r.lg, &w, d + i, 100);
                 alfs_log_close(&r.lg, &w);
             }
             alfs_log_erase(&r.lg, after, 4);
@@ -2039,16 +2060,6 @@ static void safe_fuzz(void) {
                 alfs_obj_commit(&r.ob, &p);
             }
             alfs_obj_delete(&r.ob, "a");
-        }
-        memset(&r.kv, 0, sizeof(r.kv));
-        if (alfs_kv_mount(&r.kv, &r.kcfg, &r.drv, r.kscratch) == 0) {
-            alfs_kv_iter_t it = {0, 0};
-            char key[ALFS_KEY_MAX + 1];
-            uint32_t len;
-            for (int i = 0; i < 400 && alfs_kv_next(&r.kv, &it, key, got, sizeof(got), &len) == 0; i++)
-                alfs_kv_get(&r.kv, key, got, sizeof(got), &len);
-            for (int i = 0; i < 30; i++)
-                alfs_kv_set(&r.kv, i % 2 ? "k1" : "k2", d, 1u + (uint32_t)i * 7u);
         }
         CHECK(gaps_kept(&r));
         rig_close(&r);
@@ -2261,214 +2272,181 @@ static void safe_obj_check(void) {
     }
 }
 
-/* ---- the configuration store's tests -------------------------------------- */
+/* ---- rows ------------------------------------------------------------- */
 
-static void if_kv_keys(void) {
+static void if_rows(void) {
     rig_t r;
-    rig_open(&r, 4, 2);
+    rig_open(&r, 16, 2);
     CHECK_EQ(setup(&r), 0);
-    static const char *const good[] = {"a", "0123456789012345678901234567890", "pins/arm.delay"};
-    uint8_t v[PAGE];
-    for (int i = 0; i < 3; i++) {
-        fill(v, 10, (uint32_t)i);
-        CHECK_EQ(kset(&r, good[i], v, 10), 0);
+    alfs_log_status_t st;
+    alfs_log_status(&r.lg, &st);
+    CHECK_EQ(st.row_max, ROW_MAX);
+    uint8_t d[256], got[256];
+    fill(d, ROW_MAX + 1, 1);
+    alfs_writer_t w;
+    CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
+    uint32_t edges = w.log;
+    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, 1)), 0);
+    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, ROW_MAX)), 0);
+    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, 0)), ALFS_EINVAL);
+    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, ROW_MAX + 1)), ALFS_EINVAL);
+    CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, NULL, 1)), ALFS_EINVAL);
+    CHECK_EQ(r.sim.c_ops, 0);
+    CHECK_EQ(lclose(&r, &w), 0);
+    CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
+    uint32_t every = w.log;
+    for (uint32_t len = 1; len <= ROW_MAX; len++) {
+        fill(d, len, len);
+        CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d, len)), 0);
     }
+    CHECK_EQ(lclose(&r, &w), 0);
+    uint8_t e[256];
+    fill(e, ROW_MAX, 1);
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < 3; i++) {
-            fill(v, 10, (uint32_t)i);
-            CHECK(kreads(&r, good[i], v, 10));
+        alfs_reader_t rd;
+        CHECK_EQ(CALL(&r, alfs_log_open_read(&r.lg, &rd, edges, 1, r.blk[3], r.bsize)), 0);
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, 0)), ALFS_EINVAL); /* consumes nothing */
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, 1)), 1);
+        CHECK_EQ(got[0], e[0]);
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, ROW_MAX - 1)), ALFS_EINVAL);
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, ROW_MAX)), (int32_t)ROW_MAX);
+        CHECK(memcmp(got, e, ROW_MAX) == 0);
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, sizeof(got))), 0);
+        CHECK_EQ(CALL(&r, alfs_log_close_read(&r.lg, &rd)), 0);
+        CHECK_EQ(CALL(&r, alfs_log_open_read(&r.lg, &rd, every, 1, r.blk[3], r.bsize)), 0);
+        for (uint32_t len = 1; len <= ROW_MAX; len++) {
+            fill(d, len, len);
+            int32_t n = (int32_t)CALL(&r, alfs_log_read(&r.lg, &rd, got, sizeof(got)));
+            if (n != (int32_t)len)
+                printf("    row %u read as %d bytes\n", len, n);
+            CHECK(n == (int32_t)len && !memcmp(got, d, len));
         }
+        CHECK_EQ(CALL(&r, alfs_log_read(&r.lg, &rd, got, sizeof(got))), 0);
+        CHECK_EQ(CALL(&r, alfs_log_close_read(&r.lg, &rd)), 0);
         CHECK_EQ(remount(&r), 0);
     }
-    static const char *const bad[] = {"", "01234567890123456789012345678901"};
-    for (int i = 0; i < 2; i++) {
-        CHECK_EQ(kset(&r, bad[i], v, 1), ALFS_EINVAL);
-        CHECK_EQ(r.sim.c_ops, 0);
-    }
-    CHECK_EQ(kset(&r, NULL, v, 1), ALFS_EINVAL);
-    uint8_t got[PAGE];
-    CHECK_EQ(kget(&r, "pins", got, sizeof(got)), ALFS_ENOENT); /* a prefix is not the key */
-    fill(v, PAGE, 9);
-    CHECK_EQ(kset(&r, "a", v, PAGE - 8 - 1), 0); /* the longest a page holds */
-    CHECK(kreads(&r, "a", v, PAGE - 8 - 1));
-    CHECK_EQ(kset(&r, "a", v, PAGE - 8), ALFS_EINVAL);
-    CHECK_EQ(r.sim.c_ops, 0);
-    uint32_t len = 0;
-    CHECK_EQ(CALL(&r, alfs_kv_get(&r.kv, "a", got, 10, &len)), ALFS_EINVAL); /* too small */
-    CHECK_EQ(len, PAGE - 8 - 1);
-    CHECK_EQ(kset(&r, "a", v, 0), 0); /* an empty value deletes */
-    CHECK_EQ(kget(&r, "a", got, sizeof(got)), ALFS_ENOENT);
-    CHECK_EQ(kdel(&r, "a"), ALFS_ENOENT);
-    CHECK_EQ(r.sim.c_ops, 0);
-    CHECK_EQ(kdel(&r, good[2]), 0);
-    CHECK_EQ(remount(&r), 0);
-    CHECK_EQ(kget(&r, good[2], got, sizeof(got)), ALFS_ENOENT);
-    fill(v, 10, 1);
-    CHECK(kreads(&r, good[1], v, 10));
     DONE(&r);
     rig_close(&r);
 }
 
-/* One listing, applied in order to a cache (IF-15), checked against st.
- * The current pairs, or -1. */
-static int kv_list_matches(rig_t *r, const kv_state_t *st) {
-    alfs_kv_iter_t it = {0, 0};
-    char key[ALFS_KEY_MAX + 1];
-    uint8_t v[PAGE], want[PAGE], cache[10][PAGE];
-    uint32_t clen[10] = {0};
-    bool have[10] = {false};
-    for (;;) {
-        uint32_t len = 0;
-        int rc = (int)CALL(r, alfs_kv_next(&r->kv, &it, key, v, sizeof(v), &len));
-        if (rc == ALFS_ENOENT)
-            break;
-        if (rc || key[0] != 'k' || key[2] || key[1] < '0' || key[1] > '9')
-            return -1;
-        int i = key[1] - '0';
-        have[i] = len != 0;
-        clen[i] = len;
-        memcpy(cache[i], v, len);
+/* A chunk with a valid check whose row lengths do not fill it, three ways:
+ * a length past the payload, a length one short, a length of 0. */
+static void safe_rows_whole(void) {
+    for (int kind = 0; kind < 3; kind++) {
+        rig_t r;
+        rig_open(&r, 8, 2);
+        CHECK_EQ(setup(&r), 0);
+        uint8_t d[40][30], got[40 * 30];
+        alfs_writer_t w;
+        CHECK_EQ(lopen(&r, &w, 0, 1, 0), 0);
+        for (uint32_t i = 0; i < 40; i++) {
+            fill(d[i], 30, i);
+            CHECK_EQ(CALL(&r, alfs_log_write(&r.lg, &w, d[i], 30)), 0);
+        }
+        CHECK_EQ(lclose(&r, &w), 0);
+        int32_t k = -1;
+        CHECK_EQ(claims_of(&r, w.log, &k), 1);
+        uint8_t *ch = r.sim.mem + r.lcfg.start + (uint32_t)k * SECTOR + LDATA, *pay = ch + CHUNK;
+        uint32_t len = get16le(ch), rows = len / 31; /* the first chunk's rows */
+        CHECK(len % 31 == 0 && rows >= 2);
+        if (kind == 0)
+            pay[0] = 200;
+        else if (kind == 1)
+            pay[len - 31] = 29;
+        else
+            pay[31] = 0;
+        uint8_t body[PAGE];
+        memcpy(body, ch, 3);
+        memcpy(body + 3, pay, len);
+        uint32_t c = crc32_ref(body, 3 + len);
+        memcpy(ch + 3, &c, 4); /* the check passes */
+        alfs_log_status_t st;
+        alfs_log_status(&r.lg, &st);
+        uint32_t fails = st.n.check_failures;
+        int32_t n = slurp(&r, w.log, 1, got, sizeof(got));
+        CHECK_EQ(n, (int32_t)((40 - rows) * 30)); /* the rest of the page holds no chunk */
+        for (uint32_t i = rows; n > 0 && i < 40; i++)
+            CHECK(memcmp(got + (i - rows) * 30, d[i], 30) == 0);
+        alfs_log_status(&r.lg, &st);
+        CHECK_EQ(st.n.check_failures, fails + 1);
+        DONE(&r);
+        rig_close(&r);
     }
-    int n = 0;
-    for (int i = 0; i < 10; i++) {
-        fill(want, st->len[i], st->gen[i]);
-        if (have[i] != st->present[i] || (have[i] && (clen[i] != st->len[i] || memcmp(cache[i], want, clen[i]))))
-            return -1;
-        n += have[i];
-    }
-    return n;
 }
 
-static void if_kv_list(void) {
+/* ---- the configuration application ------------------------------------ */
+
+/* The configuration area's least and greatest erase counts. */
+static void cfg_wear(const rig_t *r, uint32_t *lo, uint32_t *hi) {
+    *lo = UINT32_MAX;
+    *hi = 0;
+    for (uint32_t k = 0; k < CFG_SECTORS; k++) {
+        uint32_t wv = r->sim.wear[r->ccfg.start / SECTOR + k];
+        *lo = wv < *lo ? wv : *lo;
+        *hi = wv > *hi ? wv : *hi;
+    }
+}
+
+static void cfg_round_trip(void) {
     rig_t r;
     rig_open(&r, 4, 2);
     CHECK_EQ(setup(&r), 0);
     kv_state_t st;
     memset(&st, 0, sizeof(st));
-    for (int i = 0; i < 40; i++) {
-        kv_op_t op = kv_step(i, 60);
+    for (int i = 0; i < 300; i++) {
+        kv_op_t op = kv_step(i, 150);
+        bool had = st.present[op.key[1] - '0'];
         int rc = kv_do(&r, op);
-        CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len));
+        CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len && !had));
         kv_apply(&st, op);
+        if (i % 37 == 36)
+            CHECK_EQ(remount(&r), 0);
+        for (int j = 0; j < 10; j++)
+            CHECK(kv_reads(&r, &st, j));
     }
-    for (int pass = 0; pass < 2; pass++) {
-        CHECK(kv_list_matches(&r, &st) > 0);
-        CHECK_EQ(remount(&r), 0);
-    }
-    alfs_kv_iter_t it = {0, 0};
-    char key[ALFS_KEY_MAX + 1];
-    uint8_t v[PAGE];
-    uint32_t len;
-    CHECK_EQ(CALL(&r, alfs_kv_next(&r.kv, &it, key, v, sizeof(v), &len)), 0);
-    CHECK_EQ(kset(&r, "k1", v, 5), 0);
-    CHECK_EQ(CALL(&r, alfs_kv_next(&r.kv, &it, key, v, sizeof(v), &len)), ALFS_EINVAL);
+    uint8_t v[256];
+    fill(v, sizeof(v), 3);
+    uint64_t p0 = r.sim.programs;
+    CHECK_EQ(kdel(&r, "absent"), ALFS_ENOENT);
+    CHECK_EQ(kset(&r, "", v, 1), ALFS_EINVAL);
+    CHECK_EQ(kset(&r, NULL, v, 1), ALFS_EINVAL);
+    CHECK_EQ(kset(&r, "01234567890123456789012345678901", v, 1), ALFS_EINVAL); /* 32 bytes */
+    CHECK_EQ(kset(&r, "a", v, ROW_MAX - 1), ALFS_EINVAL);                       /* a row of R + 1 */
+    CHECK_EQ(r.sim.programs, p0);
+    CHECK_EQ(kset(&r, "a", v, ROW_MAX - 2), 0); /* a row of R */
+    CHECK_EQ(kset(&r, "0123456789012345678901234567890", v, 10), 0);
+    CHECK_EQ(remount(&r), 0);
+    CHECK(kreads(&r, "a", v, ROW_MAX - 2));
+    CHECK(kreads(&r, "0123456789012345678901234567890", v, 10));
+    for (int j = 0; j < 10; j++)
+        CHECK(kv_reads(&r, &st, j));
+    uint32_t lo, hi;
+    cfg_wear(&r, &lo, &hi);
+    CHECK(lo >= 3); /* the ring has turned */
     DONE(&r);
     rig_close(&r);
 }
 
-static void if_kv_full(void) {
+static void life_cfg_wear(void) {
     rig_t r;
     rig_open(&r, 4, 2);
     CHECK_EQ(setup(&r), 0);
-    uint8_t v[200];
-    int i = 0, rc = 0;
-    for (; i < 100; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "f%d", i);
-        fill(v, sizeof(v), (uint32_t)i);
-        if ((rc = kset(&r, key, v, sizeof(v))) != 0)
-            break;
-    }
-    CHECK_EQ(rc, ALFS_ENOSPC);
-    CHECK(i >= 10);
-    for (int pass = 0; pass < 2; pass++) {
-        for (int j = 0; j < i; j++) {
-            char key[16];
-            snprintf(key, sizeof(key), "f%d", j);
-            fill(v, sizeof(v), (uint32_t)j);
-            CHECK(kreads(&r, key, v, sizeof(v)));
-        }
-        uint8_t got[PAGE];
-        char key[16];
-        snprintf(key, sizeof(key), "f%d", i);
-        CHECK_EQ(kget(&r, key, got, sizeof(got)), ALFS_ENOENT);
-        CHECK_EQ(remount(&r), 0);
-    }
-    DONE(&r);
-    rig_close(&r);
-}
-
-static void spd_kv_set_bounded(void) {
-    rig_t r;
-    rig_open(&r, 4, 2);
-    CHECK_EQ(setup(&r), 0);
-    kv_state_t st;
-    memset(&st, 0, sizeof(st));
-    int moves = 0;
-    for (int i = 0; i < 400; i++) {
+    uint32_t lo = 0, hi = 0;
+    for (int i = 0; i < 100000 && lo < 10; i++) {
         if (i % 50 == 49)
             CHECK_EQ(remount(&r), 0);
-        kv_op_t op = kv_step(i, 150);
-        bool first = i % 50 == 49, existed = st.present[op.key[1] - '0'];
-        uint32_t seq = kv_seq(&r);
-        int rc = kv_do(&r, op);
-        CHECK_EQ(rc, 0);
-        if (!op.len && !existed) { /* deleted already: nothing to write */
-            CHECK_EQ(r.sim.c_ops, 0);
-            continue;
-        }
-        kv_apply(&st, op);
-        if (first) /* the first set in a mount moves the head */
-            CHECK(kv_seq(&r) != seq);
-        if (kv_seq(&r) != seq) {
-            moves++;
-            CHECK_EQ(r.sim.c_erases, 1);
-        } else {
-            /* a key set after a delete also zeroes the delete's pair */
-            uint64_t want = 1u + (existed ? 1u : 0u);
-            if (!existed && r.sim.c_programs == want + 1u)
-                want++;
-            if (r.sim.c_programs != want)
-                printf("    set %d: %llu programs, want %llu\n", i, (unsigned long long)r.sim.c_programs,
-                       (unsigned long long)want);
-            CHECK_EQ(r.sim.c_programs, want);
-            CHECK_EQ(r.sim.c_erases, 0);
-        }
-    }
-    CHECK(moves >= 4);
-    for (int i = 0; i < 10; i++)
-        CHECK(kv_reads(&r, &st, i));
-    DONE(&r);
-    rig_close(&r);
-}
-
-static void life_kv_round_robin(void) {
-    rig_t r;
-    rig_open(&r, 4, 2);
-    CHECK_EQ(setup(&r), 0);
-    uint32_t base = r.kcfg.start / SECTOR;
-    for (int i = 0; i < 100000; i++) {
-        uint32_t lo = UINT32_MAX;
-        for (uint32_t k = 0; k < KV_SECTORS; k++)
-            lo = r.sim.wear[base + k] < lo ? r.sim.wear[base + k] : lo;
-        if (lo >= 10)
-            break;
         CHECK_EQ(kv_do(&r, kv_step(i % 8, 150)), 0); /* no deletes */
+        cfg_wear(&r, &lo, &hi);
     }
-    uint32_t lo = UINT32_MAX, hi = 0;
-    for (uint32_t k = 0; k < KV_SECTORS; k++) {
-        lo = r.sim.wear[base + k] < lo ? r.sim.wear[base + k] : lo;
-        hi = r.sim.wear[base + k] > hi ? r.sim.wear[base + k] : hi;
-    }
+    if (hi - lo > 2)
+        printf("    wear %u to %u\n", lo, hi);
     CHECK(lo >= 10);
-    CHECK(hi - lo <= 1);
+    CHECK(hi - lo <= 2);
     DONE(&r);
     rig_close(&r);
 }
 
-/* Key i, read once: 1 when it reads as `a` has it, 2 when as `b`, 0 when
- * as neither. A bit a power loss left reading either way can change what
- * each read returns, so one read is matched against both. */
+/* Key i: 1 when it reads as `a` has it, 2 when as `b`, 0 when as neither. */
 static int kv_match(rig_t *r, const kv_state_t *a, const kv_state_t *b, int i) {
     char key[4] = {'k', (char)('0' + i), 0};
     uint8_t got[PAGE], want[PAGE];
@@ -2490,7 +2468,7 @@ static bool kv_whole(rig_t *r, const kv_state_t *done, const kv_state_t *next) {
     return true;
 }
 
-static void safe_kv_atomic(void) {
+static void safe_cfg_atomic(void) {
     for (int pl = 0; pl < PL_COUNT; pl++)
         for (int64_t k = 0;; k++) {
             rig_t r;
@@ -2509,7 +2487,7 @@ static void safe_kv_atomic(void) {
                     break;
                 CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len));
                 done = next;
-                if (i == 30 && (remount(&r) || r.sim.off)) /* a mount in the middle */
+                if (i == 30 && (remount(&r) || r.sim.off)) /* a reload in the middle */
                     break;
             }
             bool past = !r.sim.off;
@@ -2521,25 +2499,21 @@ static void safe_kv_atomic(void) {
             for (int m = 0; m < 8; m++) {
                 CHECK_EQ(remount(&r), 0);
                 if (!kv_whole(&r, &done, &next))
-                    printf("    pl %d k %lld, step %d, remount %d: a key reads wrong\n", pl, (long long)k, i, m);
+                    printf("    pl %d k %lld, step %d, reload %d: a key reads wrong\n", pl, (long long)k, i, m);
                 CHECK(kv_whole(&r, &done, &next));
             }
-            /* A set moves the head, which settles each key as its copy read
-             * it; then every remount reads the same. */
+            /* A set starts a new log from the settings as this load read
+             * them; then every reload reads the same. */
             kv_op_t op = {"k0", 99, 999};
-            CHECK_EQ(kv_do(&r, op), 0);
-            kv_apply(&done, op);
-            kv_apply(&next, op);
             kv_state_t now = done;
-            for (int j = 0; j < 10; j++) {
-                int w = kv_match(&r, &done, &next, j);
-                CHECK(w > 0);
-                if (w == 2) {
+            for (int j = 0; j < 10; j++)
+                if (kv_match(&r, &done, &next, j) == 2) {
                     now.present[j] = next.present[j];
                     now.len[j] = next.len[j];
                     now.gen[j] = next.gen[j];
                 }
-            }
+            CHECK_EQ(kv_do(&r, op), 0);
+            kv_apply(&now, op);
             for (int m = 0; m < 8; m++) {
                 CHECK_EQ(remount(&r), 0);
                 for (int j = 0; j < 10; j++)
@@ -2556,38 +2530,6 @@ static void safe_kv_atomic(void) {
         }
 }
 
-static void safe_kv_check(void) {
-    for (int trial = 0; trial < 120; trial++) {
-        rig_t r;
-        rig_open(&r, 4, 2);
-        CHECK_EQ(setup(&r), 0);
-        /* Three pairs of 120 bytes: one a page, each from a page start. */
-        static const char *const keys[] = {"one", "two", "six"};
-        uint8_t v[3][120];
-        for (int i = 0; i < 3; i++) {
-            fill(v[i], sizeof(v[i]), (uint32_t)(trial * 3 + i));
-            CHECK_EQ(kset(&r, keys[i], v[i], sizeof(v[i])), 0);
-        }
-        alfs_kv_status_t ks;
-        alfs_kv_status(&r.kv, &ks);
-        int hit = trial % 3;
-        uint32_t pair = r.kcfg.start + ks.head * SECTOR + (hit ? (uint32_t)hit * PAGE : KPAIRS);
-        uint32_t len = 8 + 3 + 120, at = 1 + sim_rand(&r.sim) % (len - 1); /* not the live mark */
-        sim_flip(&r.sim, pair + at, (uint8_t)(1u << (sim_rand(&r.sim) % 8)));
-        CHECK_EQ(remount(&r), 0);
-        uint8_t got[PAGE];
-        for (int i = 0; i < 3; i++) {
-            int32_t n = kget(&r, keys[i], got, sizeof(got));
-            if (i == hit)
-                CHECK_EQ(n, ALFS_ENOENT);
-            else
-                CHECK(n == 120 && !memcmp(got, v[i], 120));
-        }
-        DONE(&r);
-        rig_close(&r);
-    }
-}
-
 /* ---- OBS -------------------------------------------------------------- */
 
 static void obs_status(void) {
@@ -2601,6 +2543,7 @@ static void obs_status(void) {
     CHECK_EQ(st.dirty, 0);
     CHECK_EQ(st.n.erases, 32);
     CHECK_EQ(st.writable, 32 * (SECTOR - LDATA - CHUNK));
+    CHECK_EQ(st.row_max, PAGE - 38);
     uint64_t p0 = r.sim.programs;
     run_t lg;
     run_init(&lg, 1 << 18);
@@ -2631,18 +2574,6 @@ static void obs_status(void) {
     CHECK_EQ(os.seq, 2);
     alfs_log_status(&r.lg, &st);
     CHECK_EQ(st.writing, 0);
-    alfs_kv_status_t ks;
-    alfs_kv_status(&r.kv, &ks);
-    CHECK_EQ(ks.sectors, KV_SECTORS);
-    CHECK_EQ(ks.head, ALFS_KV_NO_HEAD);
-    CHECK_EQ(ks.seq, 0);
-    uint64_t kp = r.sim.programs;
-    CHECK_EQ(kset(&r, "k", c, 10), 0);
-    alfs_kv_status(&r.kv, &ks);
-    CHECK_EQ(ks.head, 0);
-    CHECK(ks.seq >= 1);
-    CHECK_EQ(ks.n.erases, 1);
-    CHECK_EQ(ks.n.programs, r.sim.programs - kp);
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
@@ -2689,7 +2620,6 @@ static void simp_ram(void) {
     CHECK(sizeof(alfs_reader_t) <= 32 + wide);
     CHECK(sizeof(alfs_put_t) <= 16);
     CHECK(sizeof(alfs_get_t) <= 16);
-    CHECK(sizeof(alfs_kv_t) <= 96 + 3 * wide);
 }
 
 int main(int argc, char **argv) {
@@ -2732,13 +2662,11 @@ int main(int argc, char **argv) {
         {"safe_log_erase", safe_log_erase},
         {"safe_put_atomic", safe_put_atomic},
         {"safe_obj_check", safe_obj_check},
-        {"if_kv_keys", if_kv_keys},
-        {"if_kv_list", if_kv_list},
-        {"if_kv_full", if_kv_full},
-        {"spd_kv_set_bounded", spd_kv_set_bounded},
-        {"life_kv_round_robin", life_kv_round_robin},
-        {"safe_kv_atomic", safe_kv_atomic},
-        {"safe_kv_check", safe_kv_check},
+        {"if_rows", if_rows},
+        {"safe_rows_whole", safe_rows_whole},
+        {"cfg_round_trip", cfg_round_trip},
+        {"life_cfg_wear", life_cfg_wear},
+        {"safe_cfg_atomic", safe_cfg_atomic},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},

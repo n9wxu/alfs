@@ -26,7 +26,7 @@ for path in sys.argv[1:]:
 @functools.lru_cache(None)
 def depth(n):
     return size.get(n, 0) + max([depth(t) for t in calls.get(n, []) if t != n] or [0])
-worst = sorted(((depth(n), n) for n in size if n.startswith(("alfs_kv_", "alfs_log_", "alfs_obj_"))), reverse=True)
+worst = sorted(((depth(n), n) for n in size if n.startswith(("alfs_log_", "alfs_obj_"))), reverse=True)
 for d, n in worst[:5]:
     print(f"stack {d:4d}  {n}")
 if worst[0][0] > 384:

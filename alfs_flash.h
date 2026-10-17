@@ -10,7 +10,7 @@
 
 #include "alfs.h"
 
-#define ALFS_VERSION 4u
+#define ALFS_VERSION 5u
 #define ALFS_ERASED 0xFFu
 #define ALFS_PIECE 16u /* the most read onto the stack at once */
 #define ALFS_NONE 0xFFFFu

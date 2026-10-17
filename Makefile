@@ -10,19 +10,19 @@ CC ?= cc
 ARMCC ?= arm-none-eabi-gcc
 ARMSIZE ?= arm-none-eabi-size
 WARN = -std=c99 -Wall -Wextra -Werror -pedantic
-CFLAGS = $(WARN) -O1 -g -I. -Itests
+CFLAGS = $(WARN) -O1 -g -I. -Itests -Iexamples
 SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 PICO_SDK_PATH ?= $(HOME)/.pico-sdk/sdk/2.2.0
 PICO_TOOLCHAIN_PATH ?= $(HOME)/.pico-sdk/toolchain/14_2_Rel1
 
-# The stores: what they share, the configuration store, the object area,
-# the log area.
-STORES = alfs_flash.c alfs_kv.c alfs_obj.c alfs_log.c
-STORE_H = alfs.h alfs_flash.h alfs_kv.h alfs_obj.h alfs_log.h
-TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
-TEST_H = tests/sim.h tests/tf.h
-STORE_BUDGET = 8960
-RT_BUDGET = 2176
+# The stores: what they share, the object area, a log area. The
+# configuration application (examples/kv.c) is the suite's, not alfs's.
+STORES = alfs_flash.c alfs_obj.c alfs_log.c
+STORE_H = alfs.h alfs_flash.h alfs_obj.h alfs_log.h
+TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c examples/kv.c
+TEST_H = tests/sim.h tests/tf.h examples/kv.h
+STORE_BUDGET = 6784
+RT_BUDGET = 1920
 
 all: test
 
@@ -49,7 +49,7 @@ test: build/test_alfs
 	$(call run_seeds,./build/test_alfs,$(SEEDS))
 
 build/test_alfs_fast: $(STORES) $(STORE_H) $(TEST_SRC) $(TEST_H) | build
-	$(CC) $(WARN) -O2 -I. -Itests -o $@ $(STORES) $(TEST_SRC)
+	$(CC) $(WARN) -O2 -I. -Itests -Iexamples -o $@ $(STORES) $(TEST_SRC)
 
 soak: build/test_alfs_fast
 	$(call run_seeds,./build/test_alfs_fast,$(shell seq 1 100))
@@ -59,6 +59,7 @@ tests-compile: | build
 	$(CC) $(CFLAGS) -c tests/test_alfs.c -o build/test_alfs.o
 	$(CC) $(CFLAGS) -c tests/sim.c -o build/sim.o
 	$(CC) $(CFLAGS) -c tests/tf.c -o build/tf.o
+	$(CC) $(CFLAGS) -c examples/kv.c -o build/kv.o
 
 STORE_M0 = $(STORES:%.c=build/%_m0.o)
 

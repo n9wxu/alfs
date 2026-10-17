@@ -1,15 +1,21 @@
 /*
- * alfs_log: the log area. Logs are appended at one place that moves
+ * alfs_log: a log area. Logs of rows are appended at one place that moves
  * forward around a ring of sectors, each sector erased ahead of time:
  * nothing erases unless the caller asks (alfs_log_erase).
  *
- * A log is one flight. It holds a stream for each tag its writers use, so
- * a flight log and a high-rate log written by two tasks are two streams of
- * one log. Logs are numbered as they start; numbers grow and are never
- * used again. After a mount, writing starts a new log.
+ * A row is what one write takes and one read returns, whole: 1 to
+ * ALFS_ROW_MAX(page) bytes, which alfs gives no meaning. An application
+ * may have several log areas, as one for its configuration and one for its
+ * flights; examples/kv.h keeps settings as rows.
  *
- * A writer brings a block of RAM: a write fills it and, when it is full,
- * programs it in chunks that fill their pages. A sync programs the rest. A
+ * A log holds a stream for each tag its writers use, so a flight log and a
+ * high-rate log written by two tasks are two streams of one log. Logs are
+ * numbered as they start; numbers grow and are never used again. After a
+ * mount, writing starts a new log.
+ *
+ * A writer brings a block of RAM that gathers its rows. When a row does
+ * not fit, the block's rows are programmed in chunks of whole rows, each
+ * filling its page as far as whole rows do. A sync programs the rest. A
  * reader's block holds the chunk being read.
  *
  * SPDX-License-Identifier: MIT
@@ -18,6 +24,10 @@
 #define ALFS_LOG_H
 
 #include "alfs.h"
+
+/* The longest row: it and its length fit after a sector's header and a
+ * chunk's (docs/SPEC.md 1.3). */
+#define ALFS_ROW_MAX(page) ((page) - 38u < 255u ? (page) - 38u : 255u)
 
 /* An instance. Opaque. */
 typedef struct alfs_log {
@@ -39,7 +49,7 @@ typedef struct alfs_writer {
     uint8_t *block;
     uint32_t log;
     uint16_t cap, used;
-    uint8_t tag, open;
+    uint8_t tag, open, max;
 } alfs_writer_t;
 
 /* A reader of one stream. Opaque. */
@@ -58,7 +68,8 @@ typedef struct alfs_log_info {
 
 typedef struct alfs_log_status {
     uint16_t sectors, ready, dirty, bad;
-    uint32_t writable; /* bytes that fit in ready sectors, about */
+    uint16_t row_max;  /* ALFS_ROW_MAX of the area's page */
+    uint32_t writable; /* bytes of rows that fit in ready sectors, about */
     uint32_t writing;  /* the log being written, or 0 */
     bool clean;        /* no dirty sector left */
     alfs_counters_t n;
@@ -92,37 +103,38 @@ int alfs_log_erase(alfs_log_t *lg, uint32_t log, uint32_t steps);
 int alfs_log_open(alfs_log_t *lg, alfs_writer_t *w, uint32_t log, uint8_t tag, uint8_t *block, uint32_t size);
 
 /*
- * Writes len bytes: copies them into the block and, each time it fills,
- * programs all of it but less than a page's room. Returns when every byte
- * is in flash or in the block: len, or fewer when no sector was ready, after
- * which the next call returns ALFS_ENOSPC. A program that fails drops its
- * bytes, counted in bytes_lost, and the log goes on. ALFS_EINVAL,
- * ALFS_ENOSPC, ALFS_EIO: nothing taken.
+ * Writes one row of len bytes, 1 to ALFS_ROW_MAX(page), into the block.
+ * When it does not fit, first programs the block's rows: the chunks they
+ * fill, then, if the row still does not fit, the rest. A program that
+ * fails drops its rows, their bytes counted in bytes_lost, and the log goes
+ * on. ALFS_OK: the row is in the block. ALFS_EINVAL; ALFS_ENOSPC (no ready
+ * sector: the block keeps its rows) and ALFS_EIO: the row is not taken.
  */
-int32_t alfs_log_write(alfs_log_t *lg, alfs_writer_t *w, const void *data, uint32_t len);
+int alfs_log_write(alfs_log_t *lg, alfs_writer_t *w, const void *row, uint32_t len);
 
-/* Makes every byte written so far durable. ALFS_OK, or an error as
- * alfs_log_write's. */
+/* Makes every row written so far durable. ALFS_OK, ALFS_ENOSPC (the block
+ * keeps its rows) or ALFS_EIO. */
 int alfs_log_sync(alfs_log_t *lg, alfs_writer_t *w);
 
 /* Syncs and releases the writer. When the sync fails it stays open, its
- * bytes in its block: retry. */
+ * rows in its block: retry. */
 int alfs_log_close(alfs_log_t *lg, alfs_writer_t *w);
 
 /*
  * Opens a reader of stream `tag` of log `log`, from its start. block: as
  * alfs_log_open's; each chunk is read into it and checked whole before any
- * of it is returned. ALFS_ENOENT, ALFS_EINVAL, ALFS_EIO.
+ * of its rows is returned. ALFS_ENOENT, ALFS_EINVAL, ALFS_EIO.
  */
 int alfs_log_open_read(alfs_log_t *lg, alfs_reader_t *r, uint32_t log, uint8_t tag, uint8_t *block,
                        uint32_t size);
 
 /*
- * Reads up to len bytes and returns how many, 0 at the end of what is
- * written. A chunk whose check fails is skipped and counted. ALFS_EIO:
- * nothing consumed; retry.
+ * Reads the next row into out and returns its length, 0 at the end of what
+ * is written. A chunk whose check fails, or whose rows do not fill it, is
+ * skipped and counted. ALFS_EINVAL: cap is under the row's length, and
+ * nothing is consumed. ALFS_EIO: nothing consumed; retry.
  */
-int32_t alfs_log_read(alfs_log_t *lg, alfs_reader_t *r, void *out, uint32_t len);
+int32_t alfs_log_read(alfs_log_t *lg, alfs_reader_t *r, void *out, uint32_t cap);
 
 int alfs_log_close_read(alfs_log_t *lg, alfs_reader_t *r);
 
@@ -136,11 +148,13 @@ void alfs_log_status(const alfs_log_t *lg, alfs_log_status_t *st);
 
 /*
  * RAM only, for a caller that serves alfs from another task (alfs_rtos.h).
- * alfs_log_take copies into a writer's block as much of data as it has room
- * for, and returns how much; alfs_log_write takes the rest. alfs_log_give
- * copies out of a reader's block what it holds, up to len.
+ * alfs_log_take copies a row into a writer's block when it is a row the
+ * writer takes and the block has room: true then, false otherwise, for
+ * alfs_log_write. alfs_log_give copies out the next row a reader's block
+ * holds and returns its length, as alfs_log_read does; 0 when the block
+ * holds none.
  */
-uint32_t alfs_log_take(alfs_writer_t *w, const void *data, uint32_t len);
-uint32_t alfs_log_give(alfs_reader_t *r, void *out, uint32_t len);
+bool alfs_log_take(alfs_writer_t *w, const void *row, uint32_t len);
+int32_t alfs_log_give(alfs_reader_t *r, void *out, uint32_t cap);
 
 #endif

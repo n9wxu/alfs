@@ -2,12 +2,14 @@
  * alfs: the append-log flash store, on serial NOR flash.
  *
  * Two stores, each on an area of the chip the caller gives it:
+ * - alfs_log.h, a log area: logs of rows appended around a ring of
+ *   sectors. Nothing erases there unless the caller asks, so every write
+ *   programs flash erased ahead of time. An application may have several,
+ *   as one for its configuration and one for its flights: alfs gives a row
+ *   no meaning.
  * - alfs_obj.h, the object area: named objects, each replaced whole (put)
  *   and read whole (get). A put may erase.
- * - alfs_log.h, the log area: logs appended around a ring of sectors.
- *   Nothing erases there unless the caller asks, so every write programs
- *   flash erased ahead of time.
- * alfs_rtos.h serves both from one FreeRTOS task.
+ * alfs_rtos.h serves any number of areas from one FreeRTOS task.
  *
  * docs/REQUIREMENTS.md says what alfs must do; docs/SPEC.md how its bytes
  * lie on the flash. Each call returns when its flash work is done; no
@@ -36,9 +38,9 @@ enum {
     ALFS_CLEAN = 2,
     /* A driver read failed. Nothing changed: retry. */
     ALFS_EIO = -1,
-    /* No room: no ready log sector for the next bytes, which stay in the
-     * writer's block (erase, then retry); or an object that does not fit
-     * (delete one, or fail). */
+    /* No room: no ready log sector for the rows a writer's block must
+     * program, which stay there (erase, then retry); or an object that does
+     * not fit (delete one, or fail). */
     ALFS_ENOSPC = -2,
     /* The object area holds no store: rebuild with alfs_obj_format, or
      * fail. */
@@ -93,7 +95,8 @@ typedef struct alfs_counters {
     uint32_t prog_failures, erase_failures;
     uint32_t check_failures; /* chunks skipped, or objects refused: their
                               * check failed */
-    uint32_t bytes_lost;     /* log bytes dropped with a failed program */
+    uint32_t bytes_lost;     /* bytes of log rows dropped with a failed
+                              * program */
 } alfs_counters_t;
 
 #define ALFS_NAME_MAX 31 /* bytes in an object's name, none 00h */
