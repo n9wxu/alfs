@@ -172,7 +172,8 @@ static int write_pair(alfs_kv_t *kv, uint32_t k, uint32_t at, const uint8_t *key
     s[1] = (uint8_t)klen;
     alfs_put16(s + 2, vlen);
     memcpy(s + PAIR_HDR, key, klen);
-    memcpy(s + PAIR_HDR + klen, value, vlen);
+    if (vlen) /* a delete passes no value */
+        memcpy(s + PAIR_HDR + klen, value, vlen);
     uint32_t body = PAIR_HDR + klen + vlen;
     alfs_put32(s + body, ~alfs_crc(ALFS_CRC_INIT, s + 1, body - 1u));
     return alfs_prog(&kv->d, alfs_addr(&kv->d, k) + at, s, body + 4u);
@@ -349,7 +350,8 @@ int alfs_kv_next(alfs_kv_t *kv, alfs_kv_iter_t *it, char *key, void *value, uint
         *len = p.vlen;
         if (cap < p.vlen)
             return ALFS_EINVAL;
-        memcpy(value, kv->d.scratch + PAIR_HDR + p.klen, p.vlen);
+        if (p.vlen)
+            memcpy(value, kv->d.scratch + PAIR_HDR + p.klen, p.vlen);
         memcpy(key, kv->d.scratch + PAIR_HDR, p.klen);
         key[p.klen] = 0;
         it->pos = (uint16_t)x;

@@ -412,7 +412,8 @@ uint32_t alfs_log_take(alfs_writer_t *w, const void *data, uint32_t len) {
     uint32_t n = w->open ? (uint32_t)(w->cap - w->used) : 0u;
     if (n > len)
         n = len;
-    memcpy(w->block + w->used, data, n);
+    if (n)
+        memcpy(w->block + w->used, data, n);
     w->used = (uint16_t)(w->used + n);
     return n;
 }
@@ -553,7 +554,8 @@ uint32_t alfs_log_give(alfs_reader_t *r, void *out, uint32_t len) {
     uint32_t n = r->open ? r->used : 0u;
     if (n > len)
         n = len;
-    memcpy(out, r->block + r->pos, n);
+    if (n)
+        memcpy(out, r->block + r->pos, n);
     r->pos = (uint16_t)(r->pos + n);
     r->used = (uint16_t)(r->used - n);
     return n;
