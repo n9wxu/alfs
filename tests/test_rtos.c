@@ -128,8 +128,9 @@ static int inst_setup(inst_t *in) {
     return rc ? rc : erase_log(in, 0);
 }
 
+/* The flash task is left waiting on its queue: the POSIX port can hang
+ * deleting a task from another one under load. */
 static void inst_close(inst_t *in) {
-    vTaskDelete(in->rt.task); /* its memory is left: the idle task may not have run */
     sim_free(&in->sim);
 }
 

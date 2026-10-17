@@ -1,6 +1,6 @@
-# Every test alfs has: the core and the flash task on simulator seeds under
-# the sanitizers, the core on 100 seeds, and the Cortex-M0+ size and stack
-# budgets. release.yml runs this before it makes a release.
+# Every test alfs has: the stores and the flash task on simulator seeds
+# under the sanitizers, the stores on 100 seeds, and the Cortex-M0+ size and
+# stack budgets. release.yml runs this before it makes a release.
 name: tests
 
 on:
@@ -14,8 +14,9 @@ permissions:
 
 jobs:
   core:
-    name: core, 8 seeds, sanitizers (${{ matrix.cc }})
+    name: stores, 8 seeds, sanitizers (${{ matrix.cc }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -27,8 +28,9 @@ jobs:
       - run: make test CC=${{ matrix.cc }} JOBS=4
 
   soak:
-    name: core, 100 seeds
+    name: stores, 100 seeds
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: make soak JOBS=4
@@ -36,6 +38,7 @@ jobs:
   flash-task:
     name: flash task, 8 seeds, sanitizers (${{ matrix.cc }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +51,7 @@ jobs:
   budgets:
     name: Cortex-M0+ size and stack budgets
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # The budgets were measured with this release; another moves the sizes.
