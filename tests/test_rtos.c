@@ -138,8 +138,8 @@ static int inst_setup(inst_t *in) {
     return rc ? rc : erase_log(in, 0);
 }
 
-/* The flash task is left waiting on its queue: the POSIX port can hang
- * deleting a task from another one under load. */
+/* The flash task is left waiting on its queue: the POSIX port deletes a
+ * task by joining its thread from the running one, which can hang. */
 static void inst_close(inst_t *in) {
     sim_free(&in->sim);
 }
@@ -165,11 +165,14 @@ typedef struct worker {
     void *arg;
 } worker_t;
 
+/* A worker waits forever once done: the POSIX port deletes a task by
+ * joining its thread from the running one, which can stop every task. */
 static void worker_entry(void *p) {
     worker_t *w = p;
     w->fn(w->arg);
     xSemaphoreGive(w->done);
-    vTaskDelete(NULL);
+    for (;;)
+        vTaskDelay(portMAX_DELAY);
 }
 
 static worker_t *spawn(void (*fn)(void *), void *arg, UBaseType_t prio) {
