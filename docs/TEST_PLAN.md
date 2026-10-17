@@ -178,7 +178,7 @@ test can tell good data from bad without alfs's help.
 | `spd_kv_set_bounded` | SPD-10, SPD-01 | W-CFG's sets: two programs and no erase while the head has room; one erase when it has none; the first set in a mount one program more. |
 | `life_kv_round_robin` | LIFE-05 | Sets until the head has gone round the store ten times: erase counts within 1. |
 | `safe_kv_atomic` | SAFE-15, SAFE-16 | Power lost at every operation of W-CFG's sets and deletes, each behaviour. After each loss, eight remounts reading every key, then a set and eight more. Each key reads as its last returned set made it, or as the one cut short would. |
-| `safe_kv_check` | SAFE-17 | One bit flipped in a pair's key, lengths, value or check: the pair is not returned; the others are. |
+| `safe_kv_check` | SAFE-17 | Three pairs, one a page; one bit flipped in a pair's key, lengths, value or check: the pair is not returned; the others are. |
 | `obs_status` | OBS-01 | Counts against the simulator's, for both areas, before and after logging, puts and a remount. |
 | `obs_clean` | OBS-03 | The log area not clean when it holds a dirty sector, clean once erased; the object area not clean after a put, clean once its spare is ready. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |

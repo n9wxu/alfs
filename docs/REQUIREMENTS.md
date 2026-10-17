@@ -808,14 +808,15 @@ newer than the head's.
 #### ALFS-SAFE-17
 
 A get or a listing returns no pair whose check fails; such a pair is
-passed over, and counted.
+passed over, and counted. Its lengths cannot be trusted either, so the
+walk goes on at the next page, passing over the rest of its page.
 
 - Priority: 3.
 - Source: UC-11: a setting partly wrong is worse than one missing, which
   the application replaces with its default.
 - Measure: a bit flipped in a pair's key, length, value and check.
-- Pass: the damaged pair is not returned; the other pairs are. Fail: a
-  damaged byte returned.
+- Pass: the damaged pair is not returned; the pairs in other pages are.
+  Fail: a damaged byte returned.
 - Verified by: `safe_kv_check`.
 
 ### 6.4 Simplicity (SIMP)

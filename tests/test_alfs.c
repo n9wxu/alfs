@@ -2,7 +2,8 @@
  * alfs's tests, one or more for each requirement of docs/REQUIREMENTS.md.
  * Each is named in the requirement's "Verified by".
  *
- * Every call a test makes goes through CALL, OCALL or an erase wrapper,
+ * Every call a test makes goes through CALL, OCALL, KCALL or an erase
+ * wrapper,
  * which hold it to SPD-01 (no erase outside an erase) and record the
  * longest single operation (SPD-06). Every test ends with DONE, which
  * fails it if the simulator saw a violation (a program across a page, a
@@ -11,6 +12,7 @@
  * outside the two areas changed. The simulator's seed comes from
  * ALFS_SEED.
  */
+#include "alfs_kv.h"
 #include "alfs_log.h"
 #include "alfs_obj.h"
 #include "sim.h"
@@ -28,6 +30,8 @@
 #define CHUNK 7u   /* a chunk's header */
 #define OBEGUN 16u /* a half's begun mark, then its commit (SPEC 6) */
 #define OCOMMIT 17u
+#define KV_SECTORS 3u /* the configuration store's */
+#define KPAIRS 19u    /* where its pairs start (SPEC 11) */
 
 /* ---- the rig ---------------------------------------------------------- */
 
@@ -41,15 +45,18 @@ typedef struct {
 typedef struct {
     sim_t sim;
     alfs_driver_t raw, drv;
-    alfs_area_t lcfg, ocfg;
+    alfs_area_t lcfg, ocfg, kcfg;
     alfs_log_t lg;
     alfs_obj_t ob;
+    alfs_kv_t kv;
     uint32_t bsize; /* the blocks', a page unless a test says */
-    uint8_t lscratch[PAGE], oscratch[PAGE];
+    uint8_t lscratch[PAGE], oscratch[PAGE], kscratch[PAGE];
     uint8_t blk[4][BLOCK_MAX];
     uint8_t gap[2][SECTOR]; /* the sectors around the areas, as filled */
     seen_t seen;
     bool oready_was; /* OCALL's: the spare half was ready before the call */
+    uint32_t kseq_was; /* KCALL's: the head's sequence before the call */
+    bool kfirst;       /* the next KCALL is the first since a mount */
 } rig_t;
 
 static int call_bad;           /* calls that broke SPD-01 */
@@ -95,9 +102,10 @@ static void area(alfs_area_t *a, uint32_t start, uint32_t sectors, uint32_t chip
     a->page_size = PAGE;
 }
 
-/* The chip: a gap sector, the object area, the log area, a gap sector. */
+/* The chip: a gap sector, the configuration store, the object area, the
+ * log area, a gap sector. */
 static void rig_open(rig_t *r, uint32_t log_sectors, uint32_t obj_sectors) {
-    uint32_t chip = (2u + obj_sectors + log_sectors) * SECTOR;
+    uint32_t chip = (2u + KV_SECTORS + obj_sectors + log_sectors) * SECTOR;
     memset(r, 0, sizeof(*r));
     sim_init(&r->sim, chip, SECTOR, PAGE, 0xFF, seed);
     sim_fill_random(&r->sim, 0, chip); /* what a used chip holds */
@@ -108,8 +116,9 @@ static void rig_open(rig_t *r, uint32_t log_sectors, uint32_t obj_sectors) {
     r->drv.read = w_read;
     r->drv.prog = w_prog;
     r->drv.erase = w_erase;
-    area(&r->ocfg, SECTOR, obj_sectors, chip);
-    area(&r->lcfg, (1u + obj_sectors) * SECTOR, log_sectors, chip);
+    area(&r->kcfg, SECTOR, KV_SECTORS, chip);
+    area(&r->ocfg, (1u + KV_SECTORS) * SECTOR, obj_sectors, chip);
+    area(&r->lcfg, (1u + KV_SECTORS + obj_sectors) * SECTOR, log_sectors, chip);
     r->bsize = PAGE;
     call_bad = 0;
     call_why[0] = 0;
@@ -152,15 +161,40 @@ static bool spare_ready(rig_t *r) {
     ((int)(begin(r), chk((r), alfs_obj_format(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch), true, "format")))
 #define LMOUNT(r) ((int)CALL((r), alfs_log_mount(&(r)->lg, &(r)->lcfg, &(r)->drv, (r)->lscratch)))
 #define OMOUNT(r) ((int)CALL((r), alfs_obj_mount(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch)))
+#define KMOUNT(r) ((r)->kfirst = true, (int)CALL((r), alfs_kv_mount(&(r)->kv, &(r)->kcfg, &(r)->drv, (r)->kscratch)))
+
+static uint32_t kv_seq(rig_t *r) {
+    alfs_kv_status_t st;
+    alfs_kv_status(&r->kv, &st);
+    return st.seq;
+}
+
+/* SPD-01, SPD-10: a set or delete erases one sector when the head moves,
+ * and the first in a mount may erase a copy cut short. */
+static int64_t kchk(rig_t *r, int64_t rc, const char *what) {
+    uint64_t erases = r->sim.c_ops - r->sim.c_programs;
+    uint64_t allowed = (kv_seq(r) != r->kseq_was ? 1u : 0u) + (r->kfirst ? 1u : 0u);
+    if (!r->sim.off)
+        r->kfirst = false;
+    if (erases > allowed) {
+        call_bad++;
+        snprintf(call_why, sizeof(call_why), "%s: %llu erases", what, (unsigned long long)erases);
+    }
+    return rc;
+}
+
+#define KCALL(r, e) ((r)->kseq_was = kv_seq(r), begin(r), kchk((r), (int64_t)(e), #e))
 
 /* A reboot: every handle gone, both areas mounted again. ALFS_ENOFS from
  * the object area is not an error here. */
 static int remount(rig_t *r) {
     memset(&r->lg, 0, sizeof(r->lg));
     memset(&r->ob, 0, sizeof(r->ob));
+    memset(&r->kv, 0, sizeof(r->kv));
     int rc = LMOUNT(r);
     int ro = OMOUNT(r);
-    return rc ? rc : ro == ALFS_ENOFS ? 0 : ro;
+    int rk = KMOUNT(r);
+    return rc ? rc : rk ? rk : ro == ALFS_ENOFS ? 0 : ro;
 }
 
 /* Log erase steps until nothing is dirty. The number of steps, or -1. */
@@ -191,9 +225,9 @@ static int oclean(rig_t *r) {
     return -1;
 }
 
-/* Both areas mounted, the log area erased, the object area formatted. */
+/* The areas mounted, the log area erased, the object area formatted. */
 static int setup(rig_t *r) {
-    if (LMOUNT(r) || lclean(r) < 0)
+    if (LMOUNT(r) || lclean(r) < 0 || KMOUNT(r))
         return -1;
     return OFORMAT(r) ? -1 : 0;
 }
@@ -444,6 +478,70 @@ static bool reads_as(rig_t *r, const char *name, const uint8_t *d, uint32_t n) {
     static uint8_t got[16384];
     int32_t m = oget(r, name, got, sizeof(got));
     return m == (int32_t)n && !memcmp(got, d, n);
+}
+
+/* ---- the configuration store ------------------------------------------ */
+
+static int kset(rig_t *r, const char *key, const uint8_t *v, uint32_t n) {
+    return (int)KCALL(r, alfs_kv_set(&r->kv, key, v, n));
+}
+
+static int kdel(rig_t *r, const char *key) {
+    return (int)KCALL(r, alfs_kv_delete(&r->kv, key));
+}
+
+/* A key's value into out: its length, or an error. */
+static int32_t kget(rig_t *r, const char *key, uint8_t *out, uint32_t cap) {
+    uint32_t len = 0;
+    int rc = (int)CALL(r, alfs_kv_get(&r->kv, key, out, cap, &len));
+    return rc ? rc : (int32_t)len;
+}
+
+static bool kreads(rig_t *r, const char *key, const uint8_t *v, uint32_t n) {
+    uint8_t got[PAGE];
+    return kget(r, key, got, sizeof(got)) == (int32_t)n && !memcmp(got, v, n);
+}
+
+/* W-CFG's sets and deletes: ten keys, values of 1 to 150 bytes (len 0: a
+ * delete), each byte a function of a generation. */
+typedef struct {
+    char key[8];
+    uint32_t len, gen;
+} kv_op_t;
+
+static kv_op_t kv_step(int i, uint32_t most) {
+    kv_op_t op;
+    snprintf(op.key, sizeof(op.key), "k%d", (i * 7) % 10);
+    op.gen = (uint32_t)i + 1u;
+    op.len = i % 9 == 8 ? 0u : 1u + (uint32_t)(i * 37) % most;
+    return op;
+}
+
+typedef struct {
+    uint32_t len[10], gen[10];
+    bool present[10];
+} kv_state_t;
+
+static int kv_do(rig_t *r, kv_op_t op) {
+    uint8_t v[PAGE];
+    fill(v, op.len, op.gen);
+    return kset(r, op.key, v, op.len); /* an empty value deletes */
+}
+
+static void kv_apply(kv_state_t *st, kv_op_t op) {
+    int i = op.key[1] - '0';
+    st->present[i] = op.len != 0;
+    st->len[i] = op.len;
+    st->gen[i] = op.gen;
+}
+
+static bool kv_reads(rig_t *r, const kv_state_t *st, int i) {
+    char key[4] = {'k', (char)('0' + i), 0};
+    uint8_t want[PAGE], got[PAGE];
+    if (!st->present[i])
+        return kget(r, key, got, sizeof(got)) == ALFS_ENOENT;
+    fill(want, st->len[i], st->gen[i]);
+    return kreads(r, key, want, st->len[i]);
 }
 
 /* ---- the simulator ------------------------------------------------------ */
@@ -1135,6 +1233,12 @@ static void spd_mount_reads_bounded(void) {
     CHECK_EQ(OMOUNT(&r), 0);
     CHECK(r.sim.c_bytes_read <= 2u * 29u);
     CHECK_EQ(r.sim.c_ops, 0);
+    for (int i = 0; i < 100; i++)
+        CHECK_EQ(kv_do(&r, kv_step(i, 150)) <= 0, 1);
+    memset(&r.kv, 0, sizeof(r.kv));
+    CHECK_EQ(KMOUNT(&r), 0);
+    CHECK(r.sim.c_bytes_read <= 19u * KV_SECTORS);
+    CHECK_EQ(r.sim.c_ops, 0);
     DONE(&r);
     rig_close(&r);
 }
@@ -1786,7 +1890,7 @@ static void safe_foreign_area(void) {
         rig_t r;
         rig_open(&r, 16, 4);
         if (blank)
-            memset(r.sim.mem + SECTOR, 0xFF, 20 * SECTOR);
+            memset(r.sim.mem + SECTOR, 0xFF, r.sim.chip_size - 2 * SECTOR);
         CHECK_EQ(LMOUNT(&r), 0);
         CHECK_EQ(r.sim.c_ops, 0);
         alfs_log_status_t st;
@@ -1798,6 +1902,10 @@ static void safe_foreign_area(void) {
         CHECK_EQ(r.sim.c_ops, 0);
         CHECK_EQ(OMOUNT(&r), ALFS_ENOFS);
         CHECK_EQ(r.sim.c_ops, 0);
+        CHECK_EQ(KMOUNT(&r), 0); /* no store: no pairs */
+        CHECK_EQ(r.sim.c_ops, 0);
+        uint8_t got[8];
+        CHECK_EQ(kget(&r, "k0", got, sizeof(got)), ALFS_ENOENT);
         DONE(&r);
         rig_close(&r);
     }
@@ -1934,6 +2042,16 @@ static void safe_fuzz(void) {
                 alfs_obj_commit(&r.ob, &p);
             }
             alfs_obj_delete(&r.ob, "a");
+        }
+        memset(&r.kv, 0, sizeof(r.kv));
+        if (alfs_kv_mount(&r.kv, &r.kcfg, &r.drv, r.kscratch) == 0) {
+            alfs_kv_iter_t it = {0, 0};
+            char key[ALFS_KEY_MAX + 1];
+            uint32_t len;
+            for (int i = 0; i < 400 && alfs_kv_next(&r.kv, &it, key, got, sizeof(got), &len) == 0; i++)
+                alfs_kv_get(&r.kv, key, got, sizeof(got), &len);
+            for (int i = 0; i < 30; i++)
+                alfs_kv_set(&r.kv, i % 2 ? "k1" : "k2", d, 1u + (uint32_t)i * 7u);
         }
         CHECK(gaps_kept(&r));
         rig_close(&r);
@@ -2146,6 +2264,300 @@ static void safe_obj_check(void) {
     }
 }
 
+/* ---- the configuration store's tests -------------------------------------- */
+
+static void if_kv_keys(void) {
+    rig_t r;
+    rig_open(&r, 4, 2);
+    CHECK_EQ(setup(&r), 0);
+    static const char *const good[] = {"a", "0123456789012345678901234567890", "pins/arm.delay"};
+    uint8_t v[PAGE];
+    for (int i = 0; i < 3; i++) {
+        fill(v, 10, (uint32_t)i);
+        CHECK_EQ(kset(&r, good[i], v, 10), 0);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < 3; i++) {
+            fill(v, 10, (uint32_t)i);
+            CHECK(kreads(&r, good[i], v, 10));
+        }
+        CHECK_EQ(remount(&r), 0);
+    }
+    static const char *const bad[] = {"", "01234567890123456789012345678901"};
+    for (int i = 0; i < 2; i++) {
+        CHECK_EQ(kset(&r, bad[i], v, 1), ALFS_EINVAL);
+        CHECK_EQ(r.sim.c_ops, 0);
+    }
+    CHECK_EQ(kset(&r, NULL, v, 1), ALFS_EINVAL);
+    uint8_t got[PAGE];
+    CHECK_EQ(kget(&r, "pins", got, sizeof(got)), ALFS_ENOENT); /* a prefix is not the key */
+    fill(v, PAGE, 9);
+    CHECK_EQ(kset(&r, "a", v, PAGE - 8 - 1), 0); /* the longest a page holds */
+    CHECK(kreads(&r, "a", v, PAGE - 8 - 1));
+    CHECK_EQ(kset(&r, "a", v, PAGE - 8), ALFS_EINVAL);
+    CHECK_EQ(r.sim.c_ops, 0);
+    uint32_t len = 0;
+    CHECK_EQ(CALL(&r, alfs_kv_get(&r.kv, "a", got, 10, &len)), ALFS_EINVAL); /* too small */
+    CHECK_EQ(len, PAGE - 8 - 1);
+    CHECK_EQ(kset(&r, "a", v, 0), 0); /* an empty value deletes */
+    CHECK_EQ(kget(&r, "a", got, sizeof(got)), ALFS_ENOENT);
+    CHECK_EQ(kdel(&r, "a"), ALFS_ENOENT);
+    CHECK_EQ(r.sim.c_ops, 0);
+    CHECK_EQ(kdel(&r, good[2]), 0);
+    CHECK_EQ(remount(&r), 0);
+    CHECK_EQ(kget(&r, good[2], got, sizeof(got)), ALFS_ENOENT);
+    fill(v, 10, 1);
+    CHECK(kreads(&r, good[1], v, 10));
+    DONE(&r);
+    rig_close(&r);
+}
+
+/* One listing: each pair's key and value checked against st, each key
+ * once. The pairs listed, or -1. */
+static int kv_list_matches(rig_t *r, const kv_state_t *st) {
+    alfs_kv_iter_t it = {0, 0};
+    char key[ALFS_KEY_MAX + 1];
+    uint8_t v[PAGE], want[PAGE];
+    bool seen[10] = {false};
+    int n = 0;
+    for (;;) {
+        uint32_t len = 0;
+        int rc = (int)CALL(r, alfs_kv_next(&r->kv, &it, key, v, sizeof(v), &len));
+        if (rc == ALFS_ENOENT)
+            break;
+        if (rc || key[0] != 'k' || key[2] || key[1] < '0' || key[1] > '9')
+            return -1;
+        int i = key[1] - '0';
+        fill(want, st->len[i], st->gen[i]);
+        if (seen[i] || !st->present[i] || len != st->len[i] || memcmp(v, want, len))
+            return -1;
+        seen[i] = true;
+        n++;
+    }
+    for (int i = 0; i < 10; i++)
+        if (st->present[i] && !seen[i])
+            return -1;
+    return n;
+}
+
+static void if_kv_list(void) {
+    rig_t r;
+    rig_open(&r, 4, 2);
+    CHECK_EQ(setup(&r), 0);
+    kv_state_t st;
+    memset(&st, 0, sizeof(st));
+    for (int i = 0; i < 40; i++) {
+        kv_op_t op = kv_step(i, 60);
+        int rc = kv_do(&r, op);
+        CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len));
+        kv_apply(&st, op);
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        CHECK(kv_list_matches(&r, &st) > 0);
+        CHECK_EQ(remount(&r), 0);
+    }
+    alfs_kv_iter_t it = {0, 0};
+    char key[ALFS_KEY_MAX + 1];
+    uint8_t v[PAGE];
+    uint32_t len;
+    CHECK_EQ(CALL(&r, alfs_kv_next(&r.kv, &it, key, v, sizeof(v), &len)), 0);
+    CHECK_EQ(kset(&r, "k1", v, 5), 0);
+    CHECK_EQ(CALL(&r, alfs_kv_next(&r.kv, &it, key, v, sizeof(v), &len)), ALFS_EINVAL);
+    DONE(&r);
+    rig_close(&r);
+}
+
+static void if_kv_full(void) {
+    rig_t r;
+    rig_open(&r, 4, 2);
+    CHECK_EQ(setup(&r), 0);
+    uint8_t v[200];
+    int i = 0, rc = 0;
+    for (; i < 100; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "f%d", i);
+        fill(v, sizeof(v), (uint32_t)i);
+        if ((rc = kset(&r, key, v, sizeof(v))) != 0)
+            break;
+    }
+    CHECK_EQ(rc, ALFS_ENOSPC);
+    CHECK(i >= 10);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int j = 0; j < i; j++) {
+            char key[8];
+            snprintf(key, sizeof(key), "f%d", j);
+            fill(v, sizeof(v), (uint32_t)j);
+            CHECK(kreads(&r, key, v, sizeof(v)));
+        }
+        uint8_t got[PAGE];
+        char key[8];
+        snprintf(key, sizeof(key), "f%d", i);
+        CHECK_EQ(kget(&r, key, got, sizeof(got)), ALFS_ENOENT);
+        CHECK_EQ(remount(&r), 0);
+    }
+    DONE(&r);
+    rig_close(&r);
+}
+
+static void spd_kv_set_bounded(void) {
+    rig_t r;
+    rig_open(&r, 4, 2);
+    CHECK_EQ(setup(&r), 0);
+    kv_state_t st;
+    memset(&st, 0, sizeof(st));
+    int moves = 0;
+    for (int i = 0; i < 400; i++) {
+        if (i % 50 == 49)
+            CHECK_EQ(remount(&r), 0);
+        kv_op_t op = kv_step(i, 150);
+        bool first = r.kfirst, existed = st.present[op.key[1] - '0'];
+        uint32_t seq = kv_seq(&r);
+        int rc = kv_do(&r, op);
+        CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len && !existed));
+        if (rc)
+            continue;
+        kv_apply(&st, op);
+        if (kv_seq(&r) != seq) {
+            moves++;
+            CHECK_EQ(r.sim.c_erases, 1);
+        } else {
+            uint64_t want = 1u + (existed ? 1u : 0u) + (first ? 1u : 0u);
+            if (r.sim.c_programs != want)
+                printf("    set %d: %llu programs, want %llu\n", i, (unsigned long long)r.sim.c_programs,
+                       (unsigned long long)want);
+            CHECK_EQ(r.sim.c_programs, want);
+            CHECK_EQ(r.sim.c_erases, 0);
+        }
+    }
+    CHECK(moves >= 4);
+    for (int i = 0; i < 10; i++)
+        CHECK(kv_reads(&r, &st, i));
+    DONE(&r);
+    rig_close(&r);
+}
+
+static void life_kv_round_robin(void) {
+    rig_t r;
+    rig_open(&r, 4, 2);
+    CHECK_EQ(setup(&r), 0);
+    uint32_t base = r.kcfg.start / SECTOR;
+    for (int i = 0; i < 100000; i++) {
+        uint32_t lo = UINT32_MAX;
+        for (uint32_t k = 0; k < KV_SECTORS; k++)
+            lo = r.sim.wear[base + k] < lo ? r.sim.wear[base + k] : lo;
+        if (lo >= 10)
+            break;
+        CHECK_EQ(kv_do(&r, kv_step(i % 8, 150)), 0); /* no deletes */
+    }
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (uint32_t k = 0; k < KV_SECTORS; k++) {
+        lo = r.sim.wear[base + k] < lo ? r.sim.wear[base + k] : lo;
+        hi = r.sim.wear[base + k] > hi ? r.sim.wear[base + k] : hi;
+    }
+    CHECK(lo >= 10);
+    CHECK(hi - lo <= 1);
+    DONE(&r);
+    rig_close(&r);
+}
+
+/* Each key reads as `done` has it, or as `next` would. */
+static bool kv_whole(rig_t *r, const kv_state_t *done, const kv_state_t *next) {
+    for (int i = 0; i < 10; i++)
+        if (!kv_reads(r, done, i) && !kv_reads(r, next, i))
+            return false;
+    return true;
+}
+
+static void safe_kv_atomic(void) {
+    for (int pl = 0; pl < PL_COUNT; pl++)
+        for (int64_t k = 0;; k++) {
+            rig_t r;
+            rig_open(&r, 4, 2);
+            CHECK_EQ(setup(&r), 0);
+            kv_state_t done, next;
+            memset(&done, 0, sizeof(done));
+            sim_power_after(&r.sim, k, (sim_pl_t)pl);
+            int i = 0;
+            for (; i < 60; i++) {
+                kv_op_t op = kv_step(i, 150);
+                next = done;
+                kv_apply(&next, op);
+                int rc = kv_do(&r, op);
+                if (r.sim.off)
+                    break;
+                CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len));
+                done = next;
+                if (i == 30 && (remount(&r) || r.sim.off)) /* a mount in the middle */
+                    break;
+            }
+            bool past = !r.sim.off;
+            sim_reboot(&r.sim);
+            if (past) {
+                rig_close(&r);
+                break;
+            }
+            for (int m = 0; m < 8; m++) {
+                CHECK_EQ(remount(&r), 0);
+                if (!kv_whole(&r, &done, &next))
+                    printf("    pl %d k %lld, step %d, remount %d: a key reads wrong\n", pl, (long long)k, i, m);
+                CHECK(kv_whole(&r, &done, &next));
+            }
+            kv_state_t now = done;
+            for (int j = 0; j < 10; j++)
+                if (!kv_reads(&r, &done, j)) {
+                    now.present[j] = next.present[j];
+                    now.len[j] = next.len[j];
+                    now.gen[j] = next.gen[j];
+                }
+            kv_op_t op = {"k0", 99, 999};
+            CHECK_EQ(kv_do(&r, op), 0);
+            kv_apply(&now, op);
+            for (int m = 0; m < 8; m++) {
+                CHECK_EQ(remount(&r), 0);
+                for (int j = 0; j < 10; j++)
+                    CHECK(kv_reads(&r, &now, j));
+            }
+            DONE(&r);
+            rig_close(&r);
+            if (tf_failed) {
+                printf("    behaviour %d, power lost at operation %lld\n", pl, (long long)k);
+                return;
+            }
+        }
+}
+
+static void safe_kv_check(void) {
+    for (int trial = 0; trial < 120; trial++) {
+        rig_t r;
+        rig_open(&r, 4, 2);
+        CHECK_EQ(setup(&r), 0);
+        /* Three pairs of 120 bytes: one a page, each from a page start. */
+        static const char *const keys[] = {"one", "two", "six"};
+        uint8_t v[3][120];
+        for (int i = 0; i < 3; i++) {
+            fill(v[i], sizeof(v[i]), (uint32_t)(trial * 3 + i));
+            CHECK_EQ(kset(&r, keys[i], v[i], sizeof(v[i])), 0);
+        }
+        alfs_kv_status_t ks;
+        alfs_kv_status(&r.kv, &ks);
+        int hit = trial % 3;
+        uint32_t pair = r.kcfg.start + ks.head * SECTOR + (hit ? (uint32_t)hit * PAGE : KPAIRS);
+        uint32_t len = 8 + 3 + 120, at = 1 + sim_rand(&r.sim) % (len - 1); /* not the live mark */
+        sim_flip(&r.sim, pair + at, (uint8_t)(1u << (sim_rand(&r.sim) % 8)));
+        CHECK_EQ(remount(&r), 0);
+        uint8_t got[PAGE];
+        for (int i = 0; i < 3; i++) {
+            int32_t n = kget(&r, keys[i], got, sizeof(got));
+            if (i == hit)
+                CHECK_EQ(n, ALFS_ENOENT);
+            else
+                CHECK(n == 120 && !memcmp(got, v[i], 120));
+        }
+        DONE(&r);
+        rig_close(&r);
+    }
+}
+
 /* ---- OBS -------------------------------------------------------------- */
 
 static void obs_status(void) {
@@ -2189,6 +2601,18 @@ static void obs_status(void) {
     CHECK_EQ(os.seq, 2);
     alfs_log_status(&r.lg, &st);
     CHECK_EQ(st.writing, 0);
+    alfs_kv_status_t ks;
+    alfs_kv_status(&r.kv, &ks);
+    CHECK_EQ(ks.sectors, KV_SECTORS);
+    CHECK_EQ(ks.head, ALFS_KV_NO_HEAD);
+    CHECK_EQ(ks.seq, 0);
+    uint64_t kp = r.sim.programs;
+    CHECK_EQ(kset(&r, "k", c, 10), 0);
+    alfs_kv_status(&r.kv, &ks);
+    CHECK_EQ(ks.head, 0);
+    CHECK(ks.seq >= 1);
+    CHECK_EQ(ks.n.erases, 1);
+    CHECK_EQ(ks.n.programs, r.sim.programs - kp);
     free(lg.exp);
     DONE(&r);
     rig_close(&r);
@@ -2235,6 +2659,7 @@ static void simp_ram(void) {
     CHECK(sizeof(alfs_reader_t) <= 32 + wide);
     CHECK(sizeof(alfs_put_t) <= 16);
     CHECK(sizeof(alfs_get_t) <= 16);
+    CHECK(sizeof(alfs_kv_t) <= 96 + 3 * wide);
 }
 
 int main(int argc, char **argv) {
@@ -2277,6 +2702,13 @@ int main(int argc, char **argv) {
         {"safe_log_erase", safe_log_erase},
         {"safe_put_atomic", safe_put_atomic},
         {"safe_obj_check", safe_obj_check},
+        {"if_kv_keys", if_kv_keys},
+        {"if_kv_list", if_kv_list},
+        {"if_kv_full", if_kv_full},
+        {"spd_kv_set_bounded", spd_kv_set_bounded},
+        {"life_kv_round_robin", life_kv_round_robin},
+        {"safe_kv_atomic", safe_kv_atomic},
+        {"safe_kv_check", safe_kv_check},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},
