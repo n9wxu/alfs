@@ -12,8 +12,10 @@
 #include "sim.h"
 #include "tf.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define SECTOR 4096u
 #define PAGE 256u
@@ -22,6 +24,8 @@
 #define LOG_SECTORS 64u
 #define CHIP ((2u + KV_SECTORS + OBJ_SECTORS + LOG_SECTORS) * SECTOR)
 #define STACK_WORDS 1024u
+#define FAILED_OPEN 0xFFFFFFFFu /* published instead of a log number */
+#define WATCHDOG_S 240u         /* the whole suite takes seconds */
 
 /* ---- an instance, behind a driver that checks who calls it ------------- */
 
@@ -315,11 +319,12 @@ static void writer(void *p) {
     uint8_t blk[PAGE];
     if (j->stream == 1) {
         j->rc = alfs_rt_log_open(&j->in->rt, &w, 0, 1, blk, sizeof(blk));
-        *j->log = w.w.log;
+        *j->log = j->rc ? FAILED_OPEN : w.w.log;
     } else {
         while (!*j->log)
             vTaskDelay(1);
-        j->rc = alfs_rt_log_open(&j->in->rt, &w, *j->log, (uint8_t)j->stream, blk, sizeof(blk));
+        j->rc = *j->log == FAILED_OPEN ? -106
+                                       : alfs_rt_log_open(&j->in->rt, &w, *j->log, (uint8_t)j->stream, blk, sizeof(blk));
     }
     if (!j->rc)
         j->rc = write_pattern(&j->in->rt, &w, j->stream, 4400, 22, 10);
@@ -565,7 +570,9 @@ static void live_writer(void *p) {
     alfs_rt_writer_t w;
     uint8_t blk[PAGE];
     l->rc = alfs_rt_log_open(&l->in->rt, &w, 0, 1, blk, sizeof(blk));
-    l->log = w.w.log;
+    l->log = l->rc ? FAILED_OPEN : w.w.log;
+    if (l->rc)
+        l->done = 1;
     for (uint32_t k = 0; k < 40 && !l->rc; k++) {
         uint8_t b[100];
         for (uint32_t i = 0; i < sizeof(b); i++)
@@ -587,6 +594,7 @@ static void rt_read_while_writing(void) {
     worker_t *w = spawn(live_writer, &l, 1);
     while (!l.log)
         vTaskDelay(1);
+    CHECK(l.log != FAILED_OPEN);
     alfs_rt_reader_t r;
     uint8_t blk[PAGE], b[64];
     CHECK_EQ(alfs_rt_log_open_read(&in->rt, &r, l.log, 1, blk, sizeof(blk)), 0);
@@ -686,9 +694,22 @@ static void runner(void *p) {
     exit(failures ? 1 : 0);
 }
 
+/* A hang shows as a failure that names it: the output is by line, so the
+ * last test passed is in the log. */
+static void *watchdog(void *p) {
+    (void)p;
+    sleep(WATCHDOG_S);
+    fprintf(stderr, "test_rtos: no end after %u s, seed %u\n", WATCHDOG_S, seed);
+    _exit(3);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     static StaticTask_t tcb;
     static StackType_t stack[STACK_WORDS];
+    pthread_t wd;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    pthread_create(&wd, NULL, watchdog, NULL);
     const char *env = getenv("ALFS_SEED");
     seed = env ? (uint32_t)strtoul(env, NULL, 0) : 0;
     if (argc > 1)
