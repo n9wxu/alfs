@@ -350,24 +350,28 @@ The sector ends at its last page.
 
 ## 13. Reading
 
+Each pair is read whole, once, and its CRC checked on that read; its key
+and value are taken from the same read. A bit a power loss left reading
+either way can make one read of a pair whole and the next damaged.
+
 A key's value is that of its **last** live, whole pair in the head, in the
 order of the walk. Normally a key has one live pair; a power loss between
 a set's two programs can leave two, and the later is the value. An empty
 value means the key is deleted.
 
-A listing walks the head and returns each pair that is live, whole, not
-empty, and the last of its key.
+A listing walks the head and returns each live, whole pair in order,
+empty ones included. A later pair of a key replaces an earlier one, and an
+empty value deletes the key, so pairs applied in order give the current
+ones.
 
 ---
 
 ## 14. Setting
 
-**The first set or delete in a mount** settles the head:
-1. If the sector after the head has a valid claim with a greater sequence,
-   it is erased: a copy a power loss cut short.
-2. The head's complete mark is programmed again (A-9).
-3. Pairs go on two page starts past the end of the last pair the walk
-   found. A pair a power loss tore lies in that pair's page or the next.
+**The first set or delete in a mount** moves the head, as below, even when
+the head has room. A pair a power loss tore can read erased, like the
+space after it, so after a mount alfs programs nothing in the old head
+again.
 
 **A set** of key K:
 1. **The pair** is programmed where the last one ended, or at the next
@@ -375,12 +379,17 @@ empty, and the last of its key.
 2. **Every earlier live pair of K** in the head has its live mark
    programmed with 00h.
 
-**When the head has no room** for the pair, the sector after it round the
-ring becomes the head:
+**Moving the head.** When the head has no room for the pair, and at the
+first set in a mount, the sector after it round the ring becomes the
+head:
 1. It is erased and read back as erased.
 2. Its claim is programmed, with the next sequence.
-3. Every pair a listing of the old head returns is copied in, in order.
-4. Its complete mark is programmed.
+3. Every live, whole pair of the old head but K's is copied in, in order,
+   from the read its CRC passed; then K's new pair, unless the set is a
+   delete.
+4. In the new head, every live pair a later live pair of its key follows,
+   and every empty one, has its live mark programmed with 00h, in order.
+5. Its complete mark is programmed.
 
 The old head then holds only pairs the new one has replaced. If the pair
 still has no room, the set returns `ALFS_ENOSPC`. With no head, the first

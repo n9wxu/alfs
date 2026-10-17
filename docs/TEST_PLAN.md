@@ -173,9 +173,9 @@ test can tell good data from bad without alfs's help.
 | `safe_put_atomic` | SAFE-12, SAFE-13 | W-CFG with power lost at every operation, each behaviour. After each loss, eight remounts reading every object, then a put and eight more. Each object reads as its last committed put or delete made it, or as the one cut short would. |
 | `safe_obj_check` | SAFE-14 | One bit flipped in an object's name, size, payload or check: no damaged byte returned; the objects before it read, and those after it unless its size was hit. |
 | `if_kv_keys` | IF-14 | Keys of 1 and 31 bytes set and got, before and after a remount; 0 and 32 bytes refused; the longest value a page holds accepted, one byte more refused; an empty value deletes. |
-| `if_kv_list` | IF-15 | Ten keys, some set again and some deleted: one listing returns each current pair once with its value, the same after a remount; a set between two calls makes the next return `ALFS_EINVAL`. |
+| `if_kv_list` | IF-15 | Ten keys, some set again and some deleted: one listing, applied in order to a cache, gives each current pair with its value, the same after a remount; a set between two calls makes the next return `ALFS_EINVAL`. |
 | `if_kv_full` | IF-16 | Pairs set until a set returns `ALFS_ENOSPC`: every key reads as before it. |
-| `spd_kv_set_bounded` | SPD-10, SPD-01 | W-CFG's sets: two programs and no erase while the head has room; one erase when it has none; the first set in a mount one program more. |
+| `spd_kv_set_bounded` | SPD-10, SPD-01 | W-CFG's sets, with remounts: two programs and no erase while the head has room; one erase when it has none, and at the first set in a mount. |
 | `life_kv_round_robin` | LIFE-05 | Sets until the head has gone round the store ten times: erase counts within 1. |
 | `safe_kv_atomic` | SAFE-15, SAFE-16 | Power lost at every operation of W-CFG's sets and deletes, each behaviour. After each loss, eight remounts reading every key, then a set and eight more. Each key reads as its last returned set made it, or as the one cut short would. |
 | `safe_kv_check` | SAFE-17 | Three pairs, one a page; one bit flipped in a pair's key, lengths, value or check: the pair is not returned; the others are. |

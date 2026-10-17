@@ -335,7 +335,7 @@ Nothing erases in the log area but `alfs_log_erase`. Nothing erases in the
 object area but `alfs_obj_erase`, `alfs_obj_format`, and a put or delete
 that finds the spare half not ready. Nothing erases in the configuration
 store but a set or delete that finds no room in the head sector, or the
-first one after a mount that finds a copy cut short (SAFE-16).
+first one in a mount (SAFE-16).
 
 - Priority: 1.
 - Source: the rulings; UC-1; the user's choice that the log area erases
@@ -469,9 +469,8 @@ flash holds.
 
 A configuration set or delete that finds room in the head sector performs
 two programs, the pair and the zero over the pair it replaces, and no
-erase. One that finds no room erases one sector and copies the current
-pairs into it. The first in a mount also programs the head's complete
-mark again (SAFE-16).
+erase. One that finds no room, and the first in a mount (SAFE-16), erases
+one sector and copies the current pairs into it.
 
 - Priority: 1.
 - Source: UC-11; the user: "Writes would zero the old key/value pair
@@ -792,23 +791,26 @@ loss leaves two live pairs of a key, the later one is its value.
 
 #### ALFS-SAFE-16
 
-Before the head sector takes a pair in a mount, alfs programs its complete
-mark again (A-9), and erases the sector after it if that sector's claim is
-newer than the head's.
+The first set or delete in a mount moves the head to the next sector,
+which it erases: after a mount, alfs programs nothing in the old head
+again but 00h over live marks.
 
 - Priority: 3.
-- Source: METASTABLE: a complete mark a power cut left half programmed can
-  read set at one mount and not at the next. A pair written into the head
-  must not lose to a copy cut short that later reads complete.
-- Measure: as SAFE-15, with the loss at the complete mark's program under
-  each behaviour, then sets.
+- Source: A-3, A-9; FLICKER. A pair a power cut tore can read erased, like
+  the space after it, so a mount cannot tell where the last one stopped
+  writing. A complete mark a power cut left half programmed can read set
+  at one mount and not at the next; the new head's sequence is above any
+  such sector's.
+- Measure: as SAFE-15, with the loss at every program of the first set
+  after a mount, under each behaviour, then sets.
 - Pass: as SAFE-15. Fail: otherwise.
 - Verified by: `safe_kv_atomic`.
 
 #### ALFS-SAFE-17
 
 A get or a listing returns no pair whose check fails; such a pair is
-passed over, and counted. Its lengths cannot be trusted either, so the
+passed over, and counted. A pair's check, key and value come from one
+read. Its lengths cannot be trusted either, so the
 walk goes on at the next page, passing over the rest of its page.
 
 - Priority: 3.
@@ -1073,9 +1075,12 @@ deletes the key.
 
 #### ALFS-IF-15
 
-A listing returns each current pair once, key and value, in one pass over
-the head sector. A set or delete between two calls of one listing makes
-the next call return `ALFS_EINVAL`: the listing starts again.
+A listing returns, in one pass over the head sector, each live pair, key
+and value, in the order written: a later pair of a key replaces an earlier
+one, and an empty value deletes the key, so a cache that applies them in
+order holds every current pair. A set or delete between two calls of one
+listing makes the next call return `ALFS_EINVAL`: the listing starts
+again.
 
 - Priority: S.
 - Source: the user: "The UI code could cache a full copy after one scan

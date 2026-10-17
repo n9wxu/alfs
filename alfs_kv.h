@@ -3,8 +3,9 @@
  *
  * One sector, the head, holds the current pairs. A set appends the new
  * pair and zeroes the live mark of the one it replaces. When the head is
- * full, the next sector round the ring is erased, every current pair is
- * copied in, and it becomes the head. A get or a listing scans the head.
+ * full, and at the first set in a mount, the next sector round the ring is
+ * erased, every current pair is copied in, and it becomes the head. A get
+ * or a listing scans the head.
  *
  * A set may erase one sector: settings are saved on the ground.
  *
@@ -22,15 +23,15 @@ typedef struct alfs_kv {
     alfs_dev_t d;
     uint32_t seq;      /* the head's claim; 0: no head */
     uint32_t next_seq;
+    uint32_t sets;     /* sets and deletes this mount: a listing's check */
     uint16_t head;
-    uint16_t end;      /* where the next pair goes, once settled */
-    uint8_t settled;   /* the head is settled for this mount (SPEC 14) */
-    uint8_t newer;     /* the sector after the head has a newer claim */
+    uint16_t end;      /* where the next pair goes, once moved */
+    uint8_t moved;     /* the head was moved in this mount (SPEC 14) */
 } alfs_kv_t;
 
 /* A listing in progress. Zero it to start. */
 typedef struct alfs_kv_iter {
-    uint32_t seq;
+    uint32_t sets;
     uint16_t pos;
 } alfs_kv_iter_t;
 
@@ -69,10 +70,12 @@ int alfs_kv_set(alfs_kv_t *kv, const char *key, const void *value, uint32_t len)
 int alfs_kv_delete(alfs_kv_t *kv, const char *key);
 
 /*
- * The next current pair of a listing: its key, NUL-terminated, into
- * key[ALFS_KEY_MAX + 1], its value into value, its length in *len.
- * ALFS_ENOENT at the end. ALFS_EINVAL: cap is under *len, or a set since
- * the listing began (start again). ALFS_EIO: retry.
+ * The next live pair of a listing, in the order written: its key,
+ * NUL-terminated, into key[ALFS_KEY_MAX + 1], its value into value, its
+ * length in *len. A later pair of a key replaces an earlier one, and an
+ * empty value deletes the key: applied in order, a listing gives every
+ * current pair. ALFS_ENOENT at the end. ALFS_EINVAL: cap is under *len, or
+ * a set since the listing began (start again). ALFS_EIO: retry.
  */
 int alfs_kv_next(alfs_kv_t *kv, alfs_kv_iter_t *it, char *key, void *value, uint32_t cap, uint32_t *len);
 

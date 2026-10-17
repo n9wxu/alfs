@@ -56,7 +56,6 @@ typedef struct {
     seen_t seen;
     bool oready_was; /* OCALL's: the spare half was ready before the call */
     uint32_t kseq_was; /* KCALL's: the head's sequence before the call */
-    bool kfirst;       /* the next KCALL is the first since a mount */
 } rig_t;
 
 static int call_bad;           /* calls that broke SPD-01 */
@@ -161,7 +160,7 @@ static bool spare_ready(rig_t *r) {
     ((int)(begin(r), chk((r), alfs_obj_format(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch), true, "format")))
 #define LMOUNT(r) ((int)CALL((r), alfs_log_mount(&(r)->lg, &(r)->lcfg, &(r)->drv, (r)->lscratch)))
 #define OMOUNT(r) ((int)CALL((r), alfs_obj_mount(&(r)->ob, &(r)->ocfg, &(r)->drv, (r)->oscratch)))
-#define KMOUNT(r) ((r)->kfirst = true, (int)CALL((r), alfs_kv_mount(&(r)->kv, &(r)->kcfg, &(r)->drv, (r)->kscratch)))
+#define KMOUNT(r) ((int)CALL((r), alfs_kv_mount(&(r)->kv, &(r)->kcfg, &(r)->drv, (r)->kscratch)))
 
 static uint32_t kv_seq(rig_t *r) {
     alfs_kv_status_t st;
@@ -169,13 +168,11 @@ static uint32_t kv_seq(rig_t *r) {
     return st.seq;
 }
 
-/* SPD-01, SPD-10: a set or delete erases one sector when the head moves,
- * and the first in a mount may erase a copy cut short. */
+/* SPD-01, SPD-10: a set or delete erases one sector, and only when the
+ * head moves, or was moving when the power went. */
 static int64_t kchk(rig_t *r, int64_t rc, const char *what) {
     uint64_t erases = r->sim.c_ops - r->sim.c_programs;
-    uint64_t allowed = (kv_seq(r) != r->kseq_was ? 1u : 0u) + (r->kfirst ? 1u : 0u);
-    if (!r->sim.off)
-        r->kfirst = false;
+    uint64_t allowed = kv_seq(r) != r->kseq_was || r->sim.off ? 1u : 0u;
     if (erases > allowed) {
         call_bad++;
         snprintf(call_why, sizeof(call_why), "%s: %llu erases", what, (unsigned long long)erases);
@@ -2312,14 +2309,14 @@ static void if_kv_keys(void) {
     rig_close(&r);
 }
 
-/* One listing: each pair's key and value checked against st, each key
- * once. The pairs listed, or -1. */
+/* One listing, applied in order to a cache (IF-15), checked against st.
+ * The current pairs, or -1. */
 static int kv_list_matches(rig_t *r, const kv_state_t *st) {
     alfs_kv_iter_t it = {0, 0};
     char key[ALFS_KEY_MAX + 1];
-    uint8_t v[PAGE], want[PAGE];
-    bool seen[10] = {false};
-    int n = 0;
+    uint8_t v[PAGE], want[PAGE], cache[10][PAGE];
+    uint32_t clen[10] = {0};
+    bool have[10] = {false};
     for (;;) {
         uint32_t len = 0;
         int rc = (int)CALL(r, alfs_kv_next(&r->kv, &it, key, v, sizeof(v), &len));
@@ -2328,15 +2325,17 @@ static int kv_list_matches(rig_t *r, const kv_state_t *st) {
         if (rc || key[0] != 'k' || key[2] || key[1] < '0' || key[1] > '9')
             return -1;
         int i = key[1] - '0';
-        fill(want, st->len[i], st->gen[i]);
-        if (seen[i] || !st->present[i] || len != st->len[i] || memcmp(v, want, len))
-            return -1;
-        seen[i] = true;
-        n++;
+        have[i] = len != 0;
+        clen[i] = len;
+        memcpy(cache[i], v, len);
     }
-    for (int i = 0; i < 10; i++)
-        if (st->present[i] && !seen[i])
+    int n = 0;
+    for (int i = 0; i < 10; i++) {
+        fill(want, st->len[i], st->gen[i]);
+        if (have[i] != st->present[i] || (have[i] && (clen[i] != st->len[i] || memcmp(cache[i], want, clen[i]))))
             return -1;
+        n += have[i];
+    }
     return n;
 }
 
@@ -2410,18 +2409,25 @@ static void spd_kv_set_bounded(void) {
         if (i % 50 == 49)
             CHECK_EQ(remount(&r), 0);
         kv_op_t op = kv_step(i, 150);
-        bool first = r.kfirst, existed = st.present[op.key[1] - '0'];
+        bool first = i % 50 == 49, existed = st.present[op.key[1] - '0'];
         uint32_t seq = kv_seq(&r);
         int rc = kv_do(&r, op);
-        CHECK(rc == 0 || (rc == ALFS_ENOENT && !op.len && !existed));
-        if (rc)
+        CHECK_EQ(rc, 0);
+        if (!op.len && !existed) { /* deleted already: nothing to write */
+            CHECK_EQ(r.sim.c_ops, 0);
             continue;
+        }
         kv_apply(&st, op);
+        if (first) /* the first set in a mount moves the head */
+            CHECK(kv_seq(&r) != seq);
         if (kv_seq(&r) != seq) {
             moves++;
             CHECK_EQ(r.sim.c_erases, 1);
         } else {
-            uint64_t want = 1u + (existed ? 1u : 0u) + (first ? 1u : 0u);
+            /* a key set after a delete also zeroes the delete's pair */
+            uint64_t want = 1u + (existed ? 1u : 0u);
+            if (!existed && r.sim.c_programs == want + 1u)
+                want++;
             if (r.sim.c_programs != want)
                 printf("    set %d: %llu programs, want %llu\n", i, (unsigned long long)r.sim.c_programs,
                        (unsigned long long)want);
@@ -2460,10 +2466,26 @@ static void life_kv_round_robin(void) {
     rig_close(&r);
 }
 
+/* Key i, read once: 1 when it reads as `a` has it, 2 when as `b`, 0 when
+ * as neither. A bit a power loss left reading either way can change what
+ * each read returns, so one read is matched against both. */
+static int kv_match(rig_t *r, const kv_state_t *a, const kv_state_t *b, int i) {
+    char key[4] = {'k', (char)('0' + i), 0};
+    uint8_t got[PAGE], want[PAGE];
+    int32_t n = kget(r, key, got, sizeof(got));
+    const kv_state_t *st[2] = {a, b};
+    for (int w = 0; w < 2; w++) {
+        fill(want, st[w]->len[i], st[w]->gen[i]);
+        if (st[w]->present[i] ? n == (int32_t)st[w]->len[i] && !memcmp(got, want, (size_t)n) : n == ALFS_ENOENT)
+            return w + 1;
+    }
+    return 0;
+}
+
 /* Each key reads as `done` has it, or as `next` would. */
 static bool kv_whole(rig_t *r, const kv_state_t *done, const kv_state_t *next) {
     for (int i = 0; i < 10; i++)
-        if (!kv_reads(r, done, i) && !kv_reads(r, next, i))
+        if (!kv_match(r, done, next, i))
             return false;
     return true;
 }
@@ -2502,21 +2524,29 @@ static void safe_kv_atomic(void) {
                     printf("    pl %d k %lld, step %d, remount %d: a key reads wrong\n", pl, (long long)k, i, m);
                 CHECK(kv_whole(&r, &done, &next));
             }
+            /* A set moves the head, which settles each key as its copy read
+             * it; then every remount reads the same. */
+            kv_op_t op = {"k0", 99, 999};
+            CHECK_EQ(kv_do(&r, op), 0);
+            kv_apply(&done, op);
+            kv_apply(&next, op);
             kv_state_t now = done;
-            for (int j = 0; j < 10; j++)
-                if (!kv_reads(&r, &done, j)) {
+            for (int j = 0; j < 10; j++) {
+                int w = kv_match(&r, &done, &next, j);
+                CHECK(w > 0);
+                if (w == 2) {
                     now.present[j] = next.present[j];
                     now.len[j] = next.len[j];
                     now.gen[j] = next.gen[j];
                 }
-            kv_op_t op = {"k0", 99, 999};
-            CHECK_EQ(kv_do(&r, op), 0);
-            kv_apply(&now, op);
+            }
             for (int m = 0; m < 8; m++) {
                 CHECK_EQ(remount(&r), 0);
                 for (int j = 0; j < 10; j++)
                     CHECK(kv_reads(&r, &now, j));
             }
+            if (r.sim.violations)
+                printf("    pl %d k %lld, step %d\n", pl, (long long)k, i);
             DONE(&r);
             rig_close(&r);
             if (tf_failed) {

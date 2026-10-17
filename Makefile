@@ -15,9 +15,10 @@ SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover
 PICO_SDK_PATH ?= $(HOME)/.pico-sdk/sdk/2.2.0
 PICO_TOOLCHAIN_PATH ?= $(HOME)/.pico-sdk/toolchain/14_2_Rel1
 
-# The stores: what both share, the log area, the object area.
-STORES = alfs_flash.c alfs_log.c alfs_obj.c
-STORE_H = alfs.h alfs_flash.h alfs_log.h alfs_obj.h
+# The stores: what they share, the configuration store, the object area,
+# the log area.
+STORES = alfs_flash.c alfs_kv.c alfs_obj.c alfs_log.c
+STORE_H = alfs.h alfs_flash.h alfs_kv.h alfs_obj.h alfs_log.h
 TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
 TEST_H = tests/sim.h tests/tf.h
 STORE_BUDGET = 6656
