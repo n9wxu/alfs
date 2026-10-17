@@ -1,10 +1,12 @@
 # alfs requirements
 
-alfs, the append-log flash store: on serial NOR flash, a configuration
-store of key-value pairs, an object area of named objects written and read
-whole, and a log area where logs are appended around a ring of sectors.
+alfs, the append-log flash store: on serial NOR flash, log areas where
+rows are appended around a ring of sectors, and an object area of named
+objects written and read whole. One log area holds an application's
+configuration and another its flights: the same code serves both, and
+only the application tells their rows apart.
 
-**Status: draft 4.** Requirements come first, then the tests that verify
+**Status: draft 5.** Requirements come first, then the tests that verify
 them (`docs/TEST_PLAN.md`), then the code.
 
 ---
@@ -37,12 +39,17 @@ The user, on the layout:
 > programs are separate objects. Since the UI is simply GET and PUT of
 > whole files, we are effectively making an object store."
 >
-> "config data could be a round-robin key-value store. Writes would zero
-> the old key/value pair while appending the new key/value pair. It would
+> "config data could be a round-robin key-value store. ... It would
 > require a O(N) search to find any specific key, but there are not that
 > many keys in the system. The UI code could cache a full copy after one
 > scan of the config store. LUA programs should still be a full file
 > write."
+>
+> "An append only log and a append only key-value store are identical,
+> just two different reagions. They should have 100% code sharing."
+>
+> "The only differences should be the application that reads and writes
+> rows. The application interprets the key-value vs log data."
 
 The user, on the flash task and on writes:
 
@@ -62,19 +69,24 @@ The user, on the flash task and on writes:
 > remaining data will be put in the ram block. If all data is consumed, the
 > writer will return to the application."
 
-And the user's choices: in the log area, erasing happens only when the
+And the user's choices: in a log area, erasing happens only when the
 application asks; after a reset the application starts a new log rather
 than resuming the old one.
 
-**The three areas.**
-- **The configuration store** holds key-value pairs. A set appends the new
-  pair and zeroes the one it replaces; a get or a listing scans one
-  sector. Pairs are saved on the ground and slowly, so a set may erase.
+**The areas.**
+- **A log area** holds logs of rows, appended at one place that moves
+  around a ring of sectors. Nothing in it erases unless the application
+  asks. alfs stores rows and returns them; what a row means is the
+  application's.
+  - **The configuration area** is a log area whose rows are settings,
+    each a key and its value. The application reads every row at boot,
+    keeps the current settings in RAM, and appends a row for each change.
+    It saves settings on the ground, so it erases there when it needs
+    room.
+  - **The flight log area** is a log area whose rows are a flight's
+    samples.
 - **The object area** holds Lua programs, each under its name. An object
   is replaced whole (PUT) and read whole (GET), and a put may erase.
-- **The log area** holds the logs, appended at one place that moves
-  around a ring of sectors. Nothing in it erases unless the application
-  asks.
 
 **The order of priority.** Every requirement carries one:
 
@@ -100,22 +112,21 @@ writes less and has fewer ways to fail. Its requirements are budgets.
 
 **In scope:**
 
-- **Configuration pairs** on raw serial NOR flash, found by key: set
-  (replace one value), get, delete, list.
+- **Logs of rows** on raw serial NOR flash, in a ring of sectors, in any
+  number of log areas: start, append rows to one or more streams of the
+  newest log, sync, read a stream's rows in order, list, and delete a log
+  by erasing it.
 - **Objects**, found by name: put (replace whole), get (read whole),
   delete, list.
-- **Logs** in a ring of sectors: start, append to one or more streams of
-  the newest log, sync, read a stream sequentially, list, and delete a
-  log by erasing it.
-- One task that performs every flash operation of the three areas for
-  the application's tasks, on FreeRTOS; and the same code, without the
-  task, for a caller with no RTOS.
-- Erasing the log area when the application asks, and reporting how much
+- One task that performs every flash operation of every area for the
+  application's tasks, on FreeRTOS; and the same code, without the task,
+  for a caller with no RTOS.
+- Erasing a log area when the application asks, and reporting how much
   of each area is ready.
 - Power loss at any moment; the bad-sector and power-loss behaviours of
   section 4.4.
-- A chip shared with executing code: alfs owns only the three areas it
-  is given.
+- A chip shared with executing code: alfs owns only the areas it is
+  given.
 
 **Out of scope:**
 
@@ -124,10 +135,11 @@ writes less and has fewer ways to fail. Its requirements are budgets.
 - Reopening a log to append after a reset. The application starts a new
   log (the user's choice); the rest of the cut-short log's last sector
   stays unused until that log is erased.
-- An object larger than half the object area; a configuration pair
-  larger than a page, or more pairs than one sector holds.
-- Erasing the configuration store and the object area ahead of time: they
-  are written on the ground, and erase when they need room.
+- An object larger than half the object area; a row longer than IF-14
+  allows.
+- What a row means: keys, values and samples are the application's.
+- Requiring the object area erased ahead of time: it is written on the
+  ground, and a put erases when it needs room.
 - NAND, SD cards, eMMC: any medium with a write-back cache or its own
   translation layer. The reordering such a cache makes is not modelled.
 - A part whose prog unit is over one byte (one with error correction
@@ -155,7 +167,7 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 | UC-8 | **The wrong geometry.** An image built for an 8 MB chip, run on a 2 MB one. | Nothing may be written past the chip's end or outside the areas, where the bootloader and the code lie (DD-098). |
 | UC-9 | **Write failures.** A program that fails part-way. | Nothing is written twice, and every byte lost is counted (L4). |
 | UC-10 | **Unattended, soldered-in flash.** Replacing the chip loses everything; the unit may be out of reach. | Degrade gracefully, shrink with bad sectors, stay readable at end of life, report health. |
-| UC-11 | **Configuration.** Settings saved on the ground as key-value pairs, a few hundred bytes in all, each save replacing one value; all read at boot, and by the web interface, which keeps a copy after one scan. | The user's words on the configuration store (section 1). pyro's settings are files of under 1 kB (`pins.ini`, `beep.ini`, `pad.mkr`). |
+| UC-11 | **Configuration.** Settings saved on the ground as key-value pairs, a few hundred bytes in all, each save replacing one value; all read at boot into a copy the web interface keeps. | The user's words on the configuration (section 1): the configuration area is a log area, and the application gives its rows their meaning. pyro's settings are files of under 1 kB (`pins.ini`, `beep.ini`, `pad.mkr`). |
 | UC-12 | **Lua programs.** Each its own object, saved whole from the web interface, read whole when loaded. | The user: "LUA programs should still be a full file write." |
 | UC-13 | **Many tasks, one flash.** The flight log from a storage task, settings, programs and downloads from a network task, each blocking only itself. | pyro runs FreeRTOS on both cores (DD-073); its flash operations go through one routine that stops both cores for one operation at a time (DD-074, `src/flash_op.c`). |
 
@@ -165,12 +177,11 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 
 ### 4.1 Terms
 
-- **area:** a sector-aligned range of the chip given to one store: the
-  configuration store, the object area or the log area.
-- **pair:** a key of 1 to 31 bytes and its value, in the configuration
-  store.
-- **head sector:** the configuration store's sector that holds its pairs;
-  the others hold pairs it has replaced.
+- **area:** a sector-aligned range of the chip given to one instance of
+  a store: a log area, or the object area.
+- **row:** what a log write takes and a log read returns, whole: 1 to R
+  bytes, R the lesser of 255 and the page size less 38 (IF-14). alfs gives
+  a row no meaning.
 - **sector:** the erase unit, a power of two (4,096 bytes on every part
   here).
 - **page:** the most one program operation writes; a program never
@@ -188,20 +199,21 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
   objects; the **spare** half is where the next put or delete writes the
   objects again.
 - **commit:** the record that makes a half active, programmed last.
-- **log:** the bytes of one flight in the log area, in one or more
-  streams, found by its number.
+- **log:** the rows written in a log area from one start, in one or more
+  streams, found by its number: in the flight log area, one flight.
 - **log number:** the number alfs gives a log when it starts; unique for
   the life of the area, and growing.
-- **stream:** the bytes of one writer within a log, marked by a tag the
+- **stream:** the rows of one writer within a log, marked by a tag the
   application chooses.
 - **block:** RAM the application gives with a log writer or reader, where
-  alfs gathers the bytes written until they fill it, and the bytes read.
-- **chunk:** the bytes of one stream that one program adds, checked as a
+  alfs gathers the rows written until the next does not fit, and holds
+  the rows read.
+- **chunk:** whole rows of one stream that one program adds, checked as a
   unit.
-- **sync:** a call after which every byte written so far is durable.
+- **sync:** a call after which every row written so far is durable.
 - **durable:** survives a power loss at any later moment.
 - **flash task:** the one task that performs every flash operation of
-  both areas.
+  every area it serves.
 - **request:** what a call in the application's task sends the flash task,
   and waits on until it is done.
 - **ready sector:** a log sector whose erase completed and which nothing
@@ -299,15 +311,16 @@ of one page unless a workload says otherwise.
 - **W-LOG:** 22-byte rows produced at 1 or 50 a second, written every
   200 ms, synced every second, for 10 minutes (the littlefs fork's
   `benches/bench_wlog.toml`).
-- **W-HR:** 480 bytes written every 20 ms (24,000 a second), synced every
-  second, for 10 minutes.
+- **W-HR:** ten 48-byte rows written every 20 ms (24,000 bytes a
+  second), synced every second, for 10 minutes.
 - **W-RING:** W-LOG at 50 rows a second, a new log every 10 minutes, and
   the oldest log erased whenever fewer than two logs' worth of sectors are
   ready; one erase step requested every 20 ms; until every sector has been
   erased at least 10 times.
-- **W-CFG:** a script of sets and deletes of ten configuration keys with
-  values of 1 to 60 bytes, and puts of a 4,096-byte and a 300-byte Lua
-  program object, one of them deleted and put back.
+- **W-CFG:** a script of sets and deletes of ten settings with values of
+  1 to 150 bytes, through the configuration application
+  (`examples/kv.c`); and puts of a 4,096-byte and a 300-byte Lua program
+  object, one of them deleted and put back.
 
 ---
 
@@ -331,14 +344,12 @@ The requirement, one sentence where possible.
 
 #### ALFS-SPD-01
 
-Nothing erases in the log area but `alfs_log_erase`. Nothing erases in the
+Nothing erases in a log area but `alfs_log_erase`. Nothing erases in the
 object area but `alfs_obj_erase`, `alfs_obj_format`, and a put or delete
-that finds the spare half not ready. Nothing erases in the configuration
-store but a set or delete that finds no room in the head sector, or the
-first one in a mount (SAFE-16).
+that finds the spare half not ready.
 
 - Priority: 1.
-- Source: the rulings; UC-1; the user's choice that the log area erases
+- Source: the rulings; UC-1; the user's choice that a log area erases
   only when the application asks; the user's words that objects "are
   stored slowly so they could be read-modify-write".
 - Measure: erases the simulator counts during each call, under W-LOG,
@@ -349,21 +360,24 @@ first one in a mount (SAFE-16).
 
 #### ALFS-SPD-02
 
-A log write or sync that programs X bytes performs at most
-ceil(X / (page − 37)) + 2 programs, plus one for each failed program and
-one to zero the fresh sector (SAFE-04 rule 3). A write programs bytes only
-when the block fills, and then all but less than a page's room: X is at
-most the block's size B plus the bytes the write passes.
+A log write or sync that programs X bytes of rows performs at most
+ceil(X / (page − 37 − L)) + 2 programs, L the longest row written, plus
+one for each failed program and one to zero the fresh sector (SAFE-04
+rule 3). X counts each row with its length byte. A write programs only
+when its row does not fit in the block's room, and then whole chunks: X
+is at most the block's size B.
 
 - Priority: 1.
-- Source: UC-1, UC-2; the stall of 4.3. A write blocks until its bytes are
+- Source: UC-1, UC-2; the stall of 4.3. A write blocks until its row is
   covered (the user's words, section 1), so the burst it makes is what is
   bounded. 37 bytes is the least room a page gives payload: a sector's
   first page holds the stamp and claim (30 bytes), and every chunk has a
-  7-byte header. The application chooses B to fit its slack: a sync of a
-  full 4,096-byte block is about 18 programs, 7 ms at the typical time.
+  7-byte header. A chunk holds whole rows, so a full one leaves unused
+  less room than the row that did not fit: at most L bytes. The
+  application chooses B to fit its slack: a sync of a full 4,096-byte
+  block of 22-byte rows is at most 23 programs, 9 ms at the typical time.
 - Measure: programs the simulator counts during each call, against the
-  bytes the call took into and left in the block, with writes of 480 and 22
+  bytes the call took into and left in the block, with rows of 48 and 22
   bytes and blocks of one page and of 4,096 bytes.
 - Pass: within the bound. Fail: more.
 - Verified by: `spd_write_burst_bounded`.
@@ -382,27 +396,26 @@ one page.
 #### ALFS-SPD-04
 
 A log write or sync that finds no ready sector returns `ALFS_ENOSPC`,
-keeps the bytes it holds in the writer's block, and erases nothing. A write
-may have programmed part of its bytes before it found no ready sector.
+keeps the rows it holds in the writer's block, and erases nothing. A write
+may have programmed part of the block before it found no ready sector;
+the row it was given is not taken.
 
 - Priority: 1.
 - Source: the rulings.
 - Measure: a log written until no sector is ready.
 - Pass: `ALFS_ENOSPC`, no erase, and after an erase makes a sector ready
-  the bytes held are written. Fail: an erase, or a lost byte.
+  the rows held are written. Fail: an erase, or a lost row.
 - Verified by: `spd_enospc_without_erase`.
 
 #### ALFS-SPD-05
 
-Mounting the log area reads at most 30 bytes of each sector; mounting the
-object area reads at most 29 bytes of each half; mounting the
-configuration store reads at most 19 bytes of each sector. None performs
-a flash operation.
+Mounting a log area reads at most 30 bytes of each sector; mounting the
+object area reads at most 29 bytes of each half. Neither performs a flash
+operation.
 
 - Priority: 1.
 - Source: UC-3. 30 bytes are a log sector's stamp (18) and claim (12); 29
-  are a half's stamp (16), begun mark (1) and commit (12); 19 are a
-  configuration sector's claim (18) and complete mark (1).
+  are a half's stamp (16), begun mark (1) and commit (12).
 - Measure: bytes the simulator reads during each mount.
 - Pass: at most those. Fail: more, or any operation.
 - Verified by: `spd_mount_reads_bounded`.
@@ -465,26 +478,11 @@ flash holds.
 - Pass: every call returns. Fail: any that does not.
 - Verified by: `safe_fuzz`; review.
 
-#### ALFS-SPD-10
-
-A configuration set or delete that finds room in the head sector performs
-two programs, the pair and the zero over the pair it replaces, and no
-erase. One that finds no room, and the first in a mount (SAFE-16), erases
-one sector and copies the current pairs into it.
-
-- Priority: 1.
-- Source: UC-11; the user: "Writes would zero the old key/value pair
-  while appending the new key/value pair."
-- Measure: programs and erases the simulator counts during each set of
-  W-CFG.
-- Pass: as stated. Fail: more.
-- Verified by: `spd_kv_set_bounded`.
-
 ### 6.2 Flash life (LIFE)
 
 #### ALFS-LIFE-01
 
-An erase in the log area takes only a sector that is dirty or belongs to
+An erase in a log area takes only a sector that is dirty or belongs to
 the log being erased, never a ready one. A put or delete erases nothing
 when the spare half is ready, and otherwise each of its sectors once.
 
@@ -504,10 +502,11 @@ and 12 for each claim it zeroes.
 - Priority: 2.
 - Source: the brief. A sector costs its stamp (18 bytes, programmed by the
   erase) and a claim program that writes the stamp again with the claim
-  (30); a chunk costs its header (7). SPEC section 1.
+  (30); a chunk costs its header (7); a row costs its length byte, which
+  the bytes taken from the block count. SPEC section 1.
 - Measure: bytes the simulator programs during writes and syncs, against
-  the bound computed from its own counts, under W-LOG (22 bytes a sync at
-  1 row a second, 1,100 at 50) and W-HR (24,000).
+  the bound computed from its own counts, under W-LOG (one 22-byte row a
+  sync at 1 row a second, 50 at 50) and W-HR (500 48-byte rows).
 - Pass: within the bound. Fail: above it.
 - Verified by: `life_write_amplification`.
 
@@ -538,23 +537,24 @@ by at most 2.
 
 #### ALFS-LIFE-05
 
-The configuration store's head moves to the next sector round the ring
-each time it fills, so its sectors wear evenly: under repeated sets their
-erase counts differ by at most 1.
+The configuration area wears evenly: under repeated sets through the
+configuration application, the erase counts of its sectors differ by at
+most 2.
 
 - Priority: 2.
-- Source: the user: "a round-robin key-value store"; 100K-cycle
-  endurance (4.3).
-- Measure: each sector's erase count after the head has gone round the
-  ring ten times.
-- Pass: largest minus smallest at most 1. Fail: more.
-- Verified by: `life_kv_round_robin`.
+- Source: UC-11; the user: "a round-robin key-value store"; 100K-cycle
+  endurance (4.3). The ring takes sectors in order, and each new log of
+  the configuration area lets the application erase the logs before it.
+- Measure: each sector's erase count after every sector of the area has
+  been erased ten times, with a remount every 50 sets.
+- Pass: largest minus smallest at most 2. Fail: more.
+- Verified by: `life_cfg_wear`.
 
 ### 6.3 Safety (SAFE)
 
 #### ALFS-SAFE-01
 
-Every byte a successful sync or close made durable reads back intact after
+Every row a successful sync or close made durable reads back whole after
 a power loss at any later operation, under every power-loss behaviour of
 4.4.
 
@@ -562,30 +562,30 @@ a power loss at any later operation, under every power-loss behaviour of
 - Source: UC-7.
 - Measure: W-LOG with power lost after operation k, for every k, and a
   second loss in the log after the restart; remount; read every log.
-- Pass: every synced byte reads back, in order. Fail: any missing or wrong.
+- Pass: every synced row reads back, in order. Fail: any missing or wrong.
 - Verified by: `safe_powerloss_durable`.
 
 #### ALFS-SAFE-02
 
-A power loss loses at most the bytes written since the last successful
+A power loss loses at most the rows written since the last successful
 sync.
 
 - Priority: 3.
 - Source: UC-7, FLT-LOG-06.
-- Measure: as SAFE-01, counting bytes lost.
+- Measure: as SAFE-01, counting rows lost.
 - Pass: at most those written since the last sync. Fail: more.
 - Verified by: `safe_powerloss_bound`.
 
 #### ALFS-SAFE-03
 
-A read never returns a byte from a chunk whose check failed. A failed
+A read never returns a row from a chunk whose check failed. A failed
 check makes the chunk's length untrustworthy too, so the read skips to the
 next page, counts one failure, and reads on.
 
 - Priority: 3.
 - Source: UC-7; METASTABLE and the FLIP behaviours.
 - Measure: logs with bits flipped in chunk headers, payloads and checks.
-- Pass: no damaged byte returned; one failure counted for each page
+- Pass: no damaged row returned; one failure counted for each page
   skipped; the chunks of the pages after it read. Fail: otherwise.
 - Verified by: `safe_no_false_data`.
 
@@ -633,23 +633,24 @@ have completed and whose erased state it verified on the ground.
   so a blank check alone cannot show an erase completed; the stamp,
   programmed after the erase returns done and the sector reads blank,
   does (`docs/FLASH_PROBE.md` section 4).
-- Measure: power loss during erases, and ERASENOOP sectors, in both areas.
+- Measure: power loss during erases, and ERASENOOP sectors, in a log area
+  and the object area.
 - Pass: no write lands in a sector whose erase was interrupted or did
   nothing. Fail: any.
 - Verified by: `safe_write_only_verified_ready`.
 
 #### ALFS-SAFE-06
 
-A failed log program is counted and its bytes are dropped and counted;
-the log goes on in a fresh sector, since a page that fails is a sector
-that is failing. A program is checked by reading it back.
+A failed log program is counted, and its rows are dropped and their
+bytes counted; the log goes on in a fresh sector, since a page that fails
+is a sector that is failing. A program is checked by reading it back.
 
 - Priority: 3.
 - Source: UC-9. "A corrupted data block is less important than a broken
   exec loop": a retry would repeat a stall the flight loop already paid.
 - Measure: PROGERROR, PROGNOOP and PROGFLIP sectors in the path of W-LOG.
-- Pass: every byte reads back or is counted as lost; nothing is written
-  twice. Fail: otherwise.
+- Pass: every row reads back whole or is counted as lost; nothing is
+  written twice. Fail: otherwise.
 - Verified by: `safe_prog_failure`.
 
 #### ALFS-SAFE-07
@@ -683,9 +684,9 @@ every other state unchanged, so that a retry reads the same bytes.
 
 #### ALFS-SAFE-09
 
-alfs programs and erases only inside its two areas. A configuration whose
-area does not lie inside the chip is refused before any operation. A log
-area holding anything else mounts with every such sector dirty, and an
+alfs programs and erases only inside the areas it is given. A
+configuration whose area does not lie inside the chip is refused before
+any operation. A log area holding anything else mounts with every such sector dirty, and an
 object area holding no valid half fails to mount with `ALFS_ENOFS`; both
 write nothing.
 
@@ -699,7 +700,7 @@ write nothing.
 
 #### ALFS-SAFE-10
 
-Every call finishes, without a crash, on any content of either area.
+Every call finishes, without a crash, on any content of any area.
 
 - Priority: 3.
 - Source: UC-10; crafted images. Every call is a loop (SPD-09).
@@ -712,7 +713,7 @@ Every call finishes, without a crash, on any content of either area.
 
 Once `alfs_log_erase` reports no sector of a log left, none of the log's
 sectors reads again after any power loss. Until then, the log reads only
-chunks written to it.
+rows written to it.
 
 - Priority: 3.
 - Source: UC-4. An erase takes the dirty sectors with the log's own, so a
@@ -773,62 +774,50 @@ the objects after it in the half.
 
 #### ALFS-SAFE-15
 
-A configuration set or delete is atomic: until it returns, every key reads
-as it was, or after a power loss, as it was or as the call makes it; once
-it returns, as the call makes it, after any power loss. Where a power
-loss leaves two live pairs of a key, the later one is its value.
+A read returns only whole rows, as written. A chunk whose check passes
+but whose row lengths do not fill its payload exactly is damaged: it is
+skipped and counted, as in SAFE-03. A failed program or a damaged chunk
+loses whole rows, and the rows after it read whole.
 
 - Priority: 3.
-- Source: UC-11. A set appends before it zeroes; a full head is copied
-  into the next sector, which becomes the head only when its complete
-  mark is programmed, after the last copy.
-- Measure: power loss at every operation of W-CFG's sets and deletes,
-  under each behaviour; after each, eight remounts and a get of every
-  key; then a set and eight more.
-- Pass: as stated. Fail: a key missing, wrong, or reading a value it never
-  had.
-- Verified by: `safe_kv_atomic`.
+- Source: UC-7, UC-11: an application parses each row on its own, so a
+  row cut in two, or rows read out of step after a loss, would be read as
+  other rows. A chunk holds only whole rows, each with its length.
+- Measure: chunks planted with valid checks and row lengths that run past
+  their payload or stop short of it; and the runs of SAFE-03 and SAFE-06,
+  read row by row.
+- Pass: no partial or merged row returned; one failure counted for each
+  damaged chunk; the rows of the other chunks read. Fail: otherwise.
+- Verified by: `safe_rows_whole`, `safe_no_false_data`, `safe_prog_failure`.
 
 #### ALFS-SAFE-16
 
-The first set or delete in a mount moves the head to the next sector,
-which it erases: after a mount, alfs programs nothing in the old head
-again but 00h over live marks.
+Settings kept as rows by the configuration application (`examples/kv.c`)
+read, after a power loss at any operation, each as its last completed set
+or delete made it, or as the one cut short would; and after the next set,
+as one of the two on every later mount.
 
 - Priority: 3.
-- Source: A-3, A-9; FLICKER. A pair a power cut tore can read erased, like
-  the space after it, so a mount cannot tell where the last one stopped
-  writing. A complete mark a power cut left half programmed can read set
-  at one mount and not at the next; the new head's sequence is above any
-  such sector's.
-- Measure: as SAFE-15, with the loss at every program of the first set
-  after a mount, under each behaviour, then sets.
-- Pass: as SAFE-15. Fail: otherwise.
-- Verified by: `safe_kv_atomic`.
-
-#### ALFS-SAFE-17
-
-A get or a listing returns no pair whose check fails; such a pair is
-passed over, and counted. A pair's check, key and value come from one
-read. Its lengths cannot be trusted either, so the
-walk goes on at the next page, passing over the rest of its page.
-
-- Priority: 3.
-- Source: UC-11: a setting partly wrong is worse than one missing, which
-  the application replaces with its default.
-- Measure: a bit flipped in a pair's key, length, value and check.
-- Pass: the damaged pair is not returned; the pairs in other pages are.
-  Fail: a damaged byte returned.
-- Verified by: `safe_kv_check`.
+- Source: UC-11. The application appends a row for each change. Each new
+  log starts with a row for every current setting and a row that marks
+  them complete; the application erases older logs only once that mark is
+  synced. At boot it applies every row in order, and at a mark keeps only
+  the settings its log has set. So it relies on SAFE-01, SAFE-02 and
+  SAFE-15, and on logs growing in number (IF-09).
+- Measure: power loss at every operation of W-CFG's sets and deletes,
+  under each behaviour; after each, eight reloads reading every key; then
+  a set and eight more.
+- Pass: as stated. Fail: a key missing, wrong, or reading a value it never
+  had.
+- Verified by: `safe_cfg_atomic`.
 
 ### 6.4 Simplicity (SIMP)
 
 #### ALFS-SIMP-01
 
 The stores are C99: `alfs.h` (what they share), `alfs_flash.c` and
-`alfs_flash.h` (the checked flash operations they use), `alfs_kv.c` and
-`alfs_kv.h`, `alfs_obj.c` and `alfs_obj.h`, `alfs_log.c` and
-`alfs_log.h`. They use no dynamic memory, no recursion, no floating
+`alfs_flash.h` (the checked flash operations they use), `alfs_obj.c` and
+`alfs_obj.h`, `alfs_log.c` and `alfs_log.h`. They use no dynamic memory, no recursion, no floating
 point, and no library beyond `<stdint.h>`,
 `<stddef.h>`, `<stdbool.h>` and `<string.h>`. The task layer is one more
 source and header (`alfs_rtos.c`, `alfs_rtos.h`), which adds only the
@@ -842,22 +831,38 @@ FreeRTOS kernel's headers.
 - Verified by: `make target` (compiles each store alone, with
   `-std=c99 -Wall -Wextra -Werror -pedantic`), `make target-rt`; review.
 
+#### ALFS-SIMP-06
+
+Every log area runs the same code on the same format: the configuration
+area and the flight log area are two instances of `alfs_log`, and differ
+only in the rows their applications write. alfs has no code for
+settings.
+
+- Priority: S.
+- Source: the user: "An append only log and a append only key-value
+  store are identical, just two different reagions. They should have
+  100% code sharing." and "The application interprets the key-value vs
+  log data."
+- Measure: the build and a review: no source of alfs names a key or a
+  setting; the configuration application calls only `alfs_log.h`.
+- Pass: as stated. Fail: otherwise.
+- Verified by: review; `cfg_round_trip` and `safe_cfg_atomic`, which run
+  the configuration application on `alfs_log` as it is.
+
 #### ALFS-SIMP-02
 
-The stores together are at most 8.75 KiB on a Cortex-M0+ (Thumb, `-Os`),
-and the task layer at most 2.125 KiB.
+The stores together are at most 6.625 KiB on a Cortex-M0+ (Thumb, `-Os`),
+and the task layer at most 1.875 KiB.
 
 - Priority: S.
 - Source: the brief ("Simplicity will keep the code fast and flash
-  overhead cheap"). Built with Arm GNU Toolchain 13.2.Rel1, the stores
-  measure 8,755 bytes (the log area 3,173, the object area 2,669, the
-  configuration store 2,217, what they share 696) and the task layer
-  2,053. Each budget is its measurement plus about 1.5%, rounded up to a
-  multiple of 128 bytes, so that Arm GNU 14.2 builds fit too.
+  overhead cheap"). Each budget is an estimate, to be replaced by the
+  measurement plus about 1.5%, rounded up to a multiple of 128 bytes, so
+  that Arm GNU 14.2 builds fit too.
 - Measure: `arm-none-eabi-size` of `alfs_flash.o`, `alfs_log.o` and
   `alfs_obj.o`, and of `alfs_rtos.o`, text plus data; the task layer
   compiled against the kernel's generic Cortex-M0 port.
-- Pass: at most 8,960 and 2,176 bytes. Fail: more.
+- Pass: at most 6,784 and 1,920 bytes. Fail: more.
 - Verified by: `make target`, `make target-rt`.
 
 #### ALFS-SIMP-03
@@ -886,9 +891,7 @@ deepest chain no more than 512 bytes, the driver's own frames apart.
 
 - Priority: S.
 - Source: pyro's smallest task stack is 2 kB. The flash task's stack holds
-  the stores' deepest chain under the task's loop. Measured: 356 bytes
-  under `alfs_kv_set`, whose move of the head tidies the new head with a
-  walk that holds a key, and 404 under the flash task.
+  the stores' deepest chain under the task's loop.
 - Measure: the deepest chain of frames under each public call and under
   the task's function, from GCC's call graph (`-fcallgraph-info=su`) on
   the Cortex-M0+ build. A host build's stacks say nothing here: the
@@ -1044,20 +1047,22 @@ in growing number order.
 
 #### ALFS-IF-12
 
-A log write copies the caller's bytes into the writer's block; when the
-block is full, its bytes are programmed, all but less than a page's room;
-the write returns when every byte it was given is in flash or in the
+A log write copies the caller's row into the writer's block. When the
+row does not fit, the block's rows are programmed first: the chunks they
+fill, each holding the rows that fit in its page, and then, if the row
+still does not fit, the rest. The write returns when the row is in the
 block. A sync programs what the block holds.
 
 - Priority: S.
-- Source: the user's words on writes, section 1. Keeping the last part of
-  a page in the block packs the log into whole-page chunks between syncs.
+- Source: the user's words on writes, section 1. Keeping in the block the
+  rows that do not yet fill a chunk packs the log into full chunks between
+  syncs.
 - Verified by: `basic_round_trip`, `spd_write_burst_bounded`.
 
 #### ALFS-IF-13
 
 Erasing a log is refused with `ALFS_EOPEN` while it is being written, or
-while any log reader is open. A mount of either area is refused while any
+while any log reader is open. A mount of any area is refused while any
 of its handles is open.
 
 - Priority: S.
@@ -1067,49 +1072,27 @@ of its handles is open.
 
 #### ALFS-IF-14
 
-A key is 1 to 31 bytes, none of them 00h, compared byte for byte; a value
-is 0 to (page − 8 − the key's length) bytes. Setting a key's value empty
-deletes the key.
+A log write takes one row of 1 to R bytes, R the lesser of 255 and the
+page size less 38, and a read returns the next row of its stream whole.
+alfs gives a row no meaning. A row of 0 or more than R bytes is refused
+with `ALFS_EINVAL`, and so is a read into fewer bytes than the next row,
+which consumes nothing.
 
 - Priority: S.
-- Source: UC-11. A pair is one program, never across a page.
-- Verified by: `if_kv_keys`.
-
-#### ALFS-IF-15
-
-A listing returns, in one pass over the head sector, each live pair, key
-and value, in the order written: a later pair of a key replaces an earlier
-one, and an empty value deletes the key, so a cache that applies them in
-order holds every current pair. A set or delete between two calls of one
-listing makes the next call return `ALFS_EINVAL`: the listing starts
-again.
-
-- Priority: S.
-- Source: the user: "The UI code could cache a full copy after one scan
-  of the config store."
-- Verified by: `if_kv_list`.
-
-#### ALFS-IF-16
-
-The current pairs fit in one sector: a set that would not fit after the
-head is copied returns `ALFS_ENOSPC`, and every key reads as it did.
-
-- Priority: S.
-- Source: the user: "there are not that many keys in the system". A get
-  and a listing read one sector.
-- Verified by: `if_kv_full`.
+- Source: the user: "The only differences should be the application
+  that reads and writes rows." A row and its length byte fit the room a
+  sector's first page leaves for a chunk (page − 30 − 7).
+- Verified by: `if_rows`.
 
 ### 6.6 Observability and errors (OBS)
 
 #### ALFS-OBS-01
 
-The log area reports, at any moment: sectors ready, dirty and bad; bytes
+Each log area reports, at any moment: sectors ready, dirty and bad; bytes
 writable without an erase; the log being written; and its counts of
 programs, erases, failed programs, failed erases, failed checks and bytes
 lost. The object area reports the bytes its objects take and the bytes
-it can hold, whether the spare half is ready, and the same counts. The
-configuration store reports its head sector and its sequence, and the
-same counts.
+it can hold, whether the spare half is ready, and the same counts.
 
 - Priority: 3.
 - Source: UC-5 (the gate), UC-9, UC-10.
@@ -1128,7 +1111,7 @@ what the caller should do: retry, rebuild (format), or fail.
 #### ALFS-OBS-03
 
 Each area reports whether it is clean, so the caller can hold a launch
-until all unused flash is erased: the log area when no dirty sector
+until all unused flash is erased: a log area when no dirty sector
 remains, the object area when its spare half is ready.
 
 - Priority: 3.
@@ -1137,12 +1120,12 @@ remains, the object area when its spare half is ready.
 
 ### 6.7 The flash task (RT)
 
-The task layer serves one configuration store, one object area and one
-log area; every requirement above holds through it.
+The task layer serves any number of log areas and object areas, each an
+instance the application owns; every requirement above holds through it.
 
 #### ALFS-RT-01
 
-One task performs every flash operation of the three areas; the
+One task performs every flash operation of the areas it serves; the
 application's tasks reach the flash only through requests to it, served
 one at a time.
 
@@ -1158,8 +1141,8 @@ one at a time.
 #### ALFS-RT-02
 
 Every request blocks the task that made it until the flash task has done
-it. A log write returns when every byte it was given is in flash or in the
-block; a read returns bytes the flash task fetched.
+it. A log write returns when its row is in the block; a read returns a row
+the flash task fetched.
 
 - Priority: 1.
 - Source: the user's words on writes, section 1.
@@ -1167,13 +1150,14 @@ block; a read returns bytes the flash task fetched.
 
 #### ALFS-RT-03
 
-A log write whose bytes all fit in the block, without filling it, sends no
-request; nor does a log read served from what the block already holds.
+A log write whose row fits in the block's room sends no request; nor
+does a log read of a row the block already holds.
 
 - Priority: 1.
 - Source: "Writes collect in the writer function and then spill to the
   flash ops task when enough data is collected."
-- Measure: requests counted during writes smaller than the block's room.
+- Measure: requests counted during writes of rows that fit in the block's
+  room, and reads of rows the block holds.
 - Pass: none. Fail: any.
 - Verified by: `rt_fast_path`.
 
@@ -1237,17 +1221,17 @@ its steps.
 
 | Use case | Requirements |
 |---|---|
-| UC-1 flight log | SPD-01 to SPD-04, SPD-06, SPD-07, LIFE-02, LIFE-03, IF-10, IF-12 |
+| UC-1 flight log | SPD-01 to SPD-04, SPD-06, SPD-07, LIFE-02, LIFE-03, IF-10, IF-12, IF-14 |
 | UC-2 high-rate log | SPD-02, SPD-03, SPD-06, LIFE-02, IF-10 |
 | UC-3 restart after a reset | SPD-05, SAFE-04, IF-09, IF-10 |
 | UC-4 newest flights | IF-09, IF-11, IF-13, SAFE-11 |
 | UC-5 erase before flight | SPD-01, LIFE-01, SAFE-05, OBS-01, OBS-03, RT-07 |
-| UC-6 read back | SAFE-03, SAFE-08, SPD-08, IF-10 |
+| UC-6 read back | SAFE-03, SAFE-08, SAFE-15, SPD-08, IF-10 |
 | UC-7 power cut | SAFE-01, SAFE-02, SAFE-04, SAFE-12, SAFE-13 |
 | UC-8 wrong geometry | SAFE-09, IF-02 |
 | UC-9 write failures | SAFE-06, OBS-01 |
 | UC-10 unattended flash | LIFE-04, SAFE-07, SAFE-10, SPD-09, OBS-01, OBS-02 |
-| UC-11 configuration | SPD-10, LIFE-05, SAFE-15 to SAFE-17, IF-14 to IF-16 |
+| UC-11 configuration | LIFE-05, SAFE-15, SAFE-16, IF-14, SIMP-06 |
 | UC-12 Lua programs | IF-05 to IF-08, SAFE-12 to SAFE-14 |
 | UC-13 many tasks | RT-01 to RT-07 |
 
@@ -1258,6 +1242,8 @@ its steps.
 - `docs/datasheets/` and its `README.md`: the four flash parts and the
   RP2040.
 - `docs/FLASH_PROBE.md`: what the probe measures on the parts themselves.
+- `examples/kv.c`: the configuration application, which keeps settings as
+  rows of a log area.
 - The littlefs fork (github.com/n9wxu/littlefs), branch `v3-integration`
   at 58367256: `bd/lfs3_emubd.h` (the fault model), `lfs3.h` (A-3),
   `benches/bench_wlog.toml` (W-LOG).

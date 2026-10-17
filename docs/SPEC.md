@@ -1,4 +1,4 @@
-# alfs on-disk format, version 4
+# alfs on-disk format, version 5
 
 Every byte alfs writes, and how it reads them back. Little-endian
 throughout; every check is CRC-32 (reflected, polynomial 0xEDB88320,
@@ -7,9 +7,11 @@ is the sector size and P the page size, both from the configuration.
 Offsets are from the start of a sector, or of a half. The erase value is
 0xFF; "erased" means every byte reads 0xFF.
 
-alfs has three areas, each configured on its own: the log area (sections
-1 to 5), the object area (sections 6 to 10) and the configuration store
-(sections 11 to 14). None reads or writes another.
+alfs has two kinds of area, each configured on its own: log areas
+(sections 1 to 5) and the object area (sections 6 to 10). An application
+may give alfs several log areas, as one for its configuration and one for
+its flights; each holds the format of sections 1 to 5. None reads or
+writes another. What a row holds is the application's.
 
 ---
 
@@ -29,7 +31,7 @@ otherwise).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, "alfl" |
-| 4 | 1 | version, 4 |
+| 4 | 1 | version, 5 |
 | 5 | 1 | log2 S |
 | 6 | 1 | log2 P |
 | 7 | 1 | 0 |
@@ -73,10 +75,21 @@ sequences are greater, and grow in the order the log took them.
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 2 | length of the payload, 1 or more |
+| 0 | 2 | length of the payload, 2 or more |
 | 2 | 1 | tag: the stream |
 | 3 | 4 | CRC of the length, the tag and the payload |
-| 7 | length | payload |
+| 7 | length | payload: one or more rows |
+
+A row in a payload:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | n, the row's length: 1 to 255 |
+| 1 | n | the row |
+
+The rows fill the payload exactly. A row is at most R = min(255, P − 38)
+bytes, so that it and its length fit the room a sector's first page
+leaves after D and a chunk header.
 
 A chunk never crosses a page. A sector's first chunk starts at D; each
 later chunk at the end of the one before, or at the start of a later page.
@@ -106,14 +119,16 @@ their sequences.
   (section 4), so it is the next sector of the log forward.
 
 Within a sector, from D, each place holds a chunk header, or is the end:
-- **Fewer than 8 bytes to the page's end:** no chunk fits; the next page.
+- **Fewer than 9 bytes to the page's end:** no chunk fits; the next page.
 - **Erased header:** the rest of the page holds nothing; the next page.
-- **A length of 0, or one past the page's end:** the header is damaged.
-  One failed check is counted, and reading goes on at the next page.
+- **A length under 2, or one past the page's end:** the header is
+  damaged. One failed check is counted, and reading goes on at the next
+  page.
 - **Another stream's chunk:** skipped by its length, unchecked.
-- **The stream's own chunk:** its CRC is checked. A right one gives its
-  payload. A wrong one counts one failed check, and reading goes on at
-  the next page.
+- **The stream's own chunk:** its CRC is checked, and its rows' lengths
+  must fill its payload exactly. A chunk that passes both gives its rows,
+  in order. One that fails either counts one failed check, and reading
+  goes on at the next page.
 
 The sector ends at its last page.
 
@@ -145,9 +160,12 @@ since its erase.
 with the bytes it reads (A-9), the claim with the next sequence, and the
 sector's first chunk.
 
-**Chunks** fill pages. A writer's block is programmed as chunks, each as
-long as the room left in the current page allows. Two writers of one log
-add their chunks at the same place, one after the other.
+**Chunks** hold whole rows. A writer's block holds its rows as a chunk's
+payload does, each after its length, and is programmed as chunks, each
+holding the rows that fit in the room left in the current page. When the
+next row does not fit there, the chunk goes at the start of the next
+page, or in a new sector. Two writers of one log add their chunks at the
+same place, one after the other.
 
 **A program that fails** (an error, or a read-back that differs) is
 counted, and its payload is dropped and counted as lost. The next chunk
@@ -190,7 +208,7 @@ objects start at its second page.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, "alfo" |
-| 4 | 1 | version, 4 |
+| 4 | 1 | version, 5 |
 | 5 | 1 | log2 S |
 | 6 | 1 | log2 P |
 | 7 | 1 | 0 |
@@ -282,121 +300,3 @@ while it is open.
 Both halves are erased, read back as erased and stamped. Half 0 then takes
 its begun mark and a commit of sequence 1 and end P: a store with no
 objects.
-
----
-
-## 11. The configuration store
-
-The store is a ring of sectors. One of them, the **head**, holds the
-current pairs; the others hold pairs the head has replaced.
-
-| Offset | Size | Field | Written |
-|---|---|---|---|
-| 0 | 18 | claim | after the sector is erased, when it becomes the head |
-| 18 | 1 | complete mark | 00h, after every current pair is copied in |
-| 19 | | pairs | by copies and sets |
-
-### 11.1 The claim
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | magic, "alfk" |
-| 4 | 1 | version, 4 |
-| 5 | 1 | log2 S |
-| 6 | 1 | log2 P |
-| 7 | 1 | 0 |
-| 8 | 2 | sectors in the store |
-| 10 | 4 | sequence: one more than the largest when it was written |
-| 14 | 4 | CRC of bytes 0 to 13 |
-
-A claim is **valid** when bytes 0 to 9 are as the configuration makes them
-and its CRC is right.
-
-### 11.2 A pair
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 1 | live mark: FFh live, 00h replaced |
-| 1 | 1 | key length, 1 to 31 |
-| 2 | 2 | value length |
-| 4 | key length | key |
-| 4 + k | value length | value |
-| 4 + k + v | 4 | CRC of bytes 1 to 3 + k + v |
-
-A pair never crosses a page. The first starts at 19; each later one at
-the end of the one before, or at the start of a later page. A pair whose
-value is empty records a delete.
-
----
-
-## 12. What a sector is
-
-A sector is **complete** when its claim is valid and its complete mark is
-00h. The head is the complete sector with the greatest sequence. With no
-complete sector, the store holds no pairs.
-
-Within the head, from 19, each place holds a pair, or is the end of what
-its page holds:
-- **Fewer than 9 bytes to the page's end, or a pair header that reads
-  erased:** the next page.
-- **A key length of 0 or over 31, a pair past the page's end, or a wrong
-  CRC:** a damaged pair. One failed check is counted, and the walk goes on
-  at the next page.
-- **A whole pair:** live or replaced, by its live mark.
-
-The sector ends at its last page.
-
----
-
-## 13. Reading
-
-Each pair is read whole, once, and its CRC checked on that read; its key
-and value are taken from the same read. A bit a power loss left reading
-either way can make one read of a pair whole and the next damaged.
-
-A key's value is that of its **last** live, whole pair in the head, in the
-order of the walk. Normally a key has one live pair; a power loss between
-a set's two programs can leave two, and the later is the value. An empty
-value means the key is deleted.
-
-A listing walks the head and returns each live, whole pair in order,
-empty ones included. A later pair of a key replaces an earlier one, and an
-empty value deletes the key, so pairs applied in order give the current
-ones.
-
----
-
-## 14. Setting
-
-**The first set or delete in a mount** moves the head, as below, even when
-the head has room. A pair a power loss tore can read erased, like the
-space after it, so after a mount alfs programs nothing in the old head
-again.
-
-**A set** of key K:
-1. **The pair** is programmed where the last one ended, or at the next
-   page start when the room left in the page is too small.
-2. **Every earlier live pair of K** in the head has its live mark
-   programmed with 00h.
-
-**Moving the head.** When the head has no room for the pair, and at the
-first set in a mount, the sector after it round the ring becomes the
-head:
-1. It is erased and read back as erased.
-2. Its claim is programmed, with the next sequence.
-3. Every live, whole pair of the old head but K's is copied in, in order,
-   from the read its CRC passed; then K's new pair, unless the set is a
-   delete.
-4. In the new head, every live pair a later live pair of its key follows,
-   and every empty one, has its live mark programmed with 00h, in order.
-5. Its complete mark is programmed.
-
-The old head then holds only pairs the new one has replaced. If the pair
-still has no room, the set returns `ALFS_ENOSPC`. With no head, the first
-set makes sector 0 the head the same way, with nothing to copy.
-
-The next sequence at mount is one more than the largest valid claim's.
-A claim a power loss tore holds that sequence at most, and lies in the
-sector after the head, which is erased before the sequence is given
-again.
-

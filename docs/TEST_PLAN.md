@@ -1,6 +1,6 @@
 # alfs test plan
 
-**Status: draft 4.** Every requirement in `docs/REQUIREMENTS.md` names its
+**Status: draft 5.** Every requirement in `docs/REQUIREMENTS.md` names its
 test; this document says how the tests work and what each one does.
 
 ---
@@ -86,8 +86,9 @@ program gives it 0 (A-9), and stays unsettled when given 1.
 
 ## 3. The rig (`tests/test_alfs.c`)
 
-**The chip** holds a gap sector, the configuration store (three sectors),
-the object area, the log area and another gap sector, in that order. The gaps hold random bytes that every test
+**The chip** holds a gap sector, the configuration area (a log area of
+three sectors), the object area, the flight log area and another gap
+sector, in that order. The gaps hold random bytes that every test
 checks are unchanged at its end (SAFE-09), and no address is ever taken
 as an offset.
 
@@ -103,7 +104,6 @@ requirements as it runs:
 |---|---|---|
 | `CALL` | every call that may not erase | no erase (SPD-01); records the longest single operation (SPD-06) |
 | `OCALL` | a put or delete | no erase when the spare half was ready before it (SPD-01, LIFE-01) |
-| `KCALL` | a configuration set or delete | at most one erase, and only when the head moved to another sector (SPD-01, SPD-10) |
 | `LERASE`, `OERASE`, `OFORMAT` | `alfs_log_erase`, `alfs_obj_erase`, `alfs_obj_format` | none; the erase count is the test's to check |
 
 `DONE` ends every test: it fails the test on any flash violation, any call
@@ -111,22 +111,30 @@ that broke its bound, or any change to a gap sector. So SPD-01, SPD-03,
 IF-02 and SAFE-09 are checked by every test, not only the ones named for
 them.
 
-**Rows.** A 22-byte row carries its sequence number and a CRC-32, so a
-test can tell good data from bad without alfs's help.
+**The configuration application** (`examples/kv.c`) is built into the
+suite and given the configuration area. Its own calls into alfs go
+unwrapped, since it erases there by design; the flash rules and the gaps
+are still checked by `DONE`.
+
+**Rows.** A W-LOG row is 22 bytes and carries its sequence number and a
+CRC-32, so a test can tell good data from bad, and a row cut or shifted,
+without alfs's help. Tests that write a run of bytes write it as rows of
+200 bytes, the last one shorter, and read it back row by row.
 
 **Workloads** (requirements 4.5):
 
 - `log_run`: W-LOG. Rows at 1 or 50 a second, written every 200 ms, synced
   every second, and an erase step every 20 ms when asked. It records every
   byte alfs took and how many a successful sync covered.
-- W-HR: 480 bytes every 20 ms, synced every second.
+- W-HR: ten 48-byte rows every 20 ms, synced every second.
 - `ring`: W-RING. W-LOG at 50 rows a second, a new log every `every` rows,
   the oldest erased while fewer than two logs' worth of sectors are
   ready, an erase step every 20 ms, until every sector has been erased a
   number of times. Run on a 32-sector area so it cycles quickly.
 - `kv_step` and `cfg_step`: W-CFG. A script of sets and deletes of ten
-  keys, each value's bytes a function of a generation number; and of puts
-  and deletes of a 4,096-byte and a 300-byte program.
+  keys through the configuration application, each value's bytes a
+  function of a generation number; and of puts and deletes of a
+  4,096-byte and a 300-byte program.
 
 ---
 
@@ -136,50 +144,48 @@ test can tell good data from bad without alfs's help.
 |---|---|---|
 | `sim_torn_obeys_a9` | 4.4 | Each power-loss behaviour, 500 torn programs of random data into erased bytes and over programmed ones: no bit the data left 1 ever reads 0, on any of 16 reads. |
 | `if_geometry` | IF-02 | Refuses seven bad geometries for each area, and an object area of an odd sector count, with no operation. A log area mounted with another sector count finds every sector dirty; an object area mounted with another half size finds no store. |
-| `if_endian` | IF-03, SIMP-05 | Checks a log sector's stamp, claim and chunk, and a half's stamp, begun mark, commit and object, against `docs/SPEC.md`: the magics, version 4, the geometry, the words little-endian, the checks. |
+| `if_endian` | IF-03, SIMP-05 | Checks a log sector's stamp, claim and chunk, with its row's length, and a half's stamp, begun mark, commit and object, against `docs/SPEC.md`: the magics, version 5, the geometry, the words little-endian, the checks. |
 | `if_object_names` | IF-05 | Names of 1 and 31 bytes, and one with `/`, put and got, before and after a remount; 0 and 32 bytes, and none, refused with no operation; a prefix of a name does not get it. |
 | `if_put_replaces` | IF-06 | A put of an object that exists: a get during the put reads the old bytes, after the commit the new. A delete, a delete of an object that does not exist, writing past the size, and committing short. The same after a remount. |
 | `if_put_one_at_a_time` | IF-06 | A second put, and a delete, during a put are refused with `ALFS_EOPEN`; after an abandon the old object reads and a put succeeds. |
 | `if_get_snapshot` | IF-07 | A reader opened before a put commits reads the old bytes to the end; a put, delete or erase that would erase its half meanwhile is refused with `ALFS_EOPEN`, and succeeds after it closes. |
 | `if_object_list` | IF-08 | Three objects, one deleted and one put again: listed with names and sizes, the same after a remount. |
 | `if_log_numbers_never_reused` | IF-09 | Numbers grow; erasing the newest log and remounting does not give its number again; a log's first claim, and its first chunk, torn by FLICKER, METASTABLE or SOMEBITS, each followed by eight remounts each starting a log: no number is given twice. |
-| `if_log_streams` | IF-10 | Two writers of one log, tags 1 and 2, interleaved: each stream reads back its own bytes, a third tag reads none; the same after a remount. |
+| `if_log_streams` | IF-10 | Two writers of one log, tags 1 and 2, with rows of 22 and 160 bytes interleaved: each stream reads back its own rows, a third tag reads none; the same after a remount. |
 | `if_log_new_after_mount` | IF-10, SAFE-04 | After a remount, writing to the log written before is refused; a new log starts in a sector of its own, and the old one reads whole. |
 | `if_log_list` | IF-11 | Three logs of different lengths: listed in growing number with the sectors each holds, against the simulator's flash. |
 | `if_log_refusals` | IF-13 | Erasing the log being written, starting a log while a writer is open, erasing while a reader is open, and mounting with a handle open: each refused with `ALFS_EOPEN`, then allowed once closed. |
-| `basic_round_trip` | IF-12 | Seven sizes, 1 byte to 20,000, with blocks of one page and of 4,096 bytes: written, read, remounted, read. |
-| `spd_no_erase_outside_erase` | SPD-01 | W-LOG at both rates, two minutes, with erase steps; W-CFG with the spare made ready between puts. |
-| `spd_write_burst_bounded` | SPD-02, IF-12 | 30 seconds of 480-byte writes (W-HR) and of 22-byte writes, with blocks of one page and of 4,096 bytes: every write, sync and close within its program bound for the bytes it programmed. |
-| `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no erase, from write and sync; after one sector of an older log is erased, the held bytes are written and read back. |
-| `spd_mount_reads_bounded` | SPD-05 | A mount of a 128-sector log area holding logs reads at most 30 bytes a sector; of an object area holding objects, at most 29 bytes a half; of a configuration store holding pairs, at most 19 bytes a sector; none does an operation. |
+| `basic_round_trip` | IF-12 | Seven sizes, 1 byte to 20,000, as rows, with blocks of one page and of 4,096 bytes: written, read, remounted, read. |
+| `spd_no_erase_outside_erase` | SPD-01 | W-LOG at both rates, two minutes, with erase steps; W-CFG's puts with the spare made ready between them. |
+| `spd_write_burst_bounded` | SPD-02, IF-12 | 30 seconds of W-HR's 48-byte rows and of 22-byte rows, ten a tick, with blocks of one page and of 4,096 bytes: every write, sync and close within its program bound for the bytes it programmed. |
+| `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no erase, from write and sync, the refused row not taken; after one sector of an older log is erased, the held rows are written and read back. |
+| `spd_mount_reads_bounded` | SPD-05 | A mount of a 128-sector log area holding logs, and of the configuration area holding settings, reads at most 30 bytes a sector; of an object area holding objects, at most 29 bytes a half; none does an operation. |
 | `spd_wlog_longest_stall` | SPD-06 | Ten minutes of W-LOG at 50 rows a second: no operation longer than one program. |
 | `spd_cpu_linear` | SPD-07 | The same writes and syncs on 32 and 2,048 sectors read the same bytes. |
 | `spd_read_next_bounded` | SPD-08 | A log written across dirty sectors left in its way: reading it reads at most one header for each of its sectors and each sector between them, plus two. The read that finds the log's end scans every header, and is not counted. |
 | `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. W-CFG: a put erases nothing when the spare is ready, and each sector of a half once when not. |
-| `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and W-HR, against the bound computed from the counts the driver wrapper keeps. |
+| `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and a minute of W-HR, against the bound computed from the counts the driver wrapper keeps. |
 | `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, then the log erased: erases at most the sectors the log filled, plus one. Prints the count. |
 | `life_wear_level` | LIFE-04 | W-RING until every sector is erased ten times: counts within 2. |
 | `safe_powerloss_durable` | SAFE-01 | Each behaviour, power lost at every operation of a 20-second W-LOG with erase steps. Then the rest of the case runs as below. |
 | `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss after the restart in every third case. |
 | `safe_no_program_after_torn` | SAFE-04 | The same runs, for the simulator's check that nothing programs a page a power loss touched. |
-| `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a chunk of a two-stream log: what reads back is the stream with at most one page's chunks cut out, and one failure counted when one was. |
+| `safe_no_false_data` | SAFE-03, SAFE-15 | 200 trials of one bit flipped in a chunk of a two-stream log of 100-byte rows: what reads back is the stream with at most one page's chunks cut out, in whole rows, and one failure counted when one was. |
 | `safe_write_only_verified_ready` | SAFE-05 | An ERASENOOP log sector is found out by its erase and never programmed; an ERASENOOP sector in the spare half makes a put fail and the store reads as it did. Power lost in erases is covered by the power-loss runs. |
-| `safe_prog_failure` | SAFE-06 | The sector being written goes PROGERROR, PROGNOOP or PROGFLIP: the bytes read back and the bytes counted lost add up to the bytes written, and what reads back is what was written with runs cut out. |
+| `safe_prog_failure` | SAFE-06, SAFE-15 | The sector being written goes PROGERROR, PROGNOOP or PROGFLIP: the bytes of the rows read back and the bytes counted lost add up to the rows written, what reads back is what was written with runs cut out, and every row read is whole. |
 | `safe_bad_sector` | SAFE-07 | ERASEERROR and ERASENOOP log sectors are counted bad, found bad again after a remount, never programmed. Wear-out under W-RING: logging goes on until the flash is worn. An ERASEERROR sector in the spare half: puts fail with `ALFS_EPROG`, every object reads. |
-| `safe_read_retry` | SAFE-08 | Reads that fail once, in each mount, open and read of both areas: each retried call gets the right bytes. |
-| `safe_foreign_area` | SAFE-09 | Random and blank areas: the log area mounts with every sector dirty, the object area with `ALFS_ENOFS`. An area past the chip: `ALFS_EGEOMETRY`. No operation in any. |
-| `safe_fuzz` | SAFE-10, SPD-09 | 300 images of each area with bits flipped, headers randomised, headers copied, or everything random but one stamp: every call of both stores, under the sanitizers. |
+| `safe_read_retry` | SAFE-08 | Reads that fail once, in each mount, open and read of the flight log area and the object area: each retried call gets the right bytes. |
+| `safe_foreign_area` | SAFE-09 | Random and blank areas: both log areas mount with every sector dirty, the object area with `ALFS_ENOFS`, the configuration application loads no settings. An area past the chip: `ALFS_EGEOMETRY`. No operation in any. |
+| `safe_fuzz` | SAFE-10, SPD-09 | 300 images of the flight log area and the object area with bits flipped, headers randomised, headers copied, or everything random but one stamp: every call of both stores, under the sanitizers. |
 | `safe_log_erase` | SAFE-11 | Power lost at every operation of erasing a log, each behaviour, and erasing finished after a remount: the log never reads again through eight remounts, before then reads only its own chunks, and the other log reads whole. A log with a claim torn by FLICKER is erased whole. |
 | `safe_put_atomic` | SAFE-12, SAFE-13 | W-CFG with power lost at every operation, each behaviour. After each loss, eight remounts reading every object, then a put and eight more. Each object reads as its last committed put or delete made it, or as the one cut short would. |
 | `safe_obj_check` | SAFE-14 | One bit flipped in an object's name, size, payload or check: no damaged byte returned; the objects before it read, and those after it unless its size was hit. |
-| `if_kv_keys` | IF-14 | Keys of 1 and 31 bytes set and got, before and after a remount; 0 and 32 bytes refused; the longest value a page holds accepted, one byte more refused; an empty value deletes. |
-| `if_kv_list` | IF-15 | Ten keys, some set again and some deleted: one listing, applied in order to a cache, gives each current pair with its value, the same after a remount; a set between two calls makes the next return `ALFS_EINVAL`. |
-| `if_kv_full` | IF-16 | Pairs set until a set returns `ALFS_ENOSPC`: every key reads as before it. |
-| `spd_kv_set_bounded` | SPD-10, SPD-01 | W-CFG's sets, with remounts: two programs and no erase while the head has room; one erase when it has none, and at the first set in a mount. |
-| `life_kv_round_robin` | LIFE-05 | Sets until the head has gone round the store ten times: erase counts within 1. |
-| `safe_kv_atomic` | SAFE-15, SAFE-16 | Power lost at every operation of W-CFG's sets and deletes, each behaviour. After each loss, eight remounts reading every key, then a set and eight more. Each key reads as its last returned set made it, or as the one cut short would. |
-| `safe_kv_check` | SAFE-17 | Three pairs, one a page; one bit flipped in a pair's key, lengths, value or check: the pair is not returned; the others are. |
-| `obs_status` | OBS-01 | Counts against the simulator's, for both areas, before and after logging, puts and a remount. |
+| `if_rows` | IF-14 | Rows of 1 and R bytes, and of every length between in a second log, written and read back whole, before and after a remount; rows of 0 and R + 1 bytes refused with no operation; a read into one byte fewer than the next row refused, and the row then read whole. |
+| `safe_rows_whole` | SAFE-15 | Chunks planted with valid checks whose row lengths run past the payload, stop short of it, or hold a row of length 0, between good chunks: each skipped with one failure counted, and the rows of the good chunks read whole. |
+| `cfg_round_trip` | SIMP-06 | Through the configuration application on the configuration area: ten keys set, set again and deleted, read back after each step and after reloads; a delete of an absent key writes nothing; a key of 32 bytes and a row longer than R refused; enough sets for the area's ring to turn several times. |
+| `life_cfg_wear` | LIFE-05 | Sets through the configuration application, with a reload every 50, until every sector of the configuration area has been erased ten times: counts within 2. |
+| `safe_cfg_atomic` | SAFE-16 | Power lost at every operation of W-CFG's sets and deletes through the configuration application, each behaviour, with a reload in the middle. After each loss, eight reloads reading every key, then a set and eight more. Each key reads as its last returned set made it, or as the one cut short would. |
+| `obs_status` | OBS-01 | Counts against the simulator's, for the flight log area and the object area, before and after logging, puts and a remount. |
 | `obs_clean` | OBS-03 | The log area not clean when it holds a dirty sector, clean once erased; the object area not clean after a put, clean once its spare is ready. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
 | `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds each store alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 384 bytes, from GCC's call graph. |
@@ -216,13 +222,13 @@ one runs outside the flash task once the scheduler is up.
 | Test | Requirement | What it does |
 |---|---|---|
 | `rt_round_trip` | RT-02, RT-05 | Mount, start a log, write, sync, close, read, list, erase, through requests; the flash task runs at the priority given. |
-| `rt_serialises` | RT-01 | Two writer tasks on two streams of a log, a reader, a task putting objects and setting pairs, with erase steps between: every stream, object and pair reads back whole; no operation outside the flash task, none overlapping. |
-| `rt_fast_path` | RT-03 | Writes smaller than the block's room, and reads from what the block holds, send no request; the write that fills the block sends one. |
+| `rt_serialises` | RT-01 | Two writer tasks on two streams of a log, a reader, a task putting objects and writing logs of the configuration area, with erase steps between: every stream, object and row reads back whole; no operation outside the flash task, none overlapping. |
+| `rt_fast_path` | RT-03 | Rows that fit in the block's room, and reads of rows the block holds, send no request; the write whose row does not fit sends one, and so does the read that fetches a chunk. |
 | `rt_before_scheduler` | RT-06 | Mount, erase, a log started and written, and a put, before the scheduler starts, run directly, and read back after it starts. |
 | `rt_reentry_refused` | RT-06 | A driver that calls alfs from inside an operation is refused with no effect; a log handle used from another task is refused. |
 | `rt_erase_interleaves` | RT-07 | An erase of the whole log area requested by one task; a write and sync requested by another meanwhile complete before the erase does. |
 | `rt_read_while_writing` | RT-02 | One task writes and syncs a log while another reads it: the reader gets a prefix of what was synced, in order. |
-| `rt_objects` | RT-02 | Put, get, list and delete through requests, with the spare made ready by erase steps; configuration pairs set, got, listed and deleted. |
+| `rt_objects` | RT-02 | Put, get, list and delete through requests, with the spare made ready by erase steps; then the configuration area, a second log area, mounted, written, read, listed and erased through the same task. |
 
 **Not tested here:** priorities and core affinity under SMP. The POSIX port
 has one core, so pyro's two-core scheduling is not reproduced.
