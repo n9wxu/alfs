@@ -98,6 +98,12 @@ typedef struct sim {
     /* this call */
     uint64_t c_ops, c_programs, c_erases, c_bytes_read, c_time_us, c_max_op_us;
 
+    /* A store that writes a page reading erased as erased, though a power
+     * loss may have torn it, sets torn_ok: such programs are counted, not
+     * flagged. */
+    bool torn_ok;
+    uint64_t torn_programs;
+
     /* violations */
     int violations;
     char why[160];

@@ -1,5 +1,5 @@
 #!/bin/sh
-# SIMP-02: text + data of the stores' objects at most BUDGET bytes on a
+# SIMP-02: text + data of the store's objects at most BUDGET bytes on a
 # Cortex-M0+. SIMP-04: the deepest chain of stack frames under each public
 # call at most 320 bytes, from GCC's call graphs (-fcallgraph-info=su) of
 # all of them; the driver's own frames are the caller's to add.
@@ -8,7 +8,7 @@ set -e
 budget=$1
 shift
 size=$(arm-none-eabi-size "$@" | awk 'NR > 1 { s += $1 + $2 } END { print s }')
-echo "stores: $size bytes (budget $budget)"
+echo "store: $size bytes (budget $budget)"
 [ "$size" -le "$budget" ] || { echo "SIMP-02 fails"; exit 1; }
 cis=$(for o in "$@"; do echo "${o%.o}.ci"; done)
 python3 - $cis <<'PY'
@@ -26,7 +26,7 @@ for path in sys.argv[1:]:
 @functools.lru_cache(None)
 def depth(n):
     return size.get(n, 0) + max([depth(t) for t in calls.get(n, []) if t != n] or [0])
-worst = sorted(((depth(n), n) for n in size if n.startswith(("alfs_log_", "alfs_obj_"))), reverse=True)
+worst = sorted(((depth(n), n) for n in size if n.startswith(("alfs_fs_", "alfs_file_"))), reverse=True)
 for d, n in worst[:5]:
     print(f"stack {d:4d}  {n}")
 if worst[0][0] > 320:

@@ -219,15 +219,22 @@ static int sim_prog(void *ctx, uint32_t addr, const void *data, uint32_t len) {
     if (addr / s->page_size != (addr + len - 1) / s->page_size)
         violate(s, "program across a page", addr);
     uint32_t page = addr / s->page_size;
+    bool into_torn = false;
     for (uint32_t i = 0; i < len; i++) {
         uint32_t a = addr + i;
         if (settles(s, a, buf[i]))
             continue;
+        if (s->torn[a] && s->torn_ok) {
+            into_torn = true;
+            continue;
+        }
         if (s->torn[a])
             violate(s, "program into bytes a power loss touched", a);
         if (s->done[a])
             violate(s, "byte programmed twice", a);
     }
+    if (into_torn)
+        s->torn_programs++;
     count(s, SIM_T_PROG_US);
     s->programs++;
     s->c_programs++;

@@ -1,28 +1,25 @@
-# alfs: `make test` runs the stores' host suite on 8 simulator seeds under
-# the address and undefined behaviour sanitizers; `make soak` on 100 seeds
+# alfs: `make test` runs the host suite on 8 simulator seeds under the
+# address and undefined behaviour sanitizers; `make soak` on 100 seeds
 # without them; `make target` checks the Cortex-M0+ budgets of SIMP-02 to
-# SIMP-04. `make test-rt` and `make target-rt` do the same for the flash
-# task (alfs_rtos.c). T=name runs the tests whose names contain it;
-# SEEDS="..." the seeds given. `make probe` builds the flash probe
-# (docs/TEST_PLAN.md 7).
+# SIMP-04. `make tests-compile` compiles the tests alone: on this branch the
+# store (alfs_fs.c) is not written yet, so only that runs. T=name runs the
+# tests whose names contain it; SEEDS="..." the seeds given. `make probe`
+# builds the flash probe (docs/TEST_PLAN.md 7).
 
 CC ?= cc
 ARMCC ?= arm-none-eabi-gcc
 ARMSIZE ?= arm-none-eabi-size
 WARN = -std=c99 -Wall -Wextra -Werror -pedantic
-CFLAGS = $(WARN) -O1 -g -I. -Itests -Iexamples
+CFLAGS = $(WARN) -O1 -g -I. -Itests
 SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 PICO_SDK_PATH ?= $(HOME)/.pico-sdk/sdk/2.2.0
 PICO_TOOLCHAIN_PATH ?= $(HOME)/.pico-sdk/toolchain/14_2_Rel1
 
-# The stores: what they share, the object area, a log area. The
-# configuration application (examples/kv.c) is the suite's, not alfs's.
-STORES = alfs_flash.c alfs_obj.c alfs_log.c
-STORE_H = alfs.h alfs_flash.h alfs_obj.h alfs_log.h
-TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c examples/kv.c
-TEST_H = tests/sim.h tests/tf.h examples/kv.h
-STORE_BUDGET = 6784
-RT_BUDGET = 1920
+STORES = alfs_flash.c alfs_fs.c
+STORE_H = alfs.h alfs_flash.h alfs_fs.h
+TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
+TEST_H = tests/sim.h tests/tf.h
+STORE_BUDGET = 6144
 
 all: test
 
@@ -49,7 +46,7 @@ test: build/test_alfs
 	$(call run_seeds,./build/test_alfs,$(SEEDS))
 
 build/test_alfs_fast: $(STORES) $(STORE_H) $(TEST_SRC) $(TEST_H) | build
-	$(CC) $(WARN) -O2 -I. -Itests -Iexamples -o $@ $(STORES) $(TEST_SRC)
+	$(CC) $(WARN) -O2 -I. -Itests -o $@ $(STORES) $(TEST_SRC)
 
 soak: build/test_alfs_fast
 	$(call run_seeds,./build/test_alfs_fast,$(shell seq 1 100))
@@ -59,7 +56,7 @@ tests-compile: | build
 	$(CC) $(CFLAGS) -c tests/test_alfs.c -o build/test_alfs.o
 	$(CC) $(CFLAGS) -c tests/sim.c -o build/sim.o
 	$(CC) $(CFLAGS) -c tests/tf.c -o build/tf.o
-	$(CC) $(CFLAGS) -c examples/kv.c -o build/kv.o
+	$(CC) $(CFLAGS) -c alfs_flash.c -o build/alfs_flash.o
 
 STORE_M0 = $(STORES:%.c=build/%_m0.o)
 
@@ -78,38 +75,4 @@ probe:
 clean:
 	rm -rf build
 
-# The flash task (alfs_rtos.c) against FreeRTOS-Kernel, fetched once into
-# build/_deps. ALFS_RT_KERNEL names another copy; FREERTOS_KERNEL_PATH is
-# deliberately not read, since a shell may export a stale one.
-ALFS_RT_KERNEL ?= build/_deps/FreeRTOS-Kernel
-RT_TAG = V11.3.1
-RT_POSIX = $(ALFS_RT_KERNEL)/portable/ThirdParty/GCC/Posix
-RT_KSRC = $(ALFS_RT_KERNEL)/tasks.c $(ALFS_RT_KERNEL)/queue.c $(ALFS_RT_KERNEL)/list.c \
-	$(RT_POSIX)/port.c $(RT_POSIX)/utils/wait_for_event.c
-RT_INC = -I. -Itests -Itests/rtos -I$(ALFS_RT_KERNEL)/include -I$(RT_POSIX) -I$(RT_POSIX)/utils
-
-$(ALFS_RT_KERNEL):
-	git clone -q --depth 1 --branch $(RT_TAG) https://github.com/FreeRTOS/FreeRTOS-Kernel.git $@
-
-build/rt_kernel.a: | build $(ALFS_RT_KERNEL)
-	cd build && rm -f rt_*.o && for f in $(abspath $(RT_KSRC)); do \
-		$(CC) -std=gnu99 -O1 -g -w $(addprefix -I$(CURDIR)/,$(patsubst -I%,%,$(RT_INC))) -c $$f -o rt_$$(basename $$f .c).o || exit 1; done
-	ar rcs $@ build/rt_*.o
-
-build/test_rtos: $(STORES) $(STORE_H) alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
-	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(SAN) $(RT_INC) -o $@ $(STORES) alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
-
-# The tests leave each deleted task's memory allocated, since the idle task
-# may not have run yet; LeakSanitizer (Linux) would report every one.
-test-rt: build/test_rtos
-	$(call run_seeds,ASAN_OPTIONS=detect_leaks=0 ./build/test_rtos,$(SEEDS))
-
-# SIMP-02 and SIMP-04 for the task layer, on the kernel's generic Cortex-M0 port.
-RT_M0_INC = -I. -Itests/rtos_m0 -I$(ALFS_RT_KERNEL)/include -I$(ALFS_RT_KERNEL)/portable/GCC/ARM_CM0
-
-target-rt: target | $(ALFS_RT_KERNEL)
-	$(ARMCC) -std=c99 -Wall -Wextra -Werror -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su $(RT_M0_INC) -c alfs_rtos.c -o build/alfs_rtos_m0.o
-	$(ARMSIZE) build/alfs_rtos_m0.o
-	sh tests/check_target_rt.sh $(RT_BUDGET) build/alfs_rtos_m0.o build/alfs_rtos_m0.ci $(STORE_M0:%.o=%.ci)
-
-.PHONY: all test soak tests-compile target test-rt target-rt probe clean
+.PHONY: all test soak tests-compile target probe clean

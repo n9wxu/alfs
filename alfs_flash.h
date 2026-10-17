@@ -1,5 +1,5 @@
 /*
- * alfs_flash: what both stores need of the flash and of bytes: checked
+ * alfs_flash: what the store needs of the flash and of bytes: checked
  * reads, programs and erases, the CRC, little-endian fields, geometry.
  * Internal to alfs.
  *
@@ -10,7 +10,7 @@
 
 #include "alfs.h"
 
-#define ALFS_VERSION 5u
+#define ALFS_VERSION 6u
 #define ALFS_ERASED 0xFFu
 #define ALFS_PIECE 16u /* the most read onto the stack at once */
 #define ALFS_NONE 0xFFFFu

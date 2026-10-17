@@ -1,6 +1,5 @@
 -std=c99
 -I.
 -Itests
--Iexamples
 -Wall
 -Wextra

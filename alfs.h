@@ -1,15 +1,8 @@
 /*
- * alfs: the append-log flash store, on serial NOR flash.
- *
- * Two stores, each on an area of the chip the caller gives it:
- * - alfs_log.h, a log area: logs of rows appended around a ring of
- *   sectors. Nothing erases there unless the caller asks, so every write
- *   programs flash erased ahead of time. An application may have several,
- *   as one for its configuration and one for its flights: alfs gives a row
- *   no meaning.
- * - alfs_obj.h, the object area: named objects, each replaced whole (put)
- *   and read whole (get). A put may erase.
- * alfs_rtos.h serves any number of areas from one FreeRTOS task.
+ * alfs: the append-log flash store, on serial NOR flash: files, each a
+ * frame of pages linked in a list, found by filename through a catalog
+ * (alfs_fs.h). A file's pages can be reserved ahead of time, so that
+ * writing it programs only flash erased already.
  *
  * docs/REQUIREMENTS.md says what alfs must do; docs/SPEC.md how its bytes
  * lie on the flash. Each call returns when its flash work is done; no
@@ -17,7 +10,7 @@
  * in, and an instance starts zeroed (static storage, or memset). The
  * caller serialises calls on one instance.
  *
- * This header holds what both stores share.
+ * This header holds the types the store and its driver share.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -38,27 +31,29 @@ enum {
     ALFS_CLEAN = 2,
     /* A driver read failed. Nothing changed: retry. */
     ALFS_EIO = -1,
-    /* No room: no ready log sector for the rows a writer's block must
-     * program, which stay there (erase, then retry); or an object that does
-     * not fit (delete one, or fail). */
+    /* No room: no free page for a reservation, or for a write past one,
+     * whose bytes stay in the block (clean up, then retry); or no slot in
+     * the catalog (delete a file, or fail). */
     ALFS_ENOSPC = -2,
-    /* The object area holds no store: rebuild with alfs_obj_format, or
-     * fail. */
+    /* The area holds no catalog: rebuild with alfs_fs_format, or fail. */
     ALFS_ENOFS = -3,
     /* The configuration does not fit the chip. Nothing was written: fail. */
     ALFS_EGEOMETRY = -4,
     /* An argument or a handle's state is wrong. Nothing changed: fail (it
      * is a bug in the caller). */
     ALFS_EINVAL = -5,
-    /* No object of that name, or no log of that number. */
+    /* No file of that filename. */
     ALFS_ENOENT = -6,
-    /* An erase or program failed. In the object area the put or delete is
-     * abandoned and the store is as it was: retry later, or fail. */
+    /* An erase or program failed where alfs could not go around it: the
+     * call is abandoned and every file is as it was. Retry later, or fail. */
     ALFS_EPROG = -7,
-    /* A handle is open that the call would disturb: close it, then retry. */
+    /* A file is open that the call would disturb: close it, then retry. */
     ALFS_EOPEN = -8,
-    /* The object's check failed: it is damaged. Put it again, or fail. */
+    /* A closed file's frame checksum failed at its end: it is damaged.
+     * Write it again, or fail. */
     ALFS_ECHECK = -9,
+    /* A file of that filename exists: delete it first, or fail. */
+    ALFS_EEXIST = -10,
 };
 
 /*
@@ -73,7 +68,8 @@ typedef struct alfs_driver {
     /* Program exactly len bytes, never across a page, and no others:
      * padding a page with the erase value costs over three times as long
      * on the BY25Q64ES (IF-04). alfs programs some bytes a second time,
-     * with what they hold or with zero (docs/SPEC.md 4 and 8). */
+     * with zero: a link a close ends, a filename a delete blocks out
+     * (docs/SPEC.md 5 and 7). */
     int (*prog)(void *ctx, uint32_t addr, const void *buf, uint32_t len);
     /* Erase the sector at addr. A driver that slices an erase does so
      * inside this call. */
@@ -83,7 +79,7 @@ typedef struct alfs_driver {
 /* An area of the chip. The erase value is 0xFF. */
 typedef struct alfs_area {
     uint32_t start;       /* sector-aligned, bytes from the chip's start */
-    uint32_t size;        /* sector-aligned, at most 65,535 sectors      */
+    uint32_t size;        /* sector-aligned, at most 65,535 pages        */
     uint32_t chip_size;   /* the area must lie inside it                */
     uint32_t sector_size; /* the erase unit; a power of two, >= 4 pages */
     uint32_t page_size;   /* the most one program writes; a power of two,
@@ -93,16 +89,15 @@ typedef struct alfs_area {
 typedef struct alfs_counters {
     uint32_t programs, erases;
     uint32_t prog_failures, erase_failures;
-    uint32_t check_failures; /* chunks skipped, or objects refused: their
-                              * check failed */
-    uint32_t bytes_lost;     /* bytes of log rows dropped with a failed
-                              * program */
+    uint32_t check_failures; /* pages skipped, links not followed, files
+                              * refused: their check failed */
+    uint32_t bytes_lost;     /* file bytes dropped with a failed program */
 } alfs_counters_t;
 
-#define ALFS_NAME_MAX 31 /* bytes in an object's name, none 00h */
-#define ALFS_BAD_MAX 8   /* bad log sectors remembered in a mount */
+#define ALFS_NAME_MAX 31 /* bytes in a filename, none 00h */
+#define ALFS_BAD_MAX 8   /* bad sectors remembered in a mount */
 
-/* What each store keeps of its area. Opaque. */
+/* What the store keeps of its area. Opaque. */
 typedef struct alfs_dev {
     const alfs_area_t *cfg;
     const alfs_driver_t *drv;
