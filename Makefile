@@ -1,5 +1,5 @@
-# alfs: `make test` runs the host suite on 8 simulator seeds under the
-# address and undefined behaviour sanitizers; `make soak` on 100 seeds
+# alfs: `make test` runs the stores' host suite on 8 simulator seeds under
+# the address and undefined behaviour sanitizers; `make soak` on 100 seeds
 # without them; `make target` checks the Cortex-M0+ budgets of SIMP-02 to
 # SIMP-04. `make test-rt` and `make target-rt` do the same for the flash
 # task (alfs_rtos.c). T=name runs the tests whose names contain it;
@@ -15,13 +15,20 @@ SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover
 PICO_SDK_PATH ?= $(HOME)/.pico-sdk/sdk/2.2.0
 PICO_TOOLCHAIN_PATH ?= $(HOME)/.pico-sdk/toolchain/14_2_Rel1
 
+# The stores: what both share, the log area, the object area.
+STORES = alfs_flash.c alfs_log.c alfs_obj.c
+STORE_H = alfs.h alfs_flash.h alfs_log.h alfs_obj.h
+TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
+TEST_H = tests/sim.h tests/tf.h
+STORE_BUDGET = 4096
+
 all: test
 
 build:
 	mkdir -p build
 
-build/test_alfs: alfs.c alfs.h tests/test_alfs.c tests/sim.c tests/sim.h tests/tf.c tests/tf.h | build
-	$(CC) $(CFLAGS) $(SAN) -o $@ alfs.c tests/test_alfs.c tests/sim.c tests/tf.c
+build/test_alfs: $(STORES) $(STORE_H) $(TEST_SRC) $(TEST_H) | build
+	$(CC) $(CFLAGS) $(SAN) -o $@ $(STORES) $(TEST_SRC)
 
 SEEDS ?= 1 2 3 4 5 6 7 8
 JOBS ?= 8
@@ -39,8 +46,8 @@ endef
 test: build/test_alfs
 	$(call run_seeds,./build/test_alfs,$(SEEDS))
 
-build/test_alfs_fast: alfs.c alfs.h tests/test_alfs.c tests/sim.c tests/sim.h tests/tf.c tests/tf.h | build
-	$(CC) $(WARN) -O2 -I. -Itests -o $@ alfs.c tests/test_alfs.c tests/sim.c tests/tf.c
+build/test_alfs_fast: $(STORES) $(STORE_H) $(TEST_SRC) $(TEST_H) | build
+	$(CC) $(WARN) -O2 -I. -Itests -o $@ $(STORES) $(TEST_SRC)
 
 soak: build/test_alfs_fast
 	$(call run_seeds,./build/test_alfs_fast,$(shell seq 1 100))
@@ -51,11 +58,15 @@ tests-compile: | build
 	$(CC) $(CFLAGS) -c tests/sim.c -o build/sim.o
 	$(CC) $(CFLAGS) -c tests/tf.c -o build/tf.o
 
-target: | build
-	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su -I. -c alfs.c -o build/alfs_m0.o
+STORE_M0 = $(STORES:%.c=build/%_m0.o)
+
+build/%_m0.o: %.c $(STORE_H) | build
+	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su -I. -c $< -o $@
+
+target: $(STORE_M0) | build
 	$(ARMCC) $(WARN) -mcpu=cortex-m0plus -mthumb -Os -I. -c tests/target_sizes.c -o build/target_sizes.o
-	$(ARMSIZE) build/alfs_m0.o
-	sh tests/check_target.sh build/alfs_m0.o build/alfs_m0.ci
+	$(ARMSIZE) $(STORE_M0)
+	sh tests/check_target.sh $(STORE_BUDGET) $(STORE_M0)
 
 probe:
 	cmake -S probe -B build/probe -G Ninja -DPICO_SDK_PATH=$(PICO_SDK_PATH) -DPICO_TOOLCHAIN_PATH=$(PICO_TOOLCHAIN_PATH)
@@ -82,8 +93,8 @@ build/rt_kernel.a: | build $(ALFS_RT_KERNEL)
 		$(CC) -std=gnu99 -O1 -g -w $(addprefix -I$(CURDIR)/,$(patsubst -I%,%,$(RT_INC))) -c $$f -o rt_$$(basename $$f .c).o || exit 1; done
 	ar rcs $@ build/rt_*.o
 
-build/test_rtos: alfs.c alfs.h alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
-	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(SAN) $(RT_INC) -o $@ alfs.c alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
+build/test_rtos: $(STORES) $(STORE_H) alfs_rtos.c alfs_rtos.h tests/test_rtos.c tests/sim.c tests/sim.h tests/tf.c tests/rtos/FreeRTOSConfig.h build/rt_kernel.a
+	$(CC) -std=gnu99 -Wall -Wextra -Werror -O1 -g $(SAN) $(RT_INC) -o $@ $(STORES) alfs_rtos.c tests/test_rtos.c tests/sim.c tests/tf.c build/rt_kernel.a -lpthread
 
 # The tests leave each deleted task's memory allocated, since the idle task
 # may not have run yet; LeakSanitizer (Linux) would report every one.
@@ -96,6 +107,6 @@ RT_M0_INC = -I. -Itests/rtos_m0 -I$(ALFS_RT_KERNEL)/include -I$(ALFS_RT_KERNEL)/
 target-rt: target | $(ALFS_RT_KERNEL)
 	$(ARMCC) -std=c99 -Wall -Wextra -Werror -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su $(RT_M0_INC) -c alfs_rtos.c -o build/alfs_rtos_m0.o
 	$(ARMSIZE) build/alfs_rtos_m0.o
-	sh tests/check_target_rt.sh build/alfs_rtos_m0.o build/alfs_rtos_m0.ci build/alfs_m0.ci
+	sh tests/check_target_rt.sh build/alfs_rtos_m0.o build/alfs_rtos_m0.ci $(STORE_M0:%.o=%.ci)
 
 .PHONY: all test soak tests-compile target test-rt target-rt probe clean
