@@ -844,19 +844,20 @@ FreeRTOS kernel's headers.
 
 #### ALFS-SIMP-02
 
-The stores together are at most 6.5 KiB on a Cortex-M0+ (Thumb, `-Os`),
-and the task layer at most 1.75 KiB.
+The stores together are at most 8.75 KiB on a Cortex-M0+ (Thumb, `-Os`),
+and the task layer at most 2.125 KiB.
 
 - Priority: S.
 - Source: the brief ("Simplicity will keep the code fast and flash
   overhead cheap"). Built with Arm GNU Toolchain 13.2.Rel1, the stores
-  measure 6,538 bytes (the log area 3,173, the object area 2,669, what
-  both share 696) and the task layer 1,725. Each budget is its
-  measurement rounded up to a multiple of 128 bytes.
+  measure 8,755 bytes (the log area 3,173, the object area 2,669, the
+  configuration store 2,217, what they share 696) and the task layer
+  2,053. Each budget is its measurement plus about 1.5%, rounded up to a
+  multiple of 128 bytes, so that Arm GNU 14.2 builds fit too.
 - Measure: `arm-none-eabi-size` of `alfs_flash.o`, `alfs_log.o` and
   `alfs_obj.o`, and of `alfs_rtos.o`, text plus data; the task layer
   compiled against the kernel's generic Cortex-M0 port.
-- Pass: at most 6,656 and 1,792 bytes. Fail: more.
+- Pass: at most 8,960 and 2,176 bytes. Fail: more.
 - Verified by: `make target`, `make target-rt`.
 
 #### ALFS-SIMP-03
@@ -880,18 +881,19 @@ task's stack.
 
 #### ALFS-SIMP-04
 
-No store call uses more than 320 bytes of stack, and the flash task's
+No store call uses more than 384 bytes of stack, and the flash task's
 deepest chain no more than 512 bytes, the driver's own frames apart.
 
 - Priority: S.
 - Source: pyro's smallest task stack is 2 kB. The flash task's stack holds
-  the stores' deepest chain under the task's loop. Measured: 304 bytes
-  under `alfs_obj_put`, 352 under the flash task.
+  the stores' deepest chain under the task's loop. Measured: 356 bytes
+  under `alfs_kv_set`, whose move of the head tidies the new head with a
+  walk that holds a key, and 404 under the flash task.
 - Measure: the deepest chain of frames under each public call and under
   the task's function, from GCC's call graph (`-fcallgraph-info=su`) on
   the Cortex-M0+ build. A host build's stacks say nothing here: the
   FreeRTOS POSIX port runs each task on a thread.
-- Pass: at most 320 and 512. Fail: more.
+- Pass: at most 384 and 512. Fail: more.
 - Verified by: `make target`, `make target-rt`.
 
 #### ALFS-SIMP-05

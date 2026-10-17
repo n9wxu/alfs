@@ -21,8 +21,8 @@ STORES = alfs_flash.c alfs_kv.c alfs_obj.c alfs_log.c
 STORE_H = alfs.h alfs_flash.h alfs_kv.h alfs_obj.h alfs_log.h
 TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
 TEST_H = tests/sim.h tests/tf.h
-STORE_BUDGET = 6656
-RT_BUDGET = 1792
+STORE_BUDGET = 8960
+RT_BUDGET = 2176
 
 all: test
 

@@ -17,9 +17,10 @@
 
 #define SECTOR 4096u
 #define PAGE 256u
+#define KV_SECTORS 3u
 #define OBJ_SECTORS 4u
 #define LOG_SECTORS 64u
-#define CHIP ((2u + OBJ_SECTORS + LOG_SECTORS) * SECTOR)
+#define CHIP ((2u + KV_SECTORS + OBJ_SECTORS + LOG_SECTORS) * SECTOR)
 #define STACK_WORDS 1024u
 
 /* ---- an instance, behind a driver that checks who calls it ------------- */
@@ -27,8 +28,8 @@
 typedef struct inst {
     sim_t sim;
     alfs_driver_t simd, drv;
-    alfs_area_t lcfg, ocfg;
-    uint8_t lscratch[PAGE], oscratch[PAGE];
+    alfs_area_t lcfg, ocfg, kcfg;
+    uint8_t lscratch[PAGE], oscratch[PAGE], kscratch[PAGE];
     alfs_rt_t rt;
     int in_op, overlaps, outsiders, ops;
     TickType_t erase_ticks;        /* an erase takes this long */
@@ -92,15 +93,17 @@ static void area(alfs_area_t *a, uint32_t start, uint32_t sectors) {
     a->page_size = PAGE;
 }
 
-/* The chip: a gap sector, the object area, the log area, a gap sector. */
+/* The chip: a gap sector, the configuration store, the object area, the
+ * log area, a gap sector. */
 static inst_t *inst_open(UBaseType_t prio) {
     inst_t *in = calloc(1, sizeof(*in));
     sim_init(&in->sim, CHIP, SECTOR, PAGE, 0xFF, seed);
     sim_fill_random(&in->sim, 0, CHIP);
     in->simd = sim_driver(&in->sim);
     in->drv = (alfs_driver_t){in, w_read, w_prog, w_erase};
-    area(&in->ocfg, SECTOR, OBJ_SECTORS);
-    area(&in->lcfg, (1u + OBJ_SECTORS) * SECTOR, LOG_SECTORS);
+    area(&in->kcfg, SECTOR, KV_SECTORS);
+    area(&in->ocfg, (1u + KV_SECTORS) * SECTOR, OBJ_SECTORS);
+    area(&in->lcfg, (1u + KV_SECTORS + OBJ_SECTORS) * SECTOR, LOG_SECTORS);
     alfs_rt_mem_t m = {calloc(STACK_WORDS, sizeof(StackType_t)), STACK_WORDS, calloc(1, sizeof(StaticTask_t)),
                        calloc(8, sizeof(void *)), 8, calloc(1, sizeof(StaticQueue_t)), prio, 0};
     if (alfs_rt_start(&in->rt, &m))
@@ -120,9 +123,12 @@ static int erase_log(inst_t *in, uint32_t log) {
     return rc == ALFS_CLEAN ? 0 : rc;
 }
 
-/* The object area formatted; the log area mounted and erased. */
+/* The configuration store mounted, the object area formatted, the log
+ * area mounted and erased. */
 static int inst_setup(inst_t *in) {
-    int rc = alfs_rt_obj_format(&in->rt, &in->ocfg, &in->drv, in->oscratch);
+    int rc = alfs_rt_kv_mount(&in->rt, &in->kcfg, &in->drv, in->kscratch);
+    if (!rc)
+        rc = alfs_rt_obj_format(&in->rt, &in->ocfg, &in->drv, in->oscratch);
     if (!rc)
         rc = mount_log(in);
     return rc ? rc : erase_log(in, 0);
@@ -332,9 +338,19 @@ static void reader(void *p) {
 static void putter(void *p) {
     job_t *j = p;
     for (uint32_t t = 0; t < 4 && !j->rc; t++) {
-        j->rc = put_pattern(&j->in->rt, "cfg", 20 + t, 300);
-        if (!j->rc && get_pattern(&j->in->rt, "cfg", 20 + t) != 300)
+        uint8_t v[40], got[40];
+        uint32_t len = 0;
+        j->rc = put_pattern(&j->in->rt, "lua", 20 + t, 300);
+        if (!j->rc && get_pattern(&j->in->rt, "lua", 20 + t) != 300)
             j->rc = -104;
+        for (uint32_t i = 0; i < sizeof(v); i++)
+            v[i] = pattern(30 + t, i);
+        if (!j->rc)
+            j->rc = alfs_rt_kv_set(&j->in->rt, "cfg", v, sizeof(v));
+        if (!j->rc)
+            j->rc = alfs_rt_kv_get(&j->in->rt, "cfg", got, sizeof(got), &len);
+        if (!j->rc && (len != sizeof(v) || memcmp(got, v, len)))
+            j->rc = -105;
     }
 }
 
@@ -383,7 +399,12 @@ static void rt_serialises(void) {
     CHECK_EQ(read_pattern(&in->rt, log, 2, 2), 4400);
     CHECK_EQ(read_pattern(&in->rt, kept, 9, 9), 3000);
     CHECK_EQ(read_pattern(&in->rt, junk, 8, 8), ALFS_ENOENT);
-    CHECK_EQ(get_pattern(&in->rt, "cfg", 23), 300);
+    CHECK_EQ(get_pattern(&in->rt, "lua", 23), 300);
+    uint8_t got[40];
+    uint32_t len = 0;
+    CHECK_EQ(alfs_rt_kv_get(&in->rt, "cfg", got, sizeof(got), &len), 0);
+    CHECK_EQ(len, 40);
+    CHECK_EQ(got[0], pattern(33, 0));
     CLEAN_RUN(in);
     inst_close(in);
 }
@@ -619,6 +640,27 @@ static void rt_objects(void) {
     CHECK_EQ(alfs_rt_obj_abort(&in->rt, &p), 0);
     CHECK_EQ(alfs_rt_obj_mount(&in->rt, &in->ocfg, &in->drv, in->oscratch), 0);
     CHECK_EQ(get_pattern(&in->rt, "lua/main.lua", 2), 3000);
+
+    uint8_t v[20] = {1, 2, 3}, got[20];
+    uint32_t len = 0;
+    CHECK_EQ(alfs_rt_kv_set(&in->rt, "arm", v, 3), 0);
+    CHECK_EQ(alfs_rt_kv_set(&in->rt, "beep", v, 20), 0);
+    CHECK_EQ(alfs_rt_kv_get(&in->rt, "arm", got, sizeof(got), &len), 0);
+    CHECK_EQ(len, 3);
+    alfs_kv_iter_t it = {0, 0};
+    char key[ALFS_KEY_MAX + 1];
+    int pairs = 0;
+    while (alfs_rt_kv_next(&in->rt, &it, key, got, sizeof(got), &len) == 0)
+        pairs++;
+    CHECK_EQ(pairs, 2);
+    CHECK_EQ(alfs_rt_kv_delete(&in->rt, "arm"), 0);
+    CHECK_EQ(alfs_rt_kv_get(&in->rt, "arm", got, sizeof(got), &len), ALFS_ENOENT);
+    CHECK_EQ(alfs_rt_kv_mount(&in->rt, &in->kcfg, &in->drv, in->kscratch), 0);
+    CHECK_EQ(alfs_rt_kv_get(&in->rt, "beep", got, sizeof(got), &len), 0);
+    CHECK_EQ(len, 20);
+    alfs_kv_status_t ks;
+    CHECK_EQ(alfs_rt_kv_status(&in->rt, &ks), 0);
+    CHECK_EQ(ks.sectors, KV_SECTORS);
     CLEAN_RUN(in);
     inst_close(in);
 }

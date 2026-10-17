@@ -1,6 +1,7 @@
 /*
  * alfs_rtos: one FreeRTOS task that performs every flash operation of a
- * log area and an object area, for any number of the application's tasks.
+ * configuration store, an object area and a log area, for any number of
+ * the application's tasks.
  *
  * Each call below makes a request to the flash task and blocks its caller
  * until the task has done it, except a log write whose bytes fit in the
@@ -31,6 +32,7 @@
 #include "queue.h"
 #include "task.h"
 
+#include "alfs_kv.h"
 #include "alfs_log.h"
 #include "alfs_obj.h"
 
@@ -46,8 +48,9 @@ typedef struct alfs_rt_mem {
                              * affinity; 0 lets the task run on any */
 } alfs_rt_mem_t;
 
-/* The two areas, served. Opaque. */
+/* The three areas, served. Opaque. */
 typedef struct alfs_rt {
+    alfs_kv_t kv;
     alfs_log_t log;
     alfs_obj_t obj;
     TaskHandle_t task;
@@ -99,5 +102,13 @@ int32_t alfs_rt_obj_read(alfs_rt_t *rt, alfs_get_t *g, void *out, uint32_t len);
 int alfs_rt_obj_close(alfs_rt_t *rt, alfs_get_t *g);
 int alfs_rt_obj_list(alfs_rt_t *rt, uint32_t index, alfs_obj_info_t *info);
 int alfs_rt_obj_status(alfs_rt_t *rt, alfs_obj_status_t *st);
+
+/* The configuration store: as alfs_kv.h, through the flash task. */
+int alfs_rt_kv_mount(alfs_rt_t *rt, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch);
+int alfs_rt_kv_get(alfs_rt_t *rt, const char *key, void *value, uint32_t cap, uint32_t *len);
+int alfs_rt_kv_set(alfs_rt_t *rt, const char *key, const void *value, uint32_t len);
+int alfs_rt_kv_delete(alfs_rt_t *rt, const char *key);
+int alfs_rt_kv_next(alfs_rt_t *rt, alfs_kv_iter_t *it, char *key, void *value, uint32_t cap, uint32_t *len);
+int alfs_rt_kv_status(alfs_rt_t *rt, alfs_kv_status_t *st);
 
 #endif

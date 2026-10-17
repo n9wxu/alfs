@@ -15,6 +15,14 @@
 #define ALFS_PIECE 16u /* the most read onto the stack at once */
 #define ALFS_NONE 0xFFFFu
 
+/* Keeps a function's frame off its caller's: the stack budget (SIMP-04)
+ * holds only while the deepest chains do not share one frame. */
+#if defined(__GNUC__)
+#define ALFS_NOINLINE __attribute__((noinline))
+#else
+#define ALFS_NOINLINE
+#endif
+
 /* CRC-32 over n bytes, carried in c: start with ALFS_CRC_INIT, end with ~. */
 #define ALFS_CRC_INIT 0xFFFFFFFFu
 uint32_t alfs_crc(uint32_t c, const void *p, uint32_t n);

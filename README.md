@@ -1,9 +1,9 @@
 # alfs
 
-The append-log flash store: on serial NOR flash, an object area of named
-objects, each written and read whole, and a log area where logs are
-appended around a ring of sectors. Built for systems that run code from
-the same chip and cannot afford to stall.
+The append-log flash store: on serial NOR flash, a configuration store of
+key-value pairs, an object area of named objects written and read whole,
+and a log area where logs are appended around a ring of sectors. Built for
+systems that run code from the same chip and cannot afford to stall.
 
 Priorities, in order: speed, then flash life, then safety. A corrupted data
 block is less important than a broken exec loop. Nothing in the log area
@@ -11,12 +11,12 @@ erases unless the application asks: every log write programs flash erased
 ahead of time.
 
 **Status:** format version 4. Requirements, tests and code.
-- **Stores:** 41 tests, run on 8 simulator seeds under the sanitizers
-  (`make test`) and on 100 seeds (`make soak`). 6,538 bytes of code on a
-  Cortex-M0+: the log area 3,173, the object area 2,669, what both share
-  696.
+- **Stores:** 48 tests, run on 8 simulator seeds under the sanitizers
+  (`make test`) and on 100 seeds (`make soak`). 8,755 bytes of code on a
+  Cortex-M0+: the log area 3,173, the object area 2,669, the configuration
+  store 2,217, what they share 696.
 - **Flash task:** 8 tests on the FreeRTOS POSIX port (`make test-rt`).
-  1,725 bytes of code.
+  2,053 bytes of code.
 - **Erases:** on the W-LOG workload (22-byte rows at 50 a second, synced
   every second, for 10 minutes), 168 sector erases, all of them asked for.
 - **Hardware:** the flash assumptions alfs rests on are measured on the
@@ -25,11 +25,25 @@ ahead of time.
 
 ## How it works
 
-The application gives alfs two areas of the chip, each configured on its
-own.
+The application gives alfs three areas of the chip, each configured on
+its own.
 
-**The object area** holds configuration objects and Lua programs, each
-under a name of up to 31 bytes.
+**The configuration store** holds key-value pairs: keys of up to 31 bytes,
+values of up to a page less the key and 8 bytes.
+- **One sector, the head,** holds the current pairs, so a get or a full
+  listing scans one sector. A listing returns the pairs in the order
+  written; applied in order, they give every current pair, which the web
+  interface can cache.
+- **A set** appends the new pair and zeroes the live mark of the one it
+  replaces: two programs, no erase.
+- **When the head fills,** and at the first set after a mount, the next
+  sector round the ring is erased, every live pair copied in, and a
+  complete mark makes it the head. Until the mark, the old head is the
+  store, so after any power loss each key reads its old value or its new
+  one. The sectors wear in turn.
+
+**The object area** holds Lua programs, each under a name of up to 31
+bytes, written as whole files.
 - **Two halves.** One is the store; the other, the spare, is where the
   next put or delete writes every object again.
 - **A put** names the object and its size, takes its bytes in any number
@@ -58,10 +72,10 @@ under a name of up to 31 bytes.
   happens only when the application asks.
 
 There is no directory and no index. A mount reads 30 bytes of each log
-sector and 29 bytes of each half.
+sector, 29 bytes of each half and 19 bytes of each configuration sector.
 
-**The flash task** (`alfs_rtos.c`) serves both areas from one FreeRTOS
-task. The application's tasks send requests and wait on them, so the
+**The flash task** (`alfs_rtos.c`) serves the three areas from one
+FreeRTOS task. The application's tasks send requests and wait on them, so the
 stores run each operation as a plain loop, with nothing else touching the
 flash. A log write that fits in its block never leaves the caller's task.
 
@@ -72,10 +86,11 @@ flash. A log write that fits in its block never leaves the caller's task.
 | `docs/REQUIREMENTS.md` | what alfs must do, each requirement testable |
 | `docs/TEST_PLAN.md` | how each requirement is tested |
 | `docs/SPEC.md` | every byte on the flash |
-| `alfs.h` | what both stores share: return codes, the driver, an area |
+| `alfs.h` | what the stores share: return codes, the driver, an area |
+| `alfs_kv.h`, `alfs_kv.c` | the configuration store |
 | `alfs_obj.h`, `alfs_obj.c` | the object area |
 | `alfs_log.h`, `alfs_log.c` | the log area |
-| `alfs_flash.h`, `alfs_flash.c` | the checked flash operations both use |
+| `alfs_flash.h`, `alfs_flash.c` | the checked flash operations the stores use |
 | `alfs_rtos.h`, `alfs_rtos.c` | the flash task, on FreeRTOS |
 | `tests/` | the simulated flash, the harness and both test suites |
 | `docs/datasheets/` | the flash parts the figures come from |
@@ -90,7 +105,7 @@ The use cases come from the pyro flight computer
 | Branch | What it holds |
 |---|---|
 | `main` | format version 3: named, versioned files, and the flash task |
-| `experiment/v4-object-store` | format version 4: the object area and the log ring, and the flash task |
+| `experiment/v4-object-store` | format version 4: the configuration store, the object area, the log ring, and the flash task |
 | `experiment/format-1` | format 1: streams found by an identity and a tag, one flash operation a call; 5.3 KB |
 | `experiment/format-2` | format 2: streams with sector numbers, exact programs, and resuming a stream after a reset; 6.8 KB |
 | `experiment/v2-safety-rule-cost` | the code each of format 2's safety rules takes, measured by building format 2 without it |

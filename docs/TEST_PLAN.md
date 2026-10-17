@@ -182,7 +182,7 @@ test can tell good data from bad without alfs's help.
 | `obs_status` | OBS-01 | Counts against the simulator's, for both areas, before and after logging, puts and a remount. |
 | `obs_clean` | OBS-03 | The log area not clean when it holds a dirty sector, clean once erased; the object area not clean after a put, clean once its spare is ready. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
-| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds each store alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds each store alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 384 bytes, from GCC's call graph. |
 
 **The power-loss runs, after the loss.**
 1. Remount; every synced byte of the log reads back, nothing beyond what

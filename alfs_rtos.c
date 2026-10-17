@@ -20,15 +20,17 @@
 enum {
     LOG_MOUNT, LOG_ERASE, LOG_OPEN, LOG_WRITE, LOG_SYNC, LOG_CLOSE, LOG_OPEN_READ, LOG_READ, LOG_CLOSE_READ,
     LOG_LIST, LOG_STATUS, OBJ_FORMAT, OBJ_MOUNT, OBJ_ERASE, OBJ_PUT, OBJ_WRITE, OBJ_COMMIT, OBJ_ABORT,
-    OBJ_DELETE, OBJ_OPEN, OBJ_READ, OBJ_CLOSE, OBJ_LIST, OBJ_STATUS
+    OBJ_DELETE, OBJ_OPEN, OBJ_READ, OBJ_CLOSE, OBJ_LIST, OBJ_STATUS, KV_MOUNT, KV_GET, KV_SET, KV_DELETE,
+    KV_NEXT, KV_STATUS
 };
 
 /* A request, on its caller's stack until the flash task gives done. */
 typedef struct req {
     void *h;                  /* a handle */
-    const void *in;           /* bytes to write, a name, an area */
-    void *out;                /* bytes read, a block, a scratch page, a listing */
+    const void *in, *in2;     /* bytes to write, a name or key, an area */
+    void *out, *out2;         /* bytes read, a block, a scratch page, a listing */
     const alfs_driver_t *drv;
+    uint32_t *len;            /* a value's length, found */
     uint32_t n, v;            /* a length or a size; a log, or an index */
     int32_t rc;
     uint8_t op, tag;
@@ -39,6 +41,7 @@ typedef struct req {
 static int32_t run(alfs_rt_t *rt, req_t *q) {
     alfs_log_t *lg = &rt->log;
     alfs_obj_t *o = &rt->obj;
+    alfs_kv_t *kv = &rt->kv;
     switch (q->op) {
     case LOG_MOUNT:
         return alfs_log_mount(lg, q->in, q->drv, q->out);
@@ -87,8 +90,21 @@ static int32_t run(alfs_rt_t *rt, req_t *q) {
         return alfs_obj_close(o, q->h);
     case OBJ_LIST:
         return alfs_obj_list(o, q->v, q->out);
-    default:
+    case OBJ_STATUS:
         alfs_obj_status(o, q->out);
+        return ALFS_OK;
+    case KV_MOUNT:
+        return alfs_kv_mount(kv, q->in, q->drv, q->out);
+    case KV_GET:
+        return alfs_kv_get(kv, q->in, q->out, q->n, q->len);
+    case KV_SET:
+        return alfs_kv_set(kv, q->in, q->in2, q->n);
+    case KV_DELETE:
+        return alfs_kv_delete(kv, q->in);
+    case KV_NEXT:
+        return alfs_kv_next(kv, q->h, q->out2, q->out, q->n, q->len);
+    default:
+        alfs_kv_status(kv, q->out);
         return ALFS_OK;
     }
 }
@@ -127,13 +143,13 @@ static int32_t submit(alfs_rt_t *rt, req_t *q) {
 }
 
 static int32_t ask(alfs_rt_t *rt, uint8_t op, void *h, const void *in, void *out, uint32_t n, uint32_t v) {
-    req_t q = {h, in, out, NULL, n, v, 0, op, 0, NULL};
+    req_t q = {.op = op, .h = h, .in = in, .out = out, .n = n, .v = v};
     return submit(rt, &q);
 }
 
 /* format and mount, which also pass a driver. */
 static int area(alfs_rt_t *rt, uint8_t op, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
-    req_t q = {NULL, cfg, scratch, drv, 0, 0, 0, op, 0, NULL};
+    req_t q = {.op = op, .in = cfg, .out = scratch, .drv = drv};
     return (int)submit(rt, &q);
 }
 
@@ -148,7 +164,7 @@ static int erase(alfs_rt_t *rt, uint8_t op, uint32_t log, uint32_t steps) {
 /* A log handle's open, which also passes a tag. */
 static int open_handle(alfs_rt_t *rt, uint8_t op, void *h, uint32_t log, uint8_t tag, uint8_t *block,
                        uint32_t size) {
-    req_t q = {h, NULL, block, NULL, size, log, 0, op, tag, NULL};
+    req_t q = {.op = op, .h = h, .out = block, .n = size, .v = log, .tag = tag};
     return (int)submit(rt, &q);
 }
 
@@ -293,4 +309,33 @@ int alfs_rt_obj_list(alfs_rt_t *rt, uint32_t index, alfs_obj_info_t *info) {
 
 int alfs_rt_obj_status(alfs_rt_t *rt, alfs_obj_status_t *st) {
     return st ? (int)ask(rt, OBJ_STATUS, NULL, NULL, st, 0, 0) : ALFS_EINVAL;
+}
+
+/* ---- the configuration store ------------------------------------------ */
+
+int alfs_rt_kv_mount(alfs_rt_t *rt, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    return area(rt, KV_MOUNT, cfg, drv, scratch);
+}
+
+int alfs_rt_kv_get(alfs_rt_t *rt, const char *key, void *value, uint32_t cap, uint32_t *len) {
+    req_t q = {.op = KV_GET, .in = key, .out = value, .n = cap, .len = len};
+    return (int)submit(rt, &q);
+}
+
+int alfs_rt_kv_set(alfs_rt_t *rt, const char *key, const void *value, uint32_t len) {
+    req_t q = {.op = KV_SET, .in = key, .in2 = value, .n = len};
+    return (int)submit(rt, &q);
+}
+
+int alfs_rt_kv_delete(alfs_rt_t *rt, const char *key) {
+    return (int)ask(rt, KV_DELETE, NULL, key, NULL, 0, 0);
+}
+
+int alfs_rt_kv_next(alfs_rt_t *rt, alfs_kv_iter_t *it, char *key, void *value, uint32_t cap, uint32_t *len) {
+    req_t q = {.op = KV_NEXT, .h = it, .out = value, .out2 = key, .n = cap, .len = len};
+    return (int)submit(rt, &q);
+}
+
+int alfs_rt_kv_status(alfs_rt_t *rt, alfs_kv_status_t *st) {
+    return st ? (int)ask(rt, KV_STATUS, NULL, NULL, st, 0, 0) : ALFS_EINVAL;
 }

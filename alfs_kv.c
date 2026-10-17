@@ -18,12 +18,12 @@
 #define LIVE 0xFFu
 #define NONE ALFS_NONE
 
-/* A whole pair the walk found: its bytes are in the scratch page, read
- * once, so its check and its value come from the same read. */
+/* A whole pair the walk found. Until the next read, its bytes are in the
+ * scratch page, read once, so its check, key and value come from the same
+ * read. */
 typedef struct {
     uint32_t at, len, vlen;
     uint8_t klen, live;
-    uint8_t key[ALFS_KEY_MAX];
 } pair_t;
 
 static uint32_t page(const alfs_kv_t *kv) {
@@ -100,15 +100,15 @@ static int next_pair(alfs_kv_t *kv, uint32_t k, uint32_t *x, pair_t *p) {
         p->klen = (uint8_t)klen;
         p->vlen = vlen;
         p->live = s[0] == LIVE;
-        memcpy(p->key, s + PAIR_HDR, klen);
         *x += p->len;
         return 1;
     }
     return 0;
 }
 
-static bool same_key(const pair_t *p, const uint8_t *key, uint32_t klen) {
-    return p->klen == klen && !memcmp(p->key, key, klen);
+/* p, just read, has key. */
+static bool same_key(const alfs_kv_t *kv, const pair_t *p, const uint8_t *key, uint32_t klen) {
+    return p->klen == klen && !memcmp(kv->d.scratch + PAIR_HDR, key, klen);
 }
 
 /*
@@ -120,7 +120,7 @@ static int find(alfs_kv_t *kv, const uint8_t *key, uint32_t klen, pair_t *p, voi
     pair_t q;
     int rc = 0, found = 0;
     for (uint32_t x = OFF_PAIRS; kv->head != NONE && (rc = next_pair(kv, kv->head, &x, &q)) == 1;)
-        if (q.live && same_key(&q, key, klen)) {
+        if (q.live && same_key(kv, &q, key, klen)) {
             *p = q;
             found = 1;
             if (value && q.vlen <= cap)
@@ -195,7 +195,7 @@ static int copy_live(alfs_kv_t *kv, uint32_t t, const uint8_t *key, uint32_t kle
     pair_t p;
     int rc = 0;
     for (uint32_t x = OFF_PAIRS; kv->head != NONE && (rc = next_pair(kv, kv->head, &x, &p)) == 1;) {
-        if (!p.live || same_key(&p, key, klen))
+        if (!p.live || same_key(kv, &p, key, klen))
             continue;
         if (!place(kv, y, p.len))
             return ALFS_ENOSPC;
@@ -206,13 +206,13 @@ static int copy_live(alfs_kv_t *kv, uint32_t t, const uint8_t *key, uint32_t kle
     return rc < 0 ? rc : ALFS_OK;
 }
 
-/* 1 when a live pair of p's key follows p in sector k, 0 when none, or
+/* 1 when a live pair of key follows p in sector k, 0 when none, or
  * ALFS_EIO. */
-static int replaced(alfs_kv_t *kv, uint32_t k, const pair_t *p) {
+static int replaced(alfs_kv_t *kv, uint32_t k, const pair_t *p, const uint8_t *key) {
     pair_t q;
     int rc;
     for (uint32_t x = p->at + p->len; (rc = next_pair(kv, k, &x, &q)) == 1;)
-        if (q.live && same_key(&q, p->key, p->klen))
+        if (q.live && same_key(kv, &q, key, p->klen))
             return 1;
     return rc;
 }
@@ -220,14 +220,15 @@ static int replaced(alfs_kv_t *kv, uint32_t k, const pair_t *p) {
 /* SPEC 14: in sector t, every live pair a later one replaces, and every
  * empty one, has its live mark zeroed; in order, so a delete's pair still
  * replaces those before it when they are reached. */
-static int tidy(alfs_kv_t *kv, uint32_t t) {
+ALFS_NOINLINE static int tidy(alfs_kv_t *kv, uint32_t t) {
     pair_t p;
     int rc;
-    uint8_t zero = 0;
+    uint8_t zero = 0, key[ALFS_KEY_MAX];
     for (uint32_t x = OFF_PAIRS; (rc = next_pair(kv, t, &x, &p)) == 1;) {
         if (!p.live)
             continue;
-        int r = p.vlen ? replaced(kv, t, &p) : 1;
+        memcpy(key, kv->d.scratch + PAIR_HDR, p.klen); /* the walk below reads over it */
+        int r = p.vlen ? replaced(kv, t, &p, key) : 1;
         if (r < 0)
             return r;
         if (r && alfs_prog(&kv->d, alfs_addr(&kv->d, t) + p.at, &zero, 1))
@@ -241,7 +242,8 @@ static int tidy(alfs_kv_t *kv, uint32_t t) {
  * pair and key's new one (none when vlen is 0), tidied, and made the head
  * by its complete mark. Nothing changes when they would not fit.
  */
-static int move_head(alfs_kv_t *kv, const uint8_t *key, uint32_t klen, const void *value, uint32_t vlen) {
+ALFS_NOINLINE static int move_head(alfs_kv_t *kv, const uint8_t *key, uint32_t klen, const void *value,
+                                   uint32_t vlen) {
     uint32_t t = kv->head == NONE ? 0u : (kv->head + 1u) % kv->d.sectors, y = OFF_PAIRS, len = PAIR_OVER + klen + vlen;
     int rc = copy_live(kv, NONE, key, klen, &y);
     if (rc)
@@ -251,10 +253,9 @@ static int move_head(alfs_kv_t *kv, const uint8_t *key, uint32_t klen, const voi
     rc = alfs_wipe(&kv->d, t);
     if (rc)
         return rc;
-    uint8_t c[CLAIM_LEN];
     uint32_t seq = kv->next_seq++;
-    build_claim(kv, seq, c);
-    if (alfs_prog(&kv->d, alfs_addr(&kv->d, t), c, CLAIM_LEN))
+    build_claim(kv, seq, kv->d.scratch);
+    if (alfs_prog(&kv->d, alfs_addr(&kv->d, t), kv->d.scratch, CLAIM_LEN))
         return ALFS_EPROG;
     y = OFF_PAIRS;
     rc = copy_live(kv, t, key, klen, &y);
@@ -276,17 +277,19 @@ static int move_head(alfs_kv_t *kv, const uint8_t *key, uint32_t klen, const voi
     return ALFS_OK;
 }
 
-int alfs_kv_set(alfs_kv_t *kv, const char *key, const void *value, uint32_t len) {
+/* A set, or with len 0 a delete: of a key that has no value, ALFS_ENOENT
+ * when `deleting`, else nothing to do. */
+static int store(alfs_kv_t *kv, const char *key, const void *value, uint32_t len, bool deleting) {
     uint32_t klen = key_len(key);
     if (!kv || !kv->d.cfg || !klen || len + PAIR_OVER + klen > page(kv) || (len && !value))
         return ALFS_EINVAL;
     const uint8_t *k = (const uint8_t *)key;
-    pair_t old;
-    int had = find(kv, k, klen, &old, NULL, 0);
+    pair_t p;
+    int had = find(kv, k, klen, &p, NULL, 0);
     if (had < 0)
         return had;
-    if (!len && (!had || !old.vlen))
-        return ALFS_OK; /* deleted already */
+    if (!len && (!had || !p.vlen))
+        return deleting ? ALFS_ENOENT : ALFS_OK;
     kv->sets++;
     /* SAFE-16: the first set in a mount moves the head, so nothing a power
      * loss tore in the old one is programmed again */
@@ -298,23 +301,19 @@ int alfs_kv_set(alfs_kv_t *kv, const char *key, const void *value, uint32_t len)
         return rc;
     kv->end = (uint16_t)(y + plen);
     /* every earlier live pair of the key: its live mark zeroed */
-    pair_t p;
     uint8_t zero = 0;
     for (uint32_t x = OFF_PAIRS; (rc = next_pair(kv, kv->head, &x, &p)) == 1 && p.at < y;)
-        if (p.live && same_key(&p, k, klen))
+        if (p.live && same_key(kv, &p, k, klen))
             alfs_prog(&kv->d, alfs_addr(&kv->d, kv->head) + p.at, &zero, 1);
     return rc < 0 ? rc : ALFS_OK;
 }
 
+int alfs_kv_set(alfs_kv_t *kv, const char *key, const void *value, uint32_t len) {
+    return store(kv, key, value, len, false);
+}
+
 int alfs_kv_delete(alfs_kv_t *kv, const char *key) {
-    uint32_t klen = key_len(key);
-    pair_t p;
-    if (!kv || !kv->d.cfg || !klen)
-        return ALFS_EINVAL;
-    int had = find(kv, (const uint8_t *)key, klen, &p, NULL, 0);
-    if (had < 0)
-        return had;
-    return had && p.vlen ? alfs_kv_set(kv, key, NULL, 0) : ALFS_ENOENT;
+    return store(kv, key, NULL, 0, true);
 }
 
 /* ---- reading ---------------------------------------------------------- */
@@ -351,7 +350,7 @@ int alfs_kv_next(alfs_kv_t *kv, alfs_kv_iter_t *it, char *key, void *value, uint
         if (cap < p.vlen)
             return ALFS_EINVAL;
         memcpy(value, kv->d.scratch + PAIR_HDR + p.klen, p.vlen);
-        memcpy(key, p.key, p.klen);
+        memcpy(key, kv->d.scratch + PAIR_HDR, p.klen);
         key[p.klen] = 0;
         it->pos = (uint16_t)x;
         return ALFS_OK;
