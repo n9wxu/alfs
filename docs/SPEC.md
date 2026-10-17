@@ -1,302 +1,216 @@
-# alfs on-disk format, version 5
+# alfs on-disk format, version 6
 
 Every byte alfs writes, and how it reads them back. Little-endian
 throughout; every check is CRC-32 (reflected, polynomial 0xEDB88320,
 initial value and final XOR 0xFFFFFFFF: the CRC of zlib and Ethernet). S
-is the sector size and P the page size, both from the configuration.
-Offsets are from the start of a sector, or of a half. The erase value is
-0xFF; "erased" means every byte reads 0xFF.
+is the sector size and P the page size, both from the configuration. The
+erase value is 0xFF; "erased" means every byte reads 0xFF.
 
-alfs has two kinds of area, each configured on its own: log areas
-(sections 1 to 5) and the object area (sections 6 to 10). An application
-may give alfs several log areas, as one for its configuration and one for
-its flights; each holds the format of sections 1 to 5. None reads or
-writes another. What a row holds is the application's.
+Pages are numbered from the area's start: page n lies at byte n × P of the
+area. That number is a page's **address**. The area's first two sectors are
+the catalog; every page after them is a frame page.
 
 ---
 
-## 1. A log sector
+## 1. The catalog
+
+Two sectors, catalog sectors 0 and 1. One is the catalog; the other is its
+spare.
 
 | Offset | Size | Field | Written |
 |---|---|---|---|
-| 0 | 18 | stamp | by an erase, after the erase and a check that every byte is erased |
-| 18 | 12 | claim | by the log that takes the sector, in one program with the stamp again and, but in a log's first sector, the sector's first chunk |
-| D = 30 | | chunks | by writes and syncs |
-
-P must be at least 128 bytes and S at least four pages (`ALFS_EGEOMETRY`
-otherwise).
+| 0 | 20 | stamp | after the sector is erased and checked erased |
+| 20 | 1 | complete mark | 00h, after every entry the sector starts with |
+| 24 | | entries | one at each allocation |
 
 ### 1.1 The stamp
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 4 | magic, "alfl" |
-| 4 | 1 | version, 5 |
+| 0 | 4 | magic, "alfc" |
+| 4 | 1 | version, 6 |
 | 5 | 1 | log2 S |
 | 6 | 1 | log2 P |
 | 7 | 1 | 0 |
 | 8 | 2 | sectors in the area |
-| 10 | 4 | sequence floor: the next sequence when the stamp was written |
-| 14 | 4 | CRC of bytes 0 to 13 |
+| 10 | 2 | 0 |
+| 12 | 4 | sequence: one more than the catalog it replaced |
+| 16 | 4 | CRC of bytes 0 to 15 |
 
-A stamp is **valid** when its magic, version and CRC are right. It
-**matches** when bytes 5 to 9 equal the configuration. Only a matching
-stamp counts; a sector whose stamp does not match is dirty.
+A sector is **the catalog** when its stamp's CRC is right, bytes 4 to 9
+match the configuration, and its complete mark is 00h; of two, the one with
+the greater sequence.
 
-The **next sequence** at mount is two more than the largest of every valid
-claim's sequence and every matching stamp's floor, and three more when the
-mount finds a torn claim (section 2).
-- **Why:** a power loss can tear a claim so that it reads invalid at one
-  mount and valid at a later one. Its sequence must never be given again.
-- **The bound:** a torn claim's sequence is at most two more than the
-  largest known. Either it is the first sequence its mount gave, two more
-  than the largest then, or it follows a claim that is still valid. The
-  floors keep the largest sequence known after its sector is erased.
-- **So** three more than the largest known is past any sequence a torn
-  claim holds. Two more is not: a claim torn straight after a mount holds
-  exactly two more than the largest that mount knew, which is also the
-  largest the next mount knows.
-
-### 1.2 The claim
+### 1.2 An entry
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 4 | log number |
-| 4 | 4 | sequence: unique in the area, growing, never reused |
-| 8 | 4 | CRC of bytes 0 to 7 |
+| 0 | 4 | frame ID |
+| 4 | 4 | first page: the address of the frame's first page |
+| 8 | 32 | filename: 1 to 31 bytes, none 00h, then 00h to fill |
+| 40 | 4 | CRC of bytes 0 to 39 |
 
-A claim is **valid** when it is not erased and its CRC is right, and
-**zero** when all 12 bytes are 00h.
+An entry never crosses a page: a page holds five, from byte 24 on page 0
+and from byte 0 on the others, so a sector of sixteen pages holds 80. An
+entry is **valid** when its CRC is right, and **deleted** when its
+filename is all 00h. A filename names the frame of its valid entry.
 
-A log's number is the sequence of its first claim. Its other sectors'
-sequences are greater, and grow in the order the log took them.
+### 1.3 Rewriting
 
-### 1.3 A chunk
+When no slot is left, the spare is erased, checked erased and stamped with
+the next sequence; every valid entry whose frame's first page names it
+(section 3) is copied in, in order; then its complete mark is programmed,
+which makes it the catalog. The other sector is left as it is, until the
+next rewrite erases it.
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 2 | length of the payload, 2 or more |
-| 2 | 1 | tag: the stream |
-| 3 | 4 | CRC of the length, the tag and the payload |
-| 7 | length | payload: one or more rows |
+### 1.4 Frame IDs
 
-A row in a payload:
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 1 | n, the row's length: 1 to 255 |
-| 1 | n | the row |
-
-The rows fill the payload exactly. A row is at most R = min(255, P − 38)
-bytes, so that it and its length fit the room a sector's first page
-leaves after D and a chunk header.
-
-A chunk never crosses a page. A sector's first chunk starts at D; each
-later chunk at the end of the one before, or at the start of a later page.
+At mount the next frame ID is two more than the largest frame ID in an
+entry of either catalog sector whose CRC is right, and three more when an
+entry reads neither erased nor valid. An entry is programmed in the first
+slot after the last valid entry, unless that slot reads other than erased,
+or was the first slot after the last valid entry at the mount: then in the
+slot after it.
 
 ---
 
-## 2. What a log sector is
-
-| State | Stamp | Claim |
-|---|---|---|
-| ready | matches | erased |
-| used: a sector of the log its claim names | matches | valid |
-| dirty | anything else | |
-
-A sector whose stamp matches and whose claim is neither erased, valid nor
-zero holds a **torn claim**.
-
----
-
-## 3. Reading a log
-
-A log's sectors are the used sectors whose claim names it, in the order of
-their sequences.
-- **The first** is the one with the least sequence.
-- **The next** after sector k is found forward from k, circularly: the
-  first sector of the log with a greater sequence. Allocation goes forward
-  (section 4), so it is the next sector of the log forward.
-
-Within a sector, from D, each place holds a chunk header, or is the end:
-- **Fewer than 9 bytes to the page's end:** no chunk fits; the next page.
-- **Erased header:** the rest of the page holds nothing; the next page.
-- **A length under 2, or one past the page's end:** the header is
-  damaged. One failed check is counted, and reading goes on at the next
-  page.
-- **Another stream's chunk:** skipped by its length, unchecked.
-- **The stream's own chunk:** its CRC is checked, and its rows' lengths
-  must fill its payload exactly. A chunk that passes both gives its rows,
-  in order. One that fails either counts one failed check, and reading
-  goes on at the next page.
-
-The sector ends at its last page.
-
----
-
-## 4. Writing a log
-
-**Starting a log** takes its first sector at once: one program of the
-stamp again and a claim whose sequence is also the log's number. So the
-number is on the flash before the application has it, and a mount gives
-it to no other log.
-
-**Allocation** scans forward, circularly, from the sector after the one
-holding the newest claim the mount found, or after the last sector taken.
-It takes the first sector that:
-- is ready, and not bad this mount;
-- reads erased from 18 to the end of its first page;
-- is not the **fresh sector**: after a mount, the first sector after the
-  sector of the newest valid claim whose stamp matches and whose claim is
-  neither valid nor zero, or the first such sector anywhere if no claim is
-  valid. A claim program torn at its start can leave a sector that reads
-  ready. When allocation reaches the fresh sector, alfs programs 00h over
-  its claim, which makes it dirty.
-
-A ready sector that fails the second check is dirty: something touched it
-since its erase.
-
-**Each later sector's first program** starts at byte 0: the stamp again
-with the bytes it reads (A-9), the claim with the next sequence, and the
-sector's first chunk.
-
-**Chunks** hold whole rows. A writer's block holds its rows as a chunk's
-payload does, each after its length, and is programmed as chunks, each
-holding the rows that fit in the room left in the current page. When the
-next row does not fit there, the chunk goes at the start of the next
-page, or in a new sector. Two writers of one log add their chunks at the
-same place, one after the other.
-
-**A program that fails** (an error, or a read-back that differs) is
-counted, and its payload is dropped and counted as lost. The next chunk
-takes a new sector. A sector whose first program failed is dirty.
-
----
-
-## 5. Erasing a log area
-
-Erasing happens only when the application asks, one sector a step. A step
-scans forward, circularly, from where the last one stopped, for a sector
-that is not bad and is dirty, or, when a log is named, is that log's. It
-decides from one read of the sector's header.
-
-The step erases the sector, reads every byte back as erased, programs the
-stamp with the next sequence as its floor, and reads the stamp back. Any
-failure makes the sector bad for the rest of the mount.
-
-The stamp, not the blank check, is what shows an erase completed: an erase
-aborted at a tenth of its time can already read blank
-(`docs/FLASH_PROBE.md` section 4).
-
----
-
-## 6. The object area
-
-The object area is two halves of H sectors each: half 0 its first H
-sectors, half 1 the rest. A half's first page holds its records; its
-objects start at its second page.
+## 2. A frame page
 
 | Offset | Size | Field | Written |
 |---|---|---|---|
-| 0 | 16 | stamp | after every sector of the half is erased and checked erased |
-| 16 | 1 | begun mark | 00h, by the put or delete that begins writing the half, in one program with the stamp again |
-| 17 | 12 | commit | by the put or delete that finishes, after its last object |
-| P | | objects | by the put or delete |
+| 0 | 4 | frame ID | at allocation, or when a write takes the page past the reservation |
+| 4 | 2 | page count: the page's position in its frame, from 0 | as the frame ID |
+| 6 | 4 | header check: CRC of bytes 0 to 5 | as the frame ID |
+| 10 | 4 | next page: FFFFFFFFh none yet, 0 the frame's last page, else an address | at allocation; by a write past the reservation; 0 by a close |
+| 14 | | the frame block, on a frame's first page | section 2.1 |
+| H | n | data | by a write, whole pages; by a close, the last |
+| H + n | 4 | data check: CRC of the frame ID, the page count and the data | in the data's program |
 
-### 6.1 The stamp
+H is 14, or 64 on a frame's first page. A page holds D = P − 18 bytes of
+data, or P − 68 on a frame's first page: 238 and 188 on 256-byte pages.
+Every page of a frame holds D bytes of data but the last page written,
+which holds the rest.
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | magic, "alfo" |
-| 4 | 1 | version, 5 |
-| 5 | 1 | log2 S |
-| 6 | 1 | log2 P |
-| 7 | 1 | 0 |
-| 8 | 2 | H, sectors in a half |
-| 10 | 2 | 0 |
-| 12 | 4 | CRC of bytes 0 to 11 |
+A page's header is **valid** when its header check is right. A page is
+**free** when it reads erased, every byte.
 
-Valid and matching as a log sector's stamp (section 1.1), with bytes 5
-to 11.
+### 2.1 The frame block
 
-### 6.2 The commit
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | sequence: one more than the commit before it |
-| 4 | 4 | end: the offset, from the half's start, of the byte after its last object |
-| 8 | 4 | CRC of bytes 0 to 7 |
-
-A commit is **valid** when it is not erased, its CRC is right, and P ≤ end
-≤ H × S.
-
-### 6.3 An object
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 32 | name: 1 to 31 bytes, none 00h, then 00h to fill |
-| 32 | 4 | size of the payload |
-| 36 | size | payload |
-| 36 + size | 4 | CRC of the name, the size and the payload |
-
-The first object starts at P; each later one at the end of the one before.
-The last ends at the commit's end.
-
----
-
-## 7. What a half is
-
-| State | Stamp | Begun mark | Commit |
+| Offset | Size | Field | Written |
 |---|---|---|---|
-| committed | matches | | valid |
-| ready | matches | erased | erased |
-| dirty | anything else | | |
+| 0 | 4 | frame ID | at allocation |
+| 4 | 32 | filename: as an entry's | at allocation; 00h by a delete |
+| 36 | 2 | page count: pages holding data | by a close |
+| 38 | 4 | size: bytes of data | by a close |
+| 42 | 4 | frame checksum: CRC of the data, in order | by a close |
+| 46 | 4 | close check: CRC of bytes 0 to 45 | by a close |
 
-The **active** half is the committed half with the greater sequence, half
-0 when both have the same. The other is the **spare**. With no committed
-half, the area holds no store (`ALFS_ENOFS`).
-
----
-
-## 8. Putting and deleting
-
-A put of object N, of a given size:
-
-1. **The spare is made ready,** if it is not. First the active half's
-   commit is programmed again, built from the sequence and end it holds
-   (A-9). Then each of the spare's sectors is erased and read back as
-   erased, and the spare's stamp programmed.
-2. **One program from the spare's byte 0:** the stamp again, built from the
-   configuration, and the begun mark.
-3. **Every object of the active half not called N** is copied, in order,
-   in programs that do not cross a page.
-4. **Object N:** its name and size; its payload, as the application writes
-   it; its CRC.
-5. **The commit:** the active half's sequence plus one, and the end.
-
-The spare is then the active half, and the half that was active is the
-spare, dirty: step 1 of the next put erases it.
-
-A delete of N is a put without step 4. A put that is abandoned leaves the
-spare dirty.
-
-Step 1's program means a commit a power loss left half programmed cannot
-read invalid once the half before it is gone. Step 2's means a stamp a
-power loss left half programmed cannot decay under the objects.
+The reserved size is not recorded: the list is the reservation, and its end
+is the page whose link is erased. The first 36 bytes are programmed with
+the page's header, in one program.
+The last 14, the **close fields**, are programmed together. A frame is
+**closed** when its close check is right.
 
 ---
 
-## 9. Getting
+## 3. What a file is
 
-An object is found in the active half by walking from P: each object's
-size gives where the next begins. Opening it reads it whole and checks its
-CRC; reading it then reads its payload. The half it is in is not erased
-while it is open.
+A filename names a file when a valid entry of the catalog holds it, and the
+page at the entry's first page has a valid header with the entry's frame
+ID and page count 0, and a frame block with the same frame ID and
+filename.
+
+A file's **list** starts at its first page. From each page, the next is the
+one its link names, if that page lies in the area past the catalog, has a
+valid header, the same frame ID and the next page count, and has not
+already been passed. Otherwise the list ends at the page.
+
+A page is **live** when it is in the list of a file: up to the page count
+if the file is closed, to the list's end if not. A page in no file's list
+that is not free is **dead**.
 
 ---
 
-## 10. Formatting the object area
+## 4. Allocating
 
-Both halves are erased, read back as erased and stamped. Half 0 then takes
-its begun mark and a commit of sequence 1 and end P: a store with no
-objects.
+An allocation of a filename and a size takes R pages, enough for the size
+in the frame's data (section 2), at least one:
+
+1. **Free pages** are found forward, circularly, from where the last search
+   stopped. If fewer than R are found in a lap, sectors holding no live page
+   that do not read erased are erased and checked erased, forward from the
+   same place, until enough pages are free.
+2. **The entry** is programmed in the catalog, with the next frame ID and
+   the first page's address.
+3. **The pages**, from the last to the first: each one's header, with its
+   page count and the next page's address, the last page's link left
+   erased; the first page's frame block with it.
+
+---
+
+## 5. Writing
+
+A writer's block holds the data not yet programmed. Each complete page of
+it, when the block is full, at a sync, or at a close, is programmed into
+the next page of the list, with its data check, in one program.
+
+**Without `ALFS_GROW`** a write takes only the bytes the pages left in the
+list hold, counted at open from the links.
+
+**Past the reservation**, a writer opened with `ALFS_GROW` takes the next
+page from the free pages, forward from where the last search stopped: its
+header is programmed, then the link to it in the page before. Without the
+flag, or with no free page, the write returns `ALFS_ENOSPC`. Nothing is
+erased.
+
+**A close** programs the block's rest into the next page; then the close
+fields; then 00h into the last page's link; then erases each sector of the
+list past the last page that holds no live page.
+
+**Reopening** a file not closed starts at the first page of its list whose
+data and data check read erased, every byte. The size and checksum so far
+are taken from the pages before it whose data check is right.
+
+**Reopening a closed file**, through a block of at least S bytes, rewrites
+the sector of its first page and the sector of its last page: each in turn
+is read into the block, erased, checked erased, and programmed again, page
+by page, as it was, except the first page's close fields, the last page's
+link, and the last page's data and data check, which are left erased. The
+last page's data goes into the writer's block, and writing goes on in that
+page.
+
+---
+
+## 6. Reading
+
+A file is read along its list. Each page's data is read with its data
+check; a page whose check fails gives nothing, and one failure is counted.
+A closed file ends at its page count, its last page's data being the size
+less the data before it; the read that reaches the end checks the frame
+checksum, and returns `ALFS_ECHECK` when it fails. A file not closed ends
+at the first page whose data and data check read erased, or at the list's
+end.
+
+---
+
+## 7. Deleting
+
+A delete programs 00h over the filename in the frame block, then over the
+filename in the entry. The pages are left as they are; they are dead once
+the file is gone, and a cleanup erases the sectors that hold no live page.
+
+---
+
+## 8. Cleaning up
+
+A cleanup step finds, forward from where the last one stopped, a sector
+that holds no live page and does not read erased, erases it and checks it
+erased. With none left, `ALFS_CLEAN`.
+
+---
+
+## 9. Formatting
+
+Both catalog sectors are erased and checked erased; catalog sector 0 is
+stamped with sequence 1 and given its complete mark. Every frame page is
+then in no file.
