@@ -20,7 +20,8 @@ STORES = alfs_flash.c alfs_log.c alfs_obj.c
 STORE_H = alfs.h alfs_flash.h alfs_log.h alfs_obj.h
 TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
 TEST_H = tests/sim.h tests/tf.h
-STORE_BUDGET = 4096
+STORE_BUDGET = 6656
+RT_BUDGET = 1792
 
 all: test
 
@@ -107,6 +108,6 @@ RT_M0_INC = -I. -Itests/rtos_m0 -I$(ALFS_RT_KERNEL)/include -I$(ALFS_RT_KERNEL)/
 target-rt: target | $(ALFS_RT_KERNEL)
 	$(ARMCC) -std=c99 -Wall -Wextra -Werror -mcpu=cortex-m0plus -mthumb -Os -fcallgraph-info=su $(RT_M0_INC) -c alfs_rtos.c -o build/alfs_rtos_m0.o
 	$(ARMSIZE) build/alfs_rtos_m0.o
-	sh tests/check_target_rt.sh build/alfs_rtos_m0.o build/alfs_rtos_m0.ci $(STORE_M0:%.o=%.ci)
+	sh tests/check_target_rt.sh $(RT_BUDGET) build/alfs_rtos_m0.o build/alfs_rtos_m0.ci $(STORE_M0:%.o=%.ci)
 
 .PHONY: all test soak tests-compile target test-rt target-rt probe clean

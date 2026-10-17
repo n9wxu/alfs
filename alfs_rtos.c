@@ -17,46 +17,78 @@
 #endif
 #endif
 
-enum { OP_FORMAT, OP_MOUNT, OP_ERASE, OP_CREATE, OP_OPEN, OP_WRITE, OP_READ, OP_SYNC, OP_CLOSE, OP_DELETE, OP_LIST, OP_STATUS };
+enum {
+    LOG_MOUNT, LOG_ERASE, LOG_OPEN, LOG_WRITE, LOG_SYNC, LOG_CLOSE, LOG_OPEN_READ, LOG_READ, LOG_CLOSE_READ,
+    LOG_LIST, LOG_STATUS, OBJ_FORMAT, OBJ_MOUNT, OBJ_ERASE, OBJ_PUT, OBJ_WRITE, OBJ_COMMIT, OBJ_ABORT,
+    OBJ_DELETE, OBJ_OPEN, OBJ_READ, OBJ_CLOSE, OBJ_LIST, OBJ_STATUS
+};
 
 /* A request, on its caller's stack until the flash task gives done. */
 typedef struct req {
-    alfs_file_t *f;
-    const void *in;           /* bytes to write, a name, a configuration */
+    void *h;                  /* a handle */
+    const void *in;           /* bytes to write, a name, an area */
     void *out;                /* bytes read, a block, a scratch page, a listing */
     const alfs_driver_t *drv;
-    uint32_t n, v;            /* a length or a size; a version or erase steps */
+    uint32_t n, v;            /* a length or a size; a log, or an index */
     int32_t rc;
-    uint8_t op;
+    uint8_t op, tag;
     SemaphoreHandle_t done;
 } req_t;
 
-static int32_t run(alfs_t *fs, req_t *q) {
+/* Direct calls only, so the stack check (SIMP-04) follows every chain. */
+static int32_t run(alfs_rt_t *rt, req_t *q) {
+    alfs_log_t *lg = &rt->log;
+    alfs_obj_t *o = &rt->obj;
     switch (q->op) {
-    case OP_FORMAT:
-        return alfs_format(fs, q->in, q->drv, q->out);
-    case OP_MOUNT:
-        return alfs_mount(fs, q->in, q->drv, q->out);
-    case OP_ERASE:
-        return alfs_erase(fs, q->v);
-    case OP_CREATE:
-        return alfs_create(fs, q->f, q->in, q->out, q->n);
-    case OP_OPEN:
-        return alfs_open_read(fs, q->f, q->in, q->v, q->out, q->n);
-    case OP_WRITE:
-        return alfs_write(fs, q->f, q->in, q->n);
-    case OP_READ:
-        return alfs_read(fs, q->f, q->out, q->n);
-    case OP_SYNC:
-        return alfs_sync(fs, q->f);
-    case OP_CLOSE:
-        return alfs_close(fs, q->f);
-    case OP_DELETE:
-        return alfs_delete(fs, q->in, q->v);
-    case OP_LIST:
-        return alfs_list(fs, q->v, q->out);
+    case LOG_MOUNT:
+        return alfs_log_mount(lg, q->in, q->drv, q->out);
+    case LOG_ERASE:
+        return alfs_log_erase(lg, q->v, 1);
+    case LOG_OPEN:
+        return alfs_log_open(lg, q->h, q->v, q->tag, q->out, q->n);
+    case LOG_WRITE:
+        return alfs_log_write(lg, q->h, q->in, q->n);
+    case LOG_SYNC:
+        return alfs_log_sync(lg, q->h);
+    case LOG_CLOSE:
+        return alfs_log_close(lg, q->h);
+    case LOG_OPEN_READ:
+        return alfs_log_open_read(lg, q->h, q->v, q->tag, q->out, q->n);
+    case LOG_READ:
+        return alfs_log_read(lg, q->h, q->out, q->n);
+    case LOG_CLOSE_READ:
+        return alfs_log_close_read(lg, q->h);
+    case LOG_LIST:
+        return alfs_log_list(lg, q->v, q->out);
+    case LOG_STATUS:
+        alfs_log_status(lg, q->out);
+        return ALFS_OK;
+    case OBJ_FORMAT:
+        return alfs_obj_format(o, q->in, q->drv, q->out);
+    case OBJ_MOUNT:
+        return alfs_obj_mount(o, q->in, q->drv, q->out);
+    case OBJ_ERASE:
+        return alfs_obj_erase(o, 1);
+    case OBJ_PUT:
+        return alfs_obj_put(o, q->h, q->in, q->n);
+    case OBJ_WRITE:
+        return alfs_obj_write(o, q->h, q->in, q->n);
+    case OBJ_COMMIT:
+        return alfs_obj_commit(o, q->h);
+    case OBJ_ABORT:
+        return alfs_obj_abort(o, q->h);
+    case OBJ_DELETE:
+        return alfs_obj_delete(o, q->in);
+    case OBJ_OPEN:
+        return alfs_obj_open(o, q->h, q->in);
+    case OBJ_READ:
+        return alfs_obj_read(o, q->h, q->out, q->n);
+    case OBJ_CLOSE:
+        return alfs_obj_close(o, q->h);
+    case OBJ_LIST:
+        return alfs_obj_list(o, q->v, q->out);
     default:
-        alfs_status(fs, q->out);
+        alfs_obj_status(o, q->out);
         return ALFS_OK;
     }
 }
@@ -67,7 +99,7 @@ static void task_fn(void *arg) {
         req_t *q;
         if (xQueueReceive(rt->queue, &q, portMAX_DELAY) != pdTRUE)
             continue;
-        q->rc = run(&rt->fs, q);
+        q->rc = run(rt, q);
         rt->requests++;
         xSemaphoreGive(q->done);
     }
@@ -87,29 +119,37 @@ static int32_t submit(alfs_rt_t *rt, req_t *q) {
     if (!rt || ALFS_RT_IN_ISR() || (t && t == rt->task))
         return ALFS_EINVAL;
     if (!t)
-        return run(&rt->fs, q);
+        return run(rt, q);
     q->done = xSemaphoreCreateBinaryStatic(&done);
     xQueueSend(rt->queue, &q, portMAX_DELAY);
     xSemaphoreTake(q->done, portMAX_DELAY);
     return q->rc;
 }
 
-static int32_t ask(alfs_rt_t *rt, uint8_t op, alfs_file_t *f, const void *in, void *out, uint32_t n,
-                   uint32_t v) {
-    req_t q = {f, in, out, NULL, n, v, 0, op, NULL};
+static int32_t ask(alfs_rt_t *rt, uint8_t op, void *h, const void *in, void *out, uint32_t n, uint32_t v) {
+    req_t q = {h, in, out, NULL, n, v, 0, op, 0, NULL};
     return submit(rt, &q);
 }
 
 /* format and mount, which also pass a driver. */
-static int region(alfs_rt_t *rt, uint8_t op, const alfs_config_t *cfg, const alfs_driver_t *drv,
-                  uint8_t *scratch) {
-    req_t q = {NULL, cfg, scratch, drv, 0, 0, 0, op, NULL};
+static int area(alfs_rt_t *rt, uint8_t op, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    req_t q = {NULL, cfg, scratch, drv, 0, 0, 0, op, 0, NULL};
     return (int)submit(rt, &q);
 }
 
-/* A file the calling task opened. */
-static bool mine(const alfs_rt_file_t *f) {
-    return f && f->owner == me();
+/* An erase of steps steps, one request each (RT-07). */
+static int erase(alfs_rt_t *rt, uint8_t op, uint32_t log, uint32_t steps) {
+    int rc = ALFS_OK;
+    for (uint32_t i = 0; i < steps && rc == ALFS_OK; i++)
+        rc = (int)ask(rt, op, NULL, NULL, NULL, 0, log);
+    return rc;
+}
+
+/* A log handle's open, which also passes a tag. */
+static int open_handle(alfs_rt_t *rt, uint8_t op, void *h, uint32_t log, uint8_t tag, uint8_t *block,
+                       uint32_t size) {
+    req_t q = {h, NULL, block, NULL, size, log, 0, op, tag, NULL};
+    return (int)submit(rt, &q);
 }
 
 int alfs_rt_start(alfs_rt_t *rt, const alfs_rt_mem_t *m) {
@@ -126,72 +166,131 @@ int alfs_rt_start(alfs_rt_t *rt, const alfs_rt_mem_t *m) {
     return rt->queue && rt->task ? ALFS_OK : ALFS_EINVAL;
 }
 
-int alfs_rt_format(alfs_rt_t *rt, const alfs_config_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
-    return region(rt, OP_FORMAT, cfg, drv, scratch);
+/* ---- the log area ------------------------------------------------------ */
+
+int alfs_rt_log_mount(alfs_rt_t *rt, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    return area(rt, LOG_MOUNT, cfg, drv, scratch);
 }
 
-int alfs_rt_mount(alfs_rt_t *rt, const alfs_config_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
-    return region(rt, OP_MOUNT, cfg, drv, scratch);
+int alfs_rt_log_erase(alfs_rt_t *rt, uint32_t log, uint32_t steps) {
+    return erase(rt, LOG_ERASE, log, steps);
 }
 
-int alfs_rt_erase(alfs_rt_t *rt, uint32_t steps) {
-    int rc = (int)ask(rt, OP_ERASE, NULL, NULL, NULL, 0, steps ? 1u : 0u);
-    for (uint32_t i = 1; i < steps && rc == ALFS_OK; i++)
-        rc = (int)ask(rt, OP_ERASE, NULL, NULL, NULL, 0, 1);
-    return rc;
-}
-
-int alfs_rt_create(alfs_rt_t *rt, alfs_rt_file_t *f, const char *name, uint8_t *block, uint32_t size) {
-    int rc = f ? (int)ask(rt, OP_CREATE, &f->f, name, block, size, 0) : ALFS_EINVAL;
+int alfs_rt_log_open(alfs_rt_t *rt, alfs_rt_writer_t *w, uint32_t log, uint8_t tag, uint8_t *block, uint32_t size) {
+    int rc = w ? open_handle(rt, LOG_OPEN, &w->w, log, tag, block, size) : ALFS_EINVAL;
     if (!rc)
-        f->owner = me();
+        w->owner = me();
     return rc;
 }
 
-int alfs_rt_open_read(alfs_rt_t *rt, alfs_rt_file_t *f, const char *name, uint32_t version, uint8_t *block,
-                      uint32_t size) {
-    int rc = f ? (int)ask(rt, OP_OPEN, &f->f, name, block, size, version) : ALFS_EINVAL;
+int alfs_rt_log_open_read(alfs_rt_t *rt, alfs_rt_reader_t *r, uint32_t log, uint8_t tag, uint8_t *block,
+                          uint32_t size) {
+    int rc = r ? open_handle(rt, LOG_OPEN_READ, &r->r, log, tag, block, size) : ALFS_EINVAL;
     if (!rc)
-        f->owner = me();
+        r->owner = me();
     return rc;
+}
+
+/* RT-06: a log handle is used only by the task that opened it, since its
+ * block is filled and drained in that task (RT-03). */
+static bool wmine(const alfs_rt_writer_t *w) {
+    return w && w->owner == me();
+}
+
+static bool rmine(const alfs_rt_reader_t *r) {
+    return r && r->owner == me();
 }
 
 /* RT-03: bytes that fit in the block without filling it go there in the
  * caller's task; the flash task takes the rest. */
-int32_t alfs_rt_write(alfs_rt_t *rt, alfs_rt_file_t *f, const void *data, uint32_t len) {
-    if (!mine(f) || (len && !data))
+int32_t alfs_rt_log_write(alfs_rt_t *rt, alfs_rt_writer_t *w, const void *data, uint32_t len) {
+    if (!wmine(w) || (len && !data))
         return ALFS_EINVAL;
-    uint32_t n = alfs_take(&f->f, data, len);
-    if (len && n == len && f->f.used < f->f.cap)
+    uint32_t n = alfs_log_take(&w->w, data, len);
+    if (len && n == len && w->w.used < w->w.cap)
         return (int32_t)len;
-    int32_t m = ask(rt, OP_WRITE, &f->f, (const uint8_t *)data + n, NULL, len - n, 0);
+    int32_t m = ask(rt, LOG_WRITE, &w->w, (const uint8_t *)data + n, NULL, len - n, 0);
     return m < 0 ? (n ? (int32_t)n : m) : (int32_t)(n + (uint32_t)m);
 }
 
+int alfs_rt_log_sync(alfs_rt_t *rt, alfs_rt_writer_t *w) {
+    return wmine(w) ? (int)ask(rt, LOG_SYNC, &w->w, NULL, NULL, 0, 0) : ALFS_EINVAL;
+}
+
+int alfs_rt_log_close(alfs_rt_t *rt, alfs_rt_writer_t *w) {
+    return wmine(w) ? (int)ask(rt, LOG_CLOSE, &w->w, NULL, NULL, 0, 0) : ALFS_EINVAL;
+}
+
 /* RT-03: what the block holds is read in the caller's task. */
-int32_t alfs_rt_read(alfs_rt_t *rt, alfs_rt_file_t *f, void *out, uint32_t len) {
-    if (!mine(f) || (len && !out))
+int32_t alfs_rt_log_read(alfs_rt_t *rt, alfs_rt_reader_t *r, void *out, uint32_t len) {
+    if (!rmine(r) || (len && !out))
         return ALFS_EINVAL;
-    uint32_t n = alfs_give(&f->f, out, len);
-    return n ? (int32_t)n : ask(rt, OP_READ, &f->f, NULL, out, len, 0);
+    uint32_t n = alfs_log_give(&r->r, out, len);
+    return n ? (int32_t)n : ask(rt, LOG_READ, &r->r, NULL, out, len, 0);
 }
 
-int alfs_rt_sync(alfs_rt_t *rt, alfs_rt_file_t *f) {
-    return mine(f) ? (int)ask(rt, OP_SYNC, &f->f, NULL, NULL, 0, 0) : ALFS_EINVAL;
+int alfs_rt_log_close_read(alfs_rt_t *rt, alfs_rt_reader_t *r) {
+    return rmine(r) ? (int)ask(rt, LOG_CLOSE_READ, &r->r, NULL, NULL, 0, 0) : ALFS_EINVAL;
 }
 
-int alfs_rt_close(alfs_rt_t *rt, alfs_rt_file_t *f) {
-    return mine(f) ? (int)ask(rt, OP_CLOSE, &f->f, NULL, NULL, 0, 0) : ALFS_EINVAL;
+int alfs_rt_log_list(alfs_rt_t *rt, uint32_t after, alfs_log_info_t *info) {
+    return info ? (int)ask(rt, LOG_LIST, NULL, NULL, info, 0, after) : ALFS_EINVAL;
 }
 
-int alfs_rt_delete(alfs_rt_t *rt, const char *name, uint32_t version) {
-    return (int)ask(rt, OP_DELETE, NULL, name, NULL, 0, version);
+int alfs_rt_log_status(alfs_rt_t *rt, alfs_log_status_t *st) {
+    return st ? (int)ask(rt, LOG_STATUS, NULL, NULL, st, 0, 0) : ALFS_EINVAL;
 }
 
-int alfs_rt_list(alfs_rt_t *rt, uint32_t after, alfs_info_t *info) {
-    return info ? (int)ask(rt, OP_LIST, NULL, NULL, info, 0, after) : ALFS_EINVAL;
+/* ---- the object area --------------------------------------------------- */
+
+int alfs_rt_obj_format(alfs_rt_t *rt, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    return area(rt, OBJ_FORMAT, cfg, drv, scratch);
 }
 
-int alfs_rt_status(alfs_rt_t *rt, alfs_status_t *st) {
-    return st ? (int)ask(rt, OP_STATUS, NULL, NULL, st, 0, 0) : ALFS_EINVAL;
+int alfs_rt_obj_mount(alfs_rt_t *rt, const alfs_area_t *cfg, const alfs_driver_t *drv, uint8_t *scratch) {
+    return area(rt, OBJ_MOUNT, cfg, drv, scratch);
+}
+
+int alfs_rt_obj_erase(alfs_rt_t *rt, uint32_t steps) {
+    return erase(rt, OBJ_ERASE, 0, steps);
+}
+
+int alfs_rt_obj_put(alfs_rt_t *rt, alfs_put_t *p, const char *name, uint32_t size) {
+    return (int)ask(rt, OBJ_PUT, p, name, NULL, size, 0);
+}
+
+int32_t alfs_rt_obj_write(alfs_rt_t *rt, alfs_put_t *p, const void *data, uint32_t len) {
+    return ask(rt, OBJ_WRITE, p, data, NULL, len, 0);
+}
+
+int alfs_rt_obj_commit(alfs_rt_t *rt, alfs_put_t *p) {
+    return (int)ask(rt, OBJ_COMMIT, p, NULL, NULL, 0, 0);
+}
+
+int alfs_rt_obj_abort(alfs_rt_t *rt, alfs_put_t *p) {
+    return (int)ask(rt, OBJ_ABORT, p, NULL, NULL, 0, 0);
+}
+
+int alfs_rt_obj_delete(alfs_rt_t *rt, const char *name) {
+    return (int)ask(rt, OBJ_DELETE, NULL, name, NULL, 0, 0);
+}
+
+int alfs_rt_obj_open(alfs_rt_t *rt, alfs_get_t *g, const char *name) {
+    return (int)ask(rt, OBJ_OPEN, g, name, NULL, 0, 0);
+}
+
+int32_t alfs_rt_obj_read(alfs_rt_t *rt, alfs_get_t *g, void *out, uint32_t len) {
+    return ask(rt, OBJ_READ, g, NULL, out, len, 0);
+}
+
+int alfs_rt_obj_close(alfs_rt_t *rt, alfs_get_t *g) {
+    return (int)ask(rt, OBJ_CLOSE, g, NULL, NULL, 0, 0);
+}
+
+int alfs_rt_obj_list(alfs_rt_t *rt, uint32_t index, alfs_obj_info_t *info) {
+    return info ? (int)ask(rt, OBJ_LIST, NULL, NULL, info, 0, index) : ALFS_EINVAL;
+}
+
+int alfs_rt_obj_status(alfs_rt_t *rt, alfs_obj_status_t *st) {
+    return st ? (int)ask(rt, OBJ_STATUS, NULL, NULL, st, 0, 0) : ALFS_EINVAL;
 }

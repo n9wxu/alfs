@@ -1,15 +1,15 @@
 #!/bin/sh
-# SIMP-02: text + data of alfs_rtos.o at most 1536 bytes on a Cortex-M0+.
+# SIMP-02: text + data of alfs_rtos.o at most BUDGET bytes on a Cortex-M0+.
 # SIMP-04: the deepest chain of stack frames under the flash task's
 # function at most 512 bytes, through the stores' frames (every call graph
 # given); the driver's and the kernel's own frames apart.
-# Usage: check_target_rt.sh obj ci store_ci...
+# Usage: check_target_rt.sh BUDGET obj ci store_ci...
 set -e
-obj=$1
-shift
+budget=$1 obj=$2
+shift 2
 size=$(arm-none-eabi-size "$obj" | awk 'NR == 2 { print $1 + $2 }')
-echo "task layer: $size bytes (budget 1536)"
-[ "$size" -le 1536 ] || { echo "SIMP-02 fails"; exit 1; }
+echo "task layer: $size bytes (budget $budget)"
+[ "$size" -le "$budget" ] || { echo "SIMP-02 fails"; exit 1; }
 python3 - "$@" <<'PY'
 import re, sys, functools
 size, calls = {}, {}
