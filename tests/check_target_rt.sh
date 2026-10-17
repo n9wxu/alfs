@@ -1,7 +1,7 @@
 #!/bin/sh
 # SIMP-02: text + data of alfs_rtos.o at most BUDGET bytes on a Cortex-M0+.
 # SIMP-04: the deepest chain of stack frames under the flash task's
-# function at most 512 bytes, through the stores' frames (every call graph
+# function at most 384 bytes, through the stores' frames (every call graph
 # given); the driver's and the kernel's own frames apart.
 # Usage: check_target_rt.sh BUDGET obj ci store_ci...
 set -e
@@ -27,6 +27,6 @@ def depth(n):
     return size.get(n, 0) + max([depth(t) for t in calls.get(n, []) if t != n] or [0])
 d = depth("task_fn")
 print(f"stack {d:4d}  the flash task")
-if d > 512:
+if d > 384:
     print("SIMP-04 fails"); sys.exit(1)
 PY

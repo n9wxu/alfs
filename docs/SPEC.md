@@ -173,7 +173,7 @@ takes a new sector. A sector whose first program failed is dirty.
 
 ---
 
-## 5. Erasing the log area
+## 5. Erasing a log area
 
 Erasing happens only when the application asks, one sector a step. A step
 scans forward, circularly, from where the last one stopped, for a sector

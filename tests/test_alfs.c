@@ -344,7 +344,7 @@ static int log_info(rig_t *r, uint32_t n, alfs_log_info_t *in) {
     return rc ? rc : in->log == n ? ALFS_OK : ALFS_ENOENT;
 }
 
-/* The sectors of the log area holding a valid claim of log n, by the
+/* The sectors of the flight log area holding a valid claim of log n, by the
  * simulator's flash. */
 static uint32_t claims_of(const rig_t *r, uint32_t n, int32_t *last) {
     uint32_t count = 0;

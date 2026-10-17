@@ -1,7 +1,7 @@
 #!/bin/sh
 # SIMP-02: text + data of the stores' objects at most BUDGET bytes on a
 # Cortex-M0+. SIMP-04: the deepest chain of stack frames under each public
-# call at most 384 bytes, from GCC's call graphs (-fcallgraph-info=su) of
+# call at most 320 bytes, from GCC's call graphs (-fcallgraph-info=su) of
 # all of them; the driver's own frames are the caller's to add.
 # Usage: check_target.sh BUDGET obj...; each obj's call graph is beside it.
 set -e
@@ -29,6 +29,6 @@ def depth(n):
 worst = sorted(((depth(n), n) for n in size if n.startswith(("alfs_log_", "alfs_obj_"))), reverse=True)
 for d, n in worst[:5]:
     print(f"stack {d:4d}  {n}")
-if worst[0][0] > 384:
+if worst[0][0] > 320:
     print("SIMP-04 fails"); sys.exit(1)
 PY

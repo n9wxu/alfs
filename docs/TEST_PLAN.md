@@ -186,9 +186,9 @@ without alfs's help. Tests that write a run of bytes write it as rows of
 | `life_cfg_wear` | LIFE-05 | Sets through the configuration application, with a reload every 50, until every sector of the configuration area has been erased ten times: counts within 2. |
 | `safe_cfg_atomic` | SAFE-16 | Power lost at every operation of W-CFG's sets and deletes through the configuration application, each behaviour, with a reload in the middle. After each loss, eight reloads reading every key, then a set and eight more. Each key reads as its last returned set made it, or as the one cut short would. |
 | `obs_status` | OBS-01 | Counts against the simulator's, for the flight log area and the object area, before and after logging, puts and a remount. |
-| `obs_clean` | OBS-03 | The log area not clean when it holds a dirty sector, clean once erased; the object area not clean after a put, clean once its spare is ready. |
+| `obs_clean` | OBS-03 | A log area not clean when it holds a dirty sector, clean once erased; the object area not clean after a put, clean once its spare is ready. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
-| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds each store alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 384 bytes, from GCC's call graph. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds each store alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
 
 **The power-loss runs, after the loss.**
 1. Remount; every synced byte of the log reads back, nothing beyond what

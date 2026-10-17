@@ -76,7 +76,7 @@ typedef struct alfs_log_status {
 } alfs_log_status_t;
 
 /*
- * Mounts the log area. Reads 30 bytes of each sector and writes nothing. A
+ * Mounts a log area. Reads 30 bytes of each sector and writes nothing. A
  * sector holding anything but a log sector of this geometry is dirty.
  * scratch: one page, the instance's from now on. ALFS_EGEOMETRY,
  * ALFS_EINVAL: nothing read. ALFS_EOPEN: a handle is open. ALFS_EIO: retry.
