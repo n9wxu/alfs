@@ -1097,7 +1097,7 @@ static void if_ids_never_reused(void) {
                 after = in.id;
                 note(&seen, in.id); /* listed: may be one given already */
             }
-            char name[16];
+            char name[32];
             snprintf(name, sizeof(name), "m%d%d", t, m);
             CHECK_EQ(falloc(&r, name, 100, &id), 0);
             if (!note(&seen, id))
