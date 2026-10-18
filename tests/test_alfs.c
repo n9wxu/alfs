@@ -54,7 +54,7 @@ typedef struct {
 } rig_t;
 
 static int call_bad;           /* calls that broke SPD-01 */
-static char call_why[96];
+static char call_why[128];
 static uint64_t longest_stall; /* the longest operation outside an erase, us */
 static uint32_t seed;          /* the simulator's, from ALFS_SEED */
 
@@ -1097,7 +1097,7 @@ static void if_ids_never_reused(void) {
                 after = in.id;
                 note(&seen, in.id); /* listed: may be one given already */
             }
-            char name[8];
+            char name[16];
             snprintf(name, sizeof(name), "m%d%d", t, m);
             CHECK_EQ(falloc(&r, name, 100, &id), 0);
             if (!note(&seen, id))
@@ -1330,7 +1330,7 @@ static void spd_mount_reads_bounded(void) {
     static uint8_t d[20000];
     fill(d, sizeof(d), 16);
     for (int i = 0; i < 20; i++) {
-        char name[8];
+        char name[16];
         snprintf(name, sizeof(name), "f%d", i);
         CHECK_EQ(write_file(&r, name, d, 1000u * (uint32_t)(i % 7), 20000), 0);
         if (i % 3 == 2)
@@ -1753,7 +1753,7 @@ static void safe_write_only_verified_erased(void) {
     static uint8_t d[30000];
     fill(d, sizeof(d), 21);
     for (int i = 0; i < 6; i++) {
-        char name[8];
+        char name[16];
         snprintf(name, sizeof(name), "f%d", i);
         if (write_file(&r, name, d, 3000, 3000))
             break;
@@ -1936,7 +1936,7 @@ static void safe_fuzz(void) {
         static uint8_t d[12000], got[16384];
         fill(d, sizeof(d), (uint32_t)trial);
         for (int i = 0; i < 4; i++) {
-            char name[8];
+            char name[16];
             snprintf(name, sizeof(name), "f%d", i);
             write_file(&r, name, d, 2000u * (uint32_t)(i + 1), 2000u * (uint32_t)(i + 1));
         }
