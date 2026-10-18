@@ -4,7 +4,7 @@
  *
  * Every call a test makes goes through CALL, which holds it to SPD-01 (no
  * erase) and records the longest single operation (SPD-06), or ECALL, for
- * the calls SPD-01 lets erase. Every test ends with DONE, which fails it if
+ * the cleanup, the one call SPD-01 lets erase. Every test ends with DONE, which fails it if
  * the simulator saw a violation (a program across a page, a byte
  * programmed twice, or a program into a byte a power loss touched, each but
  * a program that settles, docs/TEST_PLAN.md 2), if an erase took a sector
@@ -23,14 +23,14 @@
 #define PAGE 256u
 #define PPS (SECTOR / PAGE)  /* pages a sector */
 #define HDR 14u                  /* a page header (docs/SPEC.md 2) */
-#define FBLOCK 46u               /* a frame block (SPEC 2.1) */
+#define FBLOCK 51u               /* a frame block (SPEC 1.1) */
 #define NAME_AT (HDR + 4u)       /* the filename, on a first page */
-#define CLOSE_AT (HDR + 36u)     /* the close fields, on a first page */
+#define VERSION_AT (HDR + 36u)   /* the version, on a first page */
+#define OPEN_AT (HDR + 37u)      /* the open check, on a first page */
+#define CLOSE_AT (HDR + 41u)     /* the close fields, on a first page */
 #define D (PAGE - HDR - 2u - 4u) /* data a page holds: byte count and check apart */
 #define D0 (D - FBLOCK)          /* data a file's first page holds */
-#define CAT_PAGES (2u * PPS) /* the catalog's: no frame page has their addresses */
-#define ENTRY 44u            /* a catalog entry (SPEC 1.2) */
-#define ENTRIES 80u          /* a catalog sector's slots */
+#define CACHE 64u                /* records in the rig's cache */
 #define ROW 22u
 #define LINK_NONE 0xFFFFFFFFu
 #define MAX_PROGS 64
@@ -44,6 +44,8 @@ typedef struct {
     alfs_fs_t fs;
     uint32_t bsize; /* the writer's block, a page unless a test says */
     uint8_t scratch[PAGE];
+    alfs_rec_t cache[CACHE];
+    uint16_t ncache; /* the cache's records, CACHE unless a test says */
     uint8_t wblk[SECTOR], rblk[PAGE];
     uint8_t gap[2][SECTOR]; /* the sectors around the area, as filled */
     uint64_t blank_erases;  /* erases of a sector that read erased */
@@ -93,6 +95,7 @@ static void rig_open(rig_t *r, uint32_t sectors) {
     r->drv = (alfs_driver_t){r, w_read, w_prog, w_erase};
     r->cfg = (alfs_area_t){SECTOR, sectors * SECTOR, chip, SECTOR, PAGE};
     r->bsize = PAGE;
+    r->ncache = CACHE;
     call_bad = 0;
     call_why[0] = 0;
     longest_stall = 0;
@@ -216,17 +219,13 @@ static bool runs_cut(const uint8_t *got, uint32_t n, const uint8_t *exp, uint32_
 /* ---- the store's calls -------------------------------------------------- */
 
 static int fmount(rig_t *r) {
-    return (int)CALL(r, alfs_fs_mount(&r->fs, &r->cfg, &r->drv, r->scratch));
+    return (int)CALL(r, alfs_fs_mount(&r->fs, &r->cfg, &r->drv, r->scratch, r->cache, r->ncache));
 }
 
 /* A reboot: every handle gone, the area mounted again. */
 static int remount(rig_t *r) {
     memset(&r->fs, 0, sizeof(r->fs));
     return fmount(r);
-}
-
-static int ffmt(rig_t *r) {
-    return (int)ECALL(r, alfs_fs_format(&r->fs, &r->cfg, &r->drv, r->scratch));
 }
 
 /* Cleanup steps until none is left: the steps, or -1. */
@@ -241,14 +240,14 @@ static int clean_all(rig_t *r) {
     return -1;
 }
 
-/* The area formatted and every frame page made free. */
+/* The area mounted and every page made free. */
 static int setup(rig_t *r) {
-    return ffmt(r) || clean_all(r) < 0 ? -1 : 0;
+    return remount(r) || clean_all(r) < 0 ? -1 : 0;
 }
 
 static int falloc(rig_t *r, const char *name, uint32_t bytes, uint32_t *id) {
     uint32_t got = 0;
-    int rc = (int)ECALL(r, alfs_file_alloc(&r->fs, name, bytes, &got));
+    int rc = (int)CALL(r, alfs_file_alloc(&r->fs, name, bytes, &got));
     if (id)
         *id = got;
     return rc;
@@ -286,7 +285,7 @@ static int fflushw(rig_t *r, alfs_file_t *f) {
 }
 
 static int fclosew(rig_t *r, alfs_file_t *f) {
-    return (int)ECALL(r, alfs_file_close(&r->fs, f));
+    return (int)CALL(r, alfs_file_close(&r->fs, f));
 }
 
 /* Reads a whole file in pieces of up to 77 bytes into out: its length, or
@@ -330,12 +329,27 @@ static bool reads_as(rig_t *r, const char *name, const uint8_t *d, uint32_t n) {
     return m == (int32_t)n && !memcmp(got, d, n);
 }
 
-/* Allocates `reserve` bytes, writes d, closes. 0, or the first error. */
+/* Every file listed has name a or name b: a power loss leaves no file under
+ * a filename no one wrote. */
+static bool lists_only(rig_t *r, const char *a, const char *b) {
+    alfs_file_info_t in;
+    uint32_t after = 0;
+    for (uint32_t i = 0; i < CACHE && alfs_file_list(&r->fs, after, &in) == 0; i++) {
+        after = in.id;
+        if (strcmp(in.name, a) && strcmp(in.name, b))
+            return false;
+    }
+    return true;
+}
+
+/* Allocates `reserve` bytes, writes d, closes. 0, or the first error. Its
+ * block is its own, so another writer's stays as it is. */
 static int write_file(rig_t *r, const char *name, const uint8_t *d, uint32_t n, uint32_t reserve) {
+    static uint8_t blk[PAGE];
     alfs_file_t f;
     int rc = falloc(r, name, reserve, NULL);
     if (!rc)
-        rc = fopenw(r, &f, name, 0);
+        rc = (int)CALL(r, alfs_file_open(&r->fs, &f, name, 0, blk, sizeof(blk)));
     if (!rc)
         rc = put(r, &f, d, n, NULL);
     return rc ? rc : fclosew(r, &f);
@@ -379,43 +393,33 @@ static bool erased(const uint8_t *p, uint32_t n) {
     return true;
 }
 
-/* The catalog sector in use (SPEC 1.1), or -1. */
-static int cat_sector(rig_t *r) {
-    int best = -1;
-    uint32_t seq = 0;
-    for (int c = 0; c < 2; c++) {
-        const uint8_t *s = r->sim.mem + r->cfg.start + (uint32_t)c * SECTOR;
-        if (memcmp(s, "alfc", 4) || get32le(s + 16) != crc32_ref(s, 16) || s[20] != 0)
+/* The first page of the copy file name names (SPEC 2), by the pages'
+ * bytes: the newest closed copy, or the newest; 0 for none. */
+static uint32_t first_of(rig_t *r, const char *name) {
+    uint32_t best = 0;
+    int best_closed = 0;
+    uint8_t best_v = 0;
+    for (uint32_t p = 1; p < r->cfg.size / PAGE; p++) {
+        const uint8_t *h = pg(r, p);
+        if (get32le(h + 6) != crc32_ref(h, 6) || get16le(h + 4) != 0 || get32le(h + HDR) != get32le(h) ||
+            get32le(h + OPEN_AT) != crc32_ref(h + HDR, 37) ||
+            strncmp((const char *)h + NAME_AT, name, 32) || !name[0])
             continue;
-        if (best < 0 || get32le(s + 12) > seq) {
-            best = c;
-            seq = get32le(s + 12);
+        int closed = get32le(h + CLOSE_AT + 6) == crc32_ref(h + HDR, 47);
+        uint8_t v = h[VERSION_AT];
+        if (!best || closed > best_closed || (closed == best_closed && (int8_t)(uint8_t)(v - best_v) > 0)) {
+            best = p;
+            best_closed = closed;
+            best_v = v;
         }
     }
     return best;
 }
 
-/* Slot i of catalog sector c (SPEC 1.2). */
-static uint8_t *slot(rig_t *r, int c, uint32_t i) {
-    uint32_t page = i / 5, k = i % 5;
-    return r->sim.mem + r->cfg.start + (uint32_t)c * SECTOR + page * PAGE + (page ? 0u : 24u) + k * ENTRY;
-}
-
-/* File name's catalog entry, or NULL. */
-static uint8_t *entry_of(rig_t *r, const char *name) {
-    int c = cat_sector(r);
-    for (uint32_t i = 0; c >= 0 && i < ENTRIES; i++) {
-        uint8_t *e = slot(r, c, i);
-        if (get32le(e + 40) == crc32_ref(e, 40) && !strncmp((const char *)e + 8, name, 32))
-            return e;
-    }
-    return NULL;
-}
-
-/* A list by its links (SPEC 3), from page first: its pages into out. */
+/* A list by its links (SPEC 2), from page first: its pages into out. */
 static uint32_t list_of(rig_t *r, uint32_t first, uint32_t *out, uint32_t max) {
     uint32_t n = 0, p = first, id = get32le(pg(r, first));
-    while (n < max && p >= CAT_PAGES && p < r->cfg.size / PAGE) {
+    while (n < max && p >= 1 && p < r->cfg.size / PAGE) {
         const uint8_t *h = pg(r, p);
         if (get32le(h + 6) != crc32_ref(h, 6) || get32le(h) != id || get16le(h + 4) != n)
             break;
@@ -428,10 +432,10 @@ static uint32_t list_of(rig_t *r, uint32_t first, uint32_t *out, uint32_t max) {
     return n;
 }
 
-/* File name's pages, by the catalog and the links. */
+/* File name's pages, by the pages and the links. */
 static uint32_t pages_of(rig_t *r, const char *name, uint32_t *out, uint32_t max) {
-    const uint8_t *e = entry_of(r, name);
-    return e ? list_of(r, get32le(e + 4), out, max) : 0u;
+    uint32_t first = first_of(r, name);
+    return first ? list_of(r, first, out, max) : 0u;
 }
 
 /* ---- the simulator ------------------------------------------------------ */
@@ -484,50 +488,56 @@ static void if_geometry(void) {
         {"sector under four pages", &r.cfg.sector_size, 512},
         {"page not a power of two", &r.cfg.page_size, 200},
         {"page under 128 bytes", &r.cfg.page_size, 64},
-        {"area under four sectors", &r.cfg.size, 3 * SECTOR},
+        {"area under two sectors", &r.cfg.size, SECTOR},
         {"empty area", &r.cfg.size, 0},
     };
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         r.cfg = good;
         *bad[i].field = bad[i].value;
-        int rc = ffmt(&r);
+        int rc = remount(&r);
         if (rc != ALFS_EGEOMETRY && rc != ALFS_EINVAL)
-            printf("    format accepted: %s (%d)\n", bad[i].what, rc);
-        CHECK(rc == ALFS_EGEOMETRY || rc == ALFS_EINVAL);
-        rc = remount(&r);
+            printf("    mount accepted: %s (%d)\n", bad[i].what, rc);
         CHECK(rc == ALFS_EGEOMETRY || rc == ALFS_EINVAL);
         CHECK_EQ(r.sim.ops, 0);
+        CHECK_EQ(r.sim.bytes_read, 0);
     }
     r.cfg = good;
     CHECK_EQ(setup(&r), 0);
-    r.cfg.size = 6 * SECTOR; /* the stamp records 8 sectors */
-    CHECK_EQ(remount(&r), ALFS_ENOFS);
-    r.cfg = good;
-    CHECK_EQ(remount(&r), 0);
     DONE(&r);
     rig_close(&r);
 }
 
-static void if_format_mount(void) {
+static void if_mount(void) {
     rig_t r;
     rig_open(&r, 8);
-    CHECK_EQ(ffmt(&r), 0);
-    CHECK_EQ(cat_sector(&r), 0);
+    CHECK_EQ(remount(&r), 0); /* a used chip's bytes: no file, nothing written */
+    CHECK_EQ(r.sim.c_ops, 0);
     alfs_file_info_t in;
     CHECK_EQ(CALL(&r, alfs_file_list(&r.fs, 0, &in)), ALFS_ENOENT);
     alfs_fs_status_t st = fstatus(&r);
-    CHECK_EQ(st.pages, 6 * PPS);
+    CHECK_EQ(st.pages, 8 * PPS - 1); /* page 0 holds no file */
     CHECK_EQ(st.live, 0);
-    CHECK_EQ(st.entries, 0);
-    CHECK_EQ(st.entries_max, ENTRIES);
-    CHECK(!st.clean); /* the frame sectors hold what they held */
+    CHECK_EQ(st.records, 0);
+    CHECK_EQ(st.records_max, CACHE);
+    CHECK(!st.clean);
     CHECK(clean_all(&r) >= 0);
     st = fstatus(&r);
-    CHECK_EQ(st.free, 6 * PPS);
+    CHECK_EQ(st.free, 8 * PPS - 1);
     CHECK_EQ(st.dead, 0);
     CHECK(st.clean);
+    uint8_t d[100];
+    fill(d, sizeof(d), 1);
+    CHECK_EQ(write_file(&r, "a", d, 100, 100), 0);
+    CHECK_EQ(write_file(&r, "b", d, 100, 100), 0);
+    CHECK_EQ(write_file(&r, "c", d, 100, 100), 0);
     CHECK_EQ(remount(&r), 0);
+    CHECK_EQ(fstatus(&r).records, 3);
+    CHECK(reads_as(&r, "b", d, 100));
+    r.ncache = 2; /* a table too small for the files */
+    CHECK_EQ(remount(&r), ALFS_ENOSPC);
     CHECK_EQ(r.sim.c_ops, 0);
+    r.ncache = CACHE;
+    CHECK_EQ(remount(&r), 0);
     DONE(&r);
     rig_close(&r);
 }
@@ -547,31 +557,9 @@ static void if_endian(void) {
     CHECK_EQ(f.id, id);
     CHECK_EQ(put(&r, &f, d, sizeof(d), NULL), 0);
     CHECK_EQ(fclosew(&r, &f), 0);
-
-    const uint8_t *s = r.sim.mem + r.cfg.start;
-    CHECK(memcmp(s, "alfc", 4) == 0);
-    CHECK_EQ(s[4], 6);  /* version           */
-    CHECK_EQ(s[5], 12); /* log2(sector size) */
-    CHECK_EQ(s[6], 8);  /* log2(page size)   */
-    CHECK_EQ(s[7], 0);
-    CHECK_EQ(get16le(s + 8), 8);
-    CHECK_EQ(get16le(s + 10), 0);
-    CHECK_EQ(get32le(s + 12), 1); /* sequence */
-    CHECK_EQ(get32le(s + 16), crc32_ref(s, 16));
-    CHECK_EQ(s[20], 0); /* complete */
-
-    const uint8_t *e = entry_of(&r, "ab");
-    CHECK(e != NULL);
-    CHECK_EQ(get32le(e), id);
-    uint32_t first = get32le(e + 4);
-    CHECK(first >= CAT_PAGES);
-    CHECK(memcmp(e + 8, "ab", 3) == 0);
-    for (int i = 11; i < 40; i++)
-        CHECK_EQ(e[i], 0);
-    CHECK_EQ(get32le(e + 40), crc32_ref(e, 40));
-
-    uint32_t pages[4];
-    CHECK_EQ(list_of(&r, first, pages, 4), 2); /* 300 bytes: 188 and 112 */
+    uint32_t first = first_of(&r, "ab"), pages[4];
+    CHECK(first >= 1);
+    CHECK_EQ(list_of(&r, first, pages, 4), 2); /* 300 bytes: 185 and 115 */
     const uint8_t *p0 = pg(&r, pages[0]), *p1 = pg(&r, pages[1]);
     CHECK_EQ(get32le(p0), id);
     CHECK_EQ(get16le(p0 + 4), 0);
@@ -579,20 +567,25 @@ static void if_endian(void) {
     CHECK_EQ(get32le(p0 + 10), pages[1]);
     CHECK_EQ(get32le(p0 + HDR), id);
     CHECK(memcmp(p0 + NAME_AT, "ab", 3) == 0);
+    for (int i = 3; i < 32; i++)
+        CHECK_EQ(p0[NAME_AT + i], 0);
+    CHECK_EQ(get32le(p0 + OPEN_AT), crc32_ref(p0 + HDR, 37));
     const uint8_t *c = p0 + CLOSE_AT;
     CHECK_EQ(get16le(c), 2);       /* page count */
     CHECK_EQ(get32le(c + 2), 300); /* size       */
-    CHECK_EQ(get32le(c + 6), crc32_ref(p0 + HDR, 42));
+    CHECK_EQ(get32le(c + 6), crc32_ref(p0 + HDR, 47));
     const uint8_t *b0 = p0 + HDR + FBLOCK, *b1 = p1 + HDR; /* byte counts */
     CHECK_EQ(get16le(b0), D0);
     CHECK(memcmp(b0 + 2, d, D0) == 0);
     CHECK_EQ(get32le(b0 + 2 + D0), page_check(id, 0, d, D0));
     CHECK_EQ(get16le(p1 + 4), 1);
-    CHECK_EQ(get32le(p1 + 10), 0); /* the last page */
-    CHECK_EQ(get16le(b1), 300 - D0);  /* partial: the close's */
+    CHECK_EQ(get32le(p1 + 6), crc32_ref(p1, 6));
+    CHECK_EQ(get32le(p1 + 10), 0);   /* the last page */
+    CHECK_EQ(get16le(b1), 300 - D0); /* partial: the close's */
     CHECK(memcmp(b1 + 2, d + D0, 300 - D0) == 0);
     CHECK_EQ(get32le(b1 + 2 + 300 - D0), page_check(id, 1, d + D0, 300 - D0));
     CHECK(erased(b1 + 2 + 300 - D0 + 4, PAGE - HDR - 2 - (300 - D0) - 4));
+    CHECK(erased(pg(&r, 0), PAGE)); /* page 0 holds no file */
     DONE(&r);
     rig_close(&r);
 }
@@ -627,8 +620,6 @@ static void if_names(void) {
     CHECK_EQ(falloc(&r, NULL, 10, &id), ALFS_EINVAL);
     CHECK_EQ(CALL(&r, alfs_file_open_read(&r.fs, &rd, "lua", r.rblk, PAGE)), ALFS_ENOENT); /* a prefix */
     CHECK_EQ(CALL(&r, alfs_file_open_read(&r.fs, &rd, "lua/main.lua2", r.rblk, PAGE)), ALFS_ENOENT);
-    CHECK_EQ(falloc(&r, "a", 10, &id), ALFS_EEXIST); /* one file a filename */
-    CHECK_EQ(r.sim.c_ops, 0);
     CHECK_EQ(fopenw(&r, &f, "a", 0), ALFS_EEXIST); /* closed: final */
     CHECK_EQ(r.sim.c_ops, 0);
     DONE(&r);
@@ -641,8 +632,7 @@ static void if_alloc(void) {
     CHECK_EQ(setup(&r), 0);
     uint32_t id = 0, want = pages_for(1000); /* 5 pages */
     CHECK_EQ(falloc(&r, "log", 1000, &id), 0);
-    CHECK_EQ(r.sim.c_programs, want + 1); /* the entry and each page */
-    CHECK_EQ(r.sim.c_erases, 0);          /* every page was free */
+    CHECK_EQ(r.sim.c_programs, want + 1); /* each page's header; the first page's frame block before it */
     uint32_t pages[16];
     CHECK_EQ(pages_of(&r, "log", pages, 16), want);
     for (uint32_t i = 0; i < want; i++) {
@@ -660,27 +650,16 @@ static void if_alloc(void) {
     CHECK_EQ(in.id, id);
     CHECK(!in.closed);
     CHECK_EQ(in.size, ALFS_SIZE_OPEN);
-
-    /* An area of dead pages: an allocation erases what it needs, and only
-     * sectors holding no live page. */
-    static uint8_t d[20000];
+    /* Too few free pages: ENOSPC, nothing written; a cleanup, then room. */
+    static uint8_t d[30000];
     fill(d, sizeof(d), 2);
-    CHECK_EQ(write_file(&r, "keep", d, 3000, 3000), 0);
-    for (int i = 0; i < 6; i++) {
-        char name[8];
-        snprintf(name, sizeof(name), "f%d", i);
-        CHECK_EQ(write_file(&r, name, d, 2000, 2000), 0);
-        CHECK_EQ(fdelete(&r, name), 0);
-    }
     CHECK_EQ(fdelete(&r, "log"), 0);
     alfs_fs_status_t st = fstatus(&r);
-    uint32_t need = pages_for(12000);
-    if (st.free < need) {
-        CHECK_EQ(falloc(&r, "big", 12000, NULL), 0);
-        CHECK(r.sim.c_erases > 0);
-        CHECK(r.sim.c_erases <= (need - st.free + PPS - 1) / PPS + 2); /* sectors may hold free pages too */
-        CHECK(reads_as(&r, "keep", d, 3000));
-    }
+    uint32_t big = D0 + (st.free - 1) * D; /* every free page */
+    CHECK_EQ(falloc(&r, "big", big + D, NULL), ALFS_ENOSPC);
+    CHECK_EQ(r.sim.c_ops, 0);
+    CHECK(clean_all(&r) >= 0); /* the deleted file's sector */
+    CHECK_EQ(falloc(&r, "big", big + D, NULL), 0);
     DONE(&r);
     rig_close(&r);
 }
@@ -743,21 +722,23 @@ static void if_close(void) {
     alfs_file_t f;
     CHECK_EQ(fopenw(&r, &f, "c", 0), 0);
     CHECK_EQ(put(&r, &f, d, n, NULL), 0);
-    CHECK_EQ(fclosew(&r, &f), 0);
+    CHECK_EQ(fclosew(&r, &f), 0); /* CALL: no erase */
     const uint8_t *c = pg(&r, pages[0]) + CLOSE_AT;
     CHECK_EQ(get16le(c), used);
     CHECK_EQ(get32le(c + 2), n);
-    CHECK_EQ(get32le(c + 6), crc32_ref(pg(&r, pages[0]) + HDR, 42));
+    CHECK_EQ(get32le(c + 6), crc32_ref(pg(&r, pages[0]) + HDR, 47));
     CHECK_EQ(get32le(pg(&r, pages[used - 1]) + 10), 0); /* the list's end */
+    CHECK_EQ(get32le(pg(&r, pages[39])), get32le(pg(&r, pages[0]))); /* unused, dead, kept */
+    CHECK(clean_all(&r) > 0);
     for (uint32_t i = used; i < 40; i++) {
         uint32_t k = pages[i] / PPS; /* its sector */
         bool live = false;
         for (uint32_t j = 0; j < used; j++)
             live |= pages[j] / PPS == k;
         if (live)
-            CHECK_EQ(get32le(pg(&r, pages[i])), get32le(pg(&r, pages[0]))); /* dead, kept */
+            CHECK_EQ(get32le(pg(&r, pages[i])), get32le(pg(&r, pages[0]))); /* shared: kept */
         else
-            CHECK(erased(pg(&r, k * PPS), SECTOR)); /* erased by the close */
+            CHECK(erased(pg(&r, k * PPS), SECTOR)); /* erased by the cleanup */
     }
     CHECK(reads_as(&r, "c", d, n));
     alfs_file_info_t in;
@@ -842,14 +823,18 @@ static void if_reopen_unclosed(void) {
     fill(b, sizeof(b), 7);
     uint32_t n = D0 + 2 * D + 100; /* three pages, and 100 bytes in the block */
     CHECK_EQ(falloc(&r, "u", 5000, NULL), 0);
+    uint32_t pages[32];
+    CHECK(pages_of(&r, "u", pages, 32) >= 8);
     alfs_file_t f;
     CHECK_EQ(fopenw(&r, &f, "u", 0), 0);
     CHECK_EQ(put(&r, &f, a, n, NULL), 0);
     CHECK_EQ(fsyncw(&r, &f), 0);
     CHECK_EQ(remount(&r), 0); /* never closed: the block's 100 bytes are lost */
     CHECK_EQ(fopenw(&r, &f, "u", 0), 0);
+    CHECK_EQ(get16le(pg(&r, pages[3]) + HDR), 0); /* skipped */
     CHECK_EQ(put(&r, &f, b, sizeof(b), NULL), 0);
     CHECK_EQ(fclosew(&r, &f), 0);
+    CHECK_EQ(get16le(pg(&r, pages[4]) + HDR), D); /* the writing went on here */
     for (int pass = 0; pass < 2; pass++) {
         int32_t m = slurp(&r, "u", got, sizeof(got));
         CHECK_EQ(m, (int32_t)(n - 100 + sizeof(b)));
@@ -885,16 +870,17 @@ static void if_flush(void) {
     CHECK_EQ(remount(&r), 0); /* never closed: every flushed byte stays */
     CHECK_EQ(slurp(&r, "f", got, sizeof(got)), 400);
     CHECK(memcmp(got, d, 400) == 0);
-    CHECK_EQ(fopenw(&r, &f, "f", 0), 0);
+    CHECK_EQ(fopenw(&r, &f, "f", 0), 0); /* after a mount: page 3 skipped */
     CHECK_EQ(put(&r, &f, d + 400, 50, NULL), 0);
     CHECK_EQ(fclosew(&r, &f), 0);
-    CHECK_EQ(get16le(pg(&r, pages[3]) + HDR), 50);
+    CHECK_EQ(get16le(pg(&r, pages[3]) + HDR), 0);
+    CHECK_EQ(get16le(pg(&r, pages[4]) + HDR), 50);
     CHECK_EQ(slurp(&r, "f", got, sizeof(got)), 450);
     CHECK(memcmp(got, d, 450) == 0);
     alfs_file_info_t in;
     CHECK_EQ(finfo(&r, "f", &in), 0);
     CHECK_EQ(in.size, 450);
-    CHECK_EQ(in.pages, 4);
+    CHECK_EQ(in.pages, 5);
     DONE(&r);
     rig_close(&r);
 }
@@ -942,15 +928,11 @@ static void if_delete(void) {
     fill(b, sizeof(b), 11);
     CHECK_EQ(write_file(&r, "a", a, 500, 500), 0);
     CHECK_EQ(write_file(&r, "b", b, 500, 500), 0);
-    uint8_t *e = entry_of(&r, "a");
-    CHECK(e != NULL);
-    uint32_t first = get32le(e + 4);
+    uint32_t first = first_of(&r, "a");
+    CHECK(first >= 1);
     CHECK_EQ(fdelete(&r, "a"), 0);
-    CHECK_EQ(r.sim.c_erases, 0);
-    for (int i = 0; i < 32; i++) {
-        CHECK_EQ(e[8 + i], 0);                     /* in the entry */
-        CHECK_EQ(pg(&r, first)[NAME_AT + i], 0);   /* and the frame block */
-    }
+    for (int i = 0; i < 32; i++)
+        CHECK_EQ(pg(&r, first)[NAME_AT + i], 0); /* blocked out */
     CHECK_EQ(slurp(&r, "a", got, sizeof(got)), ALFS_ENOENT);
     CHECK(reads_as(&r, "b", b, 500));
     CHECK_EQ(remount(&r), 0);
@@ -965,12 +947,71 @@ static void if_delete(void) {
     CHECK_EQ(CALL(&r, alfs_file_open_read(&r.fs, &rd, "b", r.rblk, PAGE)), 0);
     CHECK_EQ(fdelete(&r, "b"), ALFS_EOPEN);
     CHECK_EQ(CALL(&r, alfs_file_close_read(&r.fs, &rd)), 0);
-    /* A Lua update: the filename blocked out, a new file written. */
-    CHECK_EQ(write_file(&r, "lua/main.lua", a, 300, 300), 0);
-    CHECK_EQ(fdelete(&r, "lua/main.lua"), 0);
-    CHECK_EQ(write_file(&r, "lua/main.lua", b, 400, 400), 0);
+    /* Every copy: an update under way, then the delete. */
+    CHECK_EQ(write_file(&r, "two", a, 300, 300), 0);
+    uint32_t old = first_of(&r, "two");
+    CHECK_EQ(falloc(&r, "two", 300, NULL), 0); /* a new copy, not closed */
+    CHECK_EQ(fdelete(&r, "two"), 0);
+    CHECK_EQ(pg(&r, old)[NAME_AT], 0);
+    CHECK_EQ(first_of(&r, "two"), 0);
     CHECK_EQ(remount(&r), 0);
-    CHECK(reads_as(&r, "lua/main.lua", b, 400));
+    CHECK_EQ(slurp(&r, "two", got, sizeof(got)), ALFS_ENOENT);
+    DONE(&r);
+    rig_close(&r);
+}
+
+static void if_update(void) {
+    rig_t r;
+    rig_open(&r, 10);
+    CHECK_EQ(setup(&r), 0);
+    static uint8_t a[400], b[400];
+    fill(a, sizeof(a), 40);
+    fill(b, sizeof(b), 41);
+    CHECK_EQ(write_file(&r, "cfg", a, 300, 300), 0);
+    uint32_t old = first_of(&r, "cfg"), id = 0;
+    uint8_t v = pg(&r, old)[VERSION_AT];
+    CHECK_EQ(falloc(&r, "cfg", 400, &id), 0); /* a new copy */
+    alfs_file_t f;
+    CHECK_EQ(fopenw(&r, &f, "cfg", 0), 0);
+    CHECK_EQ(f.id, id);
+    CHECK_EQ(put(&r, &f, b, 400, NULL), 0);
+    CHECK(reads_as(&r, "cfg", a, 300)); /* the old copy until the close */
+    CHECK_EQ(fclosew(&r, &f), 0);
+    CHECK(reads_as(&r, "cfg", b, 400));
+    CHECK_EQ(pg(&r, old)[NAME_AT], 0); /* the old copy blocked out */
+    uint32_t now = first_of(&r, "cfg");
+    CHECK_EQ(pg(&r, now)[VERSION_AT], (uint8_t)(v + 1));
+    /* An update a reboot cuts short: the old copy reads; the next update
+     * blocks out the cut one. */
+    CHECK_EQ(falloc(&r, "cfg", 400, NULL), 0);
+    CHECK_EQ(fopenw(&r, &f, "cfg", 0), 0);
+    CHECK_EQ(put(&r, &f, a, 300, NULL), 0);
+    CHECK_EQ(remount(&r), 0);
+    CHECK(reads_as(&r, "cfg", b, 400));
+    uint32_t cut = 0, pages[4];
+    for (uint32_t p = 1; p < r.cfg.size / PAGE && !cut; p++)
+        if (p != now && list_of(&r, p, pages, 4) && get16le(pg(&r, p) + 4) == 0 &&
+            !strncmp((const char *)pg(&r, p) + NAME_AT, "cfg", 32))
+            cut = p;
+    CHECK(cut != 0);
+    CHECK_EQ(write_file(&r, "cfg", a, 300, 300), 0);
+    CHECK_EQ(pg(&r, cut)[NAME_AT], 0);
+    CHECK(reads_as(&r, "cfg", a, 300));
+    /* 300 updates: the version wraps, and the newest is always read. */
+    for (int i = 0; i < 300; i++) {
+        fill(b, 200, (uint32_t)i);
+        int rc = write_file(&r, "cfg", b, 200, 200);
+        if (rc == ALFS_ENOSPC) {
+            CHECK(clean_all(&r) >= 0);
+            rc = write_file(&r, "cfg", b, 200, 200);
+        }
+        CHECK_EQ(rc, 0);
+        CHECK(reads_as(&r, "cfg", b, 200));
+        if (i % 37 == 36) {
+            CHECK_EQ(remount(&r), 0);
+            CHECK(reads_as(&r, "cfg", b, 200));
+        }
+    }
     DONE(&r);
     rig_close(&r);
 }
@@ -996,6 +1037,7 @@ static void if_list(void) {
             CHECK(in.id > after);
             CHECK_EQ(in.closed, i < 2);
             CHECK_EQ(in.size, sizes[i]);
+            CHECK_EQ(in.version, pg(&r, first_of(&r, names[i]))[VERSION_AT]);
             if (i < 2)
                 CHECK_EQ(in.pages, pages_for(sizes[i]));
             id[i] = in.id;
@@ -1104,7 +1146,7 @@ static void if_refusals(void) {
     rig_t r;
     rig_open(&r, 10);
     CHECK_EQ(setup(&r), 0);
-    static uint8_t d[3000], got[3000];
+    static uint8_t d[3000], got[4000];
     fill(d, sizeof(d), 15);
     CHECK_EQ(write_file(&r, "old", d, 1000, 1000), 0);
     CHECK_EQ(falloc(&r, "w", 3000, NULL), 0);
@@ -1208,17 +1250,19 @@ static cfg_op_t cfg_step(int i) {
     return op;
 }
 
-/* An update: the filename blocked out, if it names a file, and a new file
- * written. */
+/* An update: a new copy written, which replaces the old at its close; or a
+ * delete. With too few free pages, a cleanup first. */
 static int cfg_do(rig_t *r, cfg_op_t op) {
     static uint8_t d[4096];
-    int rc = fdelete(r, op.name);
-    if (rc && rc != ALFS_ENOENT)
-        return rc;
-    if (!op.size)
-        return 0;
+    if (!op.size) {
+        int rc = fdelete(r, op.name);
+        return rc == ALFS_ENOENT ? 0 : rc;
+    }
     fill(d, op.size, op.gen);
-    return write_file(r, op.name, d, op.size, op.size);
+    int rc = write_file(r, op.name, d, op.size, op.size);
+    if (rc == ALFS_ENOSPC && clean_all(r) >= 0)
+        rc = write_file(r, op.name, d, op.size, op.size);
+    return rc;
 }
 
 static void spd_no_erase_outside_erase(void) {
@@ -1292,8 +1336,13 @@ static void spd_mount_reads_bounded(void) {
         if (i % 3 == 2)
             CHECK_EQ(fdelete(&r, name), 0);
     }
+    uint32_t firsts = 0; /* pages holding a frame block, deleted files' too */
+    for (uint32_t p = 1; p < r.cfg.size / PAGE; p++) {
+        const uint8_t *h = pg(&r, p);
+        firsts += get32le(h + 6) == crc32_ref(h, 6) && get16le(h + 4) == 0;
+    }
     CHECK_EQ(remount(&r), 0);
-    CHECK(r.sim.c_bytes_read <= 2u * SECTOR);
+    CHECK(r.sim.c_bytes_read <= (r.cfg.size / PAGE) * HDR + firsts * FBLOCK);
     CHECK_EQ(r.sim.c_ops, 0);
     DONE(&r);
     rig_close(&r);
@@ -1359,17 +1408,17 @@ static void spd_open_reads_bounded(void) {
         CHECK_EQ(falloc(&r, "o", bytes, NULL), 0);
         alfs_file_t f;
         CHECK_EQ(fopenw(&r, &f, "o", 0), 0);
-        CHECK(r.sim.c_bytes_read <= SECTOR + PAGE + npages[i] * HDR);
-        uint32_t walk = npages[i] * HDR;
+        CHECK(r.sim.c_bytes_read <= PAGE + npages[i] * (2 * HDR + 2));
+        uint32_t walk = npages[i] * (2 * HDR + 2);
         CHECK_EQ(put(&r, &f, d, bytes, NULL), 0);
         CHECK_EQ(fsyncw(&r, &f), 0);
         alfs_reader_t rd;
         CHECK_EQ(CALL(&r, alfs_file_open_read(&r.fs, &rd, "o", r.rblk, PAGE)), 0);
-        CHECK(r.sim.c_bytes_read <= SECTOR + PAGE);
+        CHECK(r.sim.c_bytes_read <= PAGE);
         CHECK_EQ(CALL(&r, alfs_file_close_read(&r.fs, &rd)), 0);
         CHECK_EQ(remount(&r), 0);
         CHECK_EQ(fopenw(&r, &f, "o", 0), 0); /* a reopen: a byte count a page, and one page */
-        CHECK(r.sim.c_bytes_read <= SECTOR + 2 * PAGE + walk + npages[i] * 2u);
+        CHECK(r.sim.c_bytes_read <= 2 * PAGE + walk + npages[i] * 2u);
         CHECK_EQ(fclosew(&r, &f), 0);
         DONE(&r);
         rig_close(&r);
@@ -1426,6 +1475,8 @@ static int ring(rig_t *r, uint32_t every, uint32_t laps, uint64_t max_ms) {
                 return -5;
             snprintf(name, sizeof(name), "f%u", ++newest);
             rc = falloc(r, name, every * ROW, NULL);
+            if (rc == ALFS_ENOSPC && clean_all(r) >= 0)
+                rc = falloc(r, name, every * ROW, NULL);
             if (rc == ALFS_ENOSPC)
                 return 0; /* worn: the area no longer holds a file */
             if (rc || fopenw(r, &f, name, 0))
@@ -1433,7 +1484,7 @@ static int ring(rig_t *r, uint32_t every, uint32_t laps, uint64_t max_ms) {
             in_file = len = 0;
         }
         uint32_t least = UINT32_MAX;
-        for (uint32_t k = 2; k < sectors; k++) {
+        for (uint32_t k = 0; k < sectors; k++) {
             uint32_t idx = r->cfg.start / SECTOR + k;
             if (r->sim.bad[idx] == BAD_NONE && r->sim.wear[idx] < least)
                 least = r->sim.wear[idx];
@@ -1465,7 +1516,7 @@ static void life_write_amplification(void) {
         uint32_t total = per_sync * syncs, pages = pages_for(total);
         uint64_t b0 = r.sim.bytes_programmed;
         CHECK_EQ(falloc(&r, "a", total, NULL), 0);
-        CHECK_EQ(r.sim.bytes_programmed - b0, ENTRY + pages * HDR + 36u);
+        CHECK_EQ(r.sim.bytes_programmed - b0, pages * HDR - 4u + 41u); /* the last link left erased */
         alfs_file_t f;
         CHECK_EQ(fopenw(&r, &f, "a", 0), 0);
         static uint8_t d[24000];
@@ -1489,7 +1540,7 @@ static void life_write_amplification(void) {
 static void life_wlog_erases(void) {
     rig_t r;
     uint32_t bytes = 50u * 600u * ROW, pages = pages_for(bytes); /* ten minutes at 50 rows a second */
-    rig_open(&r, 2 + pages / PPS + 6);
+    rig_open(&r, pages / PPS + 6);
     CHECK_EQ(setup(&r), 0);
     uint64_t e0 = r.sim.erases;
     CHECK_EQ(falloc(&r, "log", bytes, NULL), 0);
@@ -1516,7 +1567,7 @@ static void life_wear_level(void) {
     CHECK_EQ(setup(&r), 0);
     CHECK_EQ(ring(&r, 1500, 10, 100000000), 0);
     uint32_t lo = UINT32_MAX, hi = 0;
-    for (uint32_t k = 2; k < 34; k++) {
+    for (uint32_t k = 0; k < 34; k++) {
         uint32_t wv = r.sim.wear[r.cfg.start / SECTOR + k];
         lo = wv < lo ? wv : lo;
         hi = wv > hi ? wv : hi;
@@ -1600,7 +1651,8 @@ static void safe_powerloss_bound(void) {
 
 /* SAFE-04: power lost at operation k of writing; reopened, written on,
  * closed. What reads back is what was written before the loss, as far as
- * some page, then what was written after, perhaps but its first page. */
+ * some page, then what was written after, whole; and the simulator sees no
+ * program into a torn byte. */
 static void safe_reopen_after_loss(void) {
     for (int pl = 0; pl < PL_COUNT; pl++)
         for (int64_t k = 0;; k++) {
@@ -1628,7 +1680,6 @@ static void safe_reopen_after_loss(void) {
                 rig_close(&r);
                 break;
             }
-            r.sim.torn_ok = true; /* a page that reads erased is written as erased (D-3) */
             CHECK_EQ(remount(&r), 0);
             CHECK_EQ(fopenw(&r, &f, "log", 0), 0);
             CHECK_EQ(put(&r, &f, b, sizeof(b), NULL), 0);
@@ -1638,14 +1689,13 @@ static void safe_reopen_after_loss(void) {
                 uint32_t n = 0;
                 int32_t rc = slurp_n(&r, "log", got, sizeof(got), &n);
                 CHECK(rc >= 0 || rc == ALFS_ECHECK);
-                /* a's bytes to some page's end, then b's, perhaps but its first page */
+                /* a's bytes to some page's end, at least the synced, then b's, whole */
                 bool ok = false;
                 uint32_t pre = 0;
                 for (uint32_t p = 0; !ok && p <= n && p <= written; p = p ? p + D : D0) {
-                    uint32_t rest = n - p;
                     pre = p;
-                    ok = p >= whole_pages(synced) && !memcmp(got, a, p) && rest <= sizeof(b) &&
-                         sizeof(b) - rest <= D && !memcmp(got + p, b + sizeof(b) - rest, rest);
+                    ok = p >= whole_pages(synced) && !memcmp(got, a, p) && n - p == sizeof(b) &&
+                         !memcmp(got + p, b, sizeof(b));
                 }
                 if (!ok)
                     printf("    pl %d k %lld, remount %d: %u read, %u before, synced %u\n", pl, (long long)k, m, n, pre,
@@ -1770,13 +1820,14 @@ static void safe_bad_sector(void) {
         CHECK_EQ(setup(&r), 0);
         alfs_fs_status_t st = fstatus(&r);
         CHECK_EQ(st.bad, 1);
-        CHECK_EQ(st.free, 5 * PPS);
-        static uint8_t d[20000];
+        CHECK_EQ(st.free, 7 * PPS - 1);
+        static uint8_t d[30000];
         fill(d, sizeof(d), 23);
-        CHECK_EQ(write_file(&r, "a", d, 5 * PPS * D - D, 5 * PPS * D - D), 0);
+        uint32_t all = D0 + (7 * PPS - 2) * D; /* every free page */
+        CHECK_EQ(write_file(&r, "a", d, all, all), 0);
         CHECK_EQ(r.sim.sector_progs[bad], 0);
         CHECK_EQ(remount(&r), 0);
-        CHECK(reads_as(&r, "a", d, 5 * PPS * D - D));
+        CHECK(reads_as(&r, "a", d, all));
         DONE(&r);
         rig_close(&r);
     }
@@ -1828,7 +1879,13 @@ static void safe_foreign_area(void) {
         rig_open(&r, 16);
         if (blank)
             memset(r.sim.mem + SECTOR, 0xFF, r.sim.chip_size - 2 * SECTOR);
-        CHECK_EQ(fmount(&r), ALFS_ENOFS);
+        CHECK_EQ(remount(&r), 0);
+        CHECK_EQ(r.sim.ops, 0);
+        alfs_file_info_t in;
+        CHECK_EQ(CALL(&r, alfs_file_list(&r.fs, 0, &in)), ALFS_ENOENT);
+        alfs_fs_status_t st = fstatus(&r);
+        CHECK_EQ(st.live, 0);
+        CHECK_EQ(st.dead == 0, blank); /* random bytes are dead pages */
         CHECK_EQ(r.sim.ops, 0);
         DONE(&r);
         rig_close(&r);
@@ -1836,8 +1893,7 @@ static void safe_foreign_area(void) {
     rig_t r;
     rig_open(&r, 16);
     r.cfg.size = 18 * SECTOR; /* past the chip */
-    CHECK_EQ(fmount(&r), ALFS_EGEOMETRY);
-    CHECK_EQ(ffmt(&r), ALFS_EGEOMETRY);
+    CHECK_EQ(remount(&r), ALFS_EGEOMETRY);
     CHECK_EQ(r.sim.ops, 0);
     DONE(&r);
     rig_close(&r);
@@ -1858,16 +1914,16 @@ static void plant_header(rig_t *r, uint32_t page, uint32_t id, uint32_t count) {
         put32le(p + 10, page); /* itself */
         break;
     case 1:
-        put32le(p + 10, sim_rand(&r->sim) % CAT_PAGES); /* the catalog */
+        put32le(p + 10, 0); /* the end */
         break;
     case 2:
         put32le(p + 10, pages + sim_rand(&r->sim) % 1000); /* past the area */
         break;
     case 3:
-        put32le(p + 10, CAT_PAGES); /* back to the start */
+        put32le(p + 10, 1); /* back to the start */
         break;
     default:
-        put32le(p + 10, CAT_PAGES + sim_rand(&r->sim) % (pages - CAT_PAGES));
+        put32le(p + 10, 1 + sim_rand(&r->sim) % (pages - 1));
         break;
     }
 }
@@ -1885,7 +1941,7 @@ static void safe_fuzz(void) {
             write_file(&r, name, d, 2000u * (uint32_t)(i + 1), 2000u * (uint32_t)(i + 1));
         }
         uint32_t lo = SECTOR, hi = r.sim.chip_size - SECTOR, pages = r.cfg.size / PAGE;
-        uint32_t id = get32le(pg(&r, CAT_PAGES));
+        uint32_t id = get32le(pg(&r, 1));
         switch (trial % 4) {
         case 0: /* bits flipped */
             for (int i = 0; i < 40; i++)
@@ -1893,23 +1949,23 @@ static void safe_fuzz(void) {
             break;
         case 1: /* headers with valid checks and misleading links */
             for (int i = 0; i < 20; i++)
-                plant_header(&r, CAT_PAGES + sim_rand(&r.sim) % (pages - CAT_PAGES), sim_rand(&r.sim) % 4 ? id : sim_rand(&r.sim),
+                plant_header(&r, 1 + sim_rand(&r.sim) % (pages - 1), sim_rand(&r.sim) % 4 ? id : sim_rand(&r.sim),
                              sim_rand(&r.sim) % 8);
             break;
         case 2: /* pages copied from one place to another */
             for (int i = 0; i < 10; i++) {
-                uint32_t a = CAT_PAGES + sim_rand(&r.sim) % (pages - CAT_PAGES);
-                uint32_t b = CAT_PAGES + sim_rand(&r.sim) % (pages - CAT_PAGES);
+                uint32_t a = 1 + sim_rand(&r.sim) % (pages - 1);
+                uint32_t b = 1 + sim_rand(&r.sim) % (pages - 1);
                 memcpy(pg(&r, b), pg(&r, a), PAGE);
             }
             break;
-        default: /* every frame page random */
-            sim_fill_random(&r.sim, r.cfg.start + CAT_PAGES * PAGE, r.cfg.size - CAT_PAGES * PAGE);
+        default: /* every page random */
+            sim_fill_random(&r.sim, r.cfg.start, r.cfg.size);
             break;
         }
         r.sim.violations = 0; /* the planted bytes are not alfs's programs */
         memset(&r.fs, 0, sizeof(r.fs));
-        if (alfs_fs_mount(&r.fs, &r.cfg, &r.drv, r.scratch) == 0) {
+        if (alfs_fs_mount(&r.fs, &r.cfg, &r.drv, r.scratch, r.cache, CACHE) == 0) {
             alfs_file_info_t in;
             uint32_t after = 0;
             for (int i = 0; i < 64 && alfs_file_list(&r.fs, after, &in) == 0; i++) {
@@ -1949,7 +2005,7 @@ static void safe_alloc_atomic(void) {
             rig_t r;
             rig_open(&r, 8);
             CHECK_EQ(setup(&r), 0);
-            static uint8_t d[3000], got[3000];
+            static uint8_t d[3000], got[4000];
             fill(d, sizeof(d), 25);
             CHECK_EQ(write_file(&r, "old", d, 1000, 1000), 0);
             CHECK_EQ(fdelete(&r, "old"), 0); /* dead pages: the allocation may erase */
@@ -1971,13 +2027,14 @@ static void safe_alloc_atomic(void) {
                     CHECK_EQ(pages_of(&r, "a", pages, 32), want);
                     note(&seen, in.id);
                 }
+                CHECK(lists_only(&r, "a", "a"));
             }
             CHECK(seen.count <= 1);
             alfs_file_info_t in;
             if (finfo(&r, "a", &in) != 0)
                 CHECK_EQ(falloc(&r, "a", sizeof(d), NULL), 0);
             alfs_file_t f;
-            CHECK_EQ(fopenw(&r, &f, "a", 0), 0);
+            CHECK_EQ(fopenw(&r, &f, "a", ALFS_GROW), 0); /* a reopen after a mount skips a page */
             CHECK_EQ(put(&r, &f, d, sizeof(d), NULL), 0);
             CHECK_EQ(fclosew(&r, &f), 0);
             CHECK_EQ(slurp(&r, "a", got, sizeof(got)), (int32_t)sizeof(d));
@@ -2022,6 +2079,7 @@ static void safe_close_atomic(void) {
                 else /* its pages: the partial one the close wrote, or not yet */
                     CHECK((n == (int32_t)whole_pages(sizeof(d)) || n == (int32_t)sizeof(d)) &&
                           !memcmp(got, d, (size_t)n));
+                CHECK(lists_only(&r, "c", "c"));
             }
             DONE(&r);
             rig_close(&r);
@@ -2056,6 +2114,7 @@ static void safe_delete_atomic(void) {
                     CHECK(n == ALFS_ENOENT || (n == (int32_t)sizeof(d) && !memcmp(got, d, sizeof(d))));
                 }
                 CHECK(reads_as(&r, "y", d, 500));
+                CHECK(lists_only(&r, "x", "y"));
             }
             DONE(&r);
             rig_close(&r);
@@ -2112,8 +2171,8 @@ static void safe_links_checked(void) {
         uint32_t pa[32], pb[32];
         CHECK(pages_of(&r, "a", pa, 32) > 4);
         CHECK(pages_of(&r, "b", pb, 32) > 4);
-        uint32_t bent = kind == 0 ? pb[3] : kind == 1 ? 1u : kind == 2 ? r.cfg.size / PAGE + 7u : pa[0];
-        put32le(pg(&r, pa[2]) + 10, bent); /* page 2's link bent: to b, the catalog, past the area, a's start */
+        uint32_t bent = kind == 0 ? pb[3] : kind == 1 ? r.cfg.size / PAGE - 1 : kind == 2 ? r.cfg.size / PAGE + 7u : pa[0];
+        put32le(pg(&r, pa[2]) + 10, bent); /* page 2's link bent: to b, a free page, past the area, a's start */
         CHECK_EQ(remount(&r), 0);
         uint32_t fails = fstatus(&r).n.check_failures;
         int32_t n = slurp(&r, "a", got, sizeof(got));
@@ -2126,40 +2185,36 @@ static void safe_links_checked(void) {
     }
 }
 
-static void safe_catalog_rewrite_atomic(void) {
+static void safe_update_atomic(void) {
     for (int pl = 0; pl < PL_COUNT; pl++)
         for (int64_t k = 0;; k++) {
             rig_t r;
-            rig_open(&r, 12);
+            rig_open(&r, 8);
             CHECK_EQ(setup(&r), 0);
-            static uint8_t d[600];
-            fill(d, sizeof(d), 31);
-            static const char *const keep[] = {"k0", "k1", "k2"};
-            for (int i = 0; i < 3; i++)
-                CHECK_EQ(write_file(&r, keep[i], d, 200u * (uint32_t)(i + 1), 600), 0);
-            for (uint32_t i = 3; i < ENTRIES; i++) { /* every slot used */
-                CHECK_EQ(falloc(&r, "t", 10, NULL), 0);
-                CHECK_EQ(fdelete(&r, "t"), 0);
-            }
-            CHECK(clean_all(&r) >= 0);
-            int before = cat_sector(&r);
+            static uint8_t a[700], b[900], got[1000];
+            fill(a, sizeof(a), 42);
+            fill(b, sizeof(b), 43);
+            CHECK_EQ(write_file(&r, "lua/main.lua", a, sizeof(a), sizeof(a)), 0);
             sim_power_after(&r.sim, k, (sim_pl_t)pl);
-            int rc = falloc(&r, "last", 10, NULL); /* the rewrite */
+            int rc = write_file(&r, "lua/main.lua", b, sizeof(b), sizeof(b));
             bool past = !r.sim.off;
             sim_reboot(&r.sim);
-            if (past) {
-                CHECK_EQ(rc, 0);
-                CHECK(cat_sector(&r) != before);
-                rig_close(&r);
-                break;
-            }
-            for (int m = 0; m < 4; m++) {
+            for (int m = 0; m < 8; m++) {
                 CHECK_EQ(remount(&r), 0);
-                for (int i = 0; i < 3; i++)
-                    CHECK(reads_as(&r, keep[i], d, 200u * (uint32_t)(i + 1)));
+                int32_t n = slurp(&r, "lua/main.lua", got, sizeof(got));
+                bool old = n == (int32_t)sizeof(a) && !memcmp(got, a, sizeof(a));
+                bool now = n == (int32_t)sizeof(b) && !memcmp(got, b, sizeof(b));
+                if (past)
+                    CHECK(rc == 0 && now); /* once the close returns, the new copy */
+                else if (!old && !now)
+                    printf("    pl %d k %lld, remount %d: read %d\n", pl, (long long)k, m, n);
+                CHECK(old || now);
+                CHECK(lists_only(&r, "lua/main.lua", "lua/main.lua"));
             }
             DONE(&r);
             rig_close(&r);
+            if (past)
+                break;
             if (tf_failed) {
                 printf("    behaviour %d, power lost at operation %lld\n", pl, (long long)k);
                 return;
@@ -2174,8 +2229,8 @@ static void obs_status(void) {
     rig_open(&r, 10);
     CHECK_EQ(setup(&r), 0);
     alfs_fs_status_t st = fstatus(&r);
-    CHECK_EQ(st.pages, 8 * PPS);
-    CHECK_EQ(st.free, 8 * PPS);
+    CHECK_EQ(st.pages, 10 * PPS - 1);
+    CHECK_EQ(st.free, 10 * PPS - 1);
     CHECK_EQ(st.data_per_page, D);
     uint64_t p0 = r.sim.programs, e0 = r.sim.erases;
     uint32_t n0 = st.n.programs, ne0 = st.n.erases;
@@ -2185,7 +2240,7 @@ static void obs_status(void) {
     CHECK_EQ(write_file(&r, "b", d, 1000, 3000), 0);
     st = fstatus(&r);
     CHECK_EQ(st.live, pages_for(5000) + pages_for(1000));
-    CHECK_EQ(st.entries, 2);
+    CHECK_EQ(st.records, 2);
     CHECK_EQ(st.n.programs - n0, r.sim.programs - p0);
     CHECK_EQ(st.n.erases - ne0, r.sim.erases - e0);
     CHECK_EQ(st.n.prog_failures, 0);
@@ -2206,14 +2261,14 @@ static void obs_status(void) {
 static void obs_clean(void) {
     rig_t r;
     rig_open(&r, 8);
-    CHECK_EQ(ffmt(&r), 0);
+    CHECK_EQ(remount(&r), 0);
     CHECK(!fstatus(&r).clean);
     CHECK(clean_all(&r) >= 0);
     CHECK(fstatus(&r).clean);
     uint8_t d[1000];
     fill(d, sizeof(d), 36);
     CHECK_EQ(write_file(&r, "a", d, sizeof(d), sizeof(d)), 0);
-    CHECK(fstatus(&r).clean);
+    CHECK(fstatus(&r).clean); /* the reservation filled */
     CHECK_EQ(fdelete(&r, "a"), 0);
     CHECK(!fstatus(&r).clean);
     CHECK(clean_all(&r) >= 0);
@@ -2236,7 +2291,7 @@ int main(int argc, char **argv) {
     static const tf_test_t tests[] = {
         {"sim_torn_obeys_a9", sim_torn_obeys_a9},
         {"if_geometry", if_geometry},
-        {"if_format_mount", if_format_mount},
+        {"if_mount", if_mount},
         {"if_endian", if_endian},
         {"if_names", if_names},
         {"if_alloc", if_alloc},
@@ -2247,6 +2302,7 @@ int main(int argc, char **argv) {
         {"if_flush", if_flush},
         {"if_read", if_read},
         {"if_delete", if_delete},
+        {"if_update", if_update},
         {"if_list", if_list},
         {"if_ids_never_reused", if_ids_never_reused},
         {"if_cleanup", if_cleanup},
@@ -2276,7 +2332,7 @@ int main(int argc, char **argv) {
         {"safe_delete_atomic", safe_delete_atomic},
         {"safe_file_check", safe_file_check},
         {"safe_links_checked", safe_links_checked},
-        {"safe_catalog_rewrite_atomic", safe_catalog_rewrite_atomic},
+        {"safe_update_atomic", safe_update_atomic},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},
