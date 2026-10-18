@@ -83,13 +83,14 @@ slot after it.
 | 6 | 4 | header check: CRC of bytes 0 to 5 | as the frame ID |
 | 10 | 4 | next page: FFFFFFFFh none yet, 0 the frame's last page, else an address | at allocation; by a write past the reservation; 0 by a close |
 | 14 | | the frame block, on a frame's first page | section 2.1 |
-| H | n | data | by a write, whole pages; by a close, the last |
-| H + n | 4 | data check: CRC of the frame ID, the page count and the data | in the data's program |
+| H | 2 | byte count: n, the bytes of data the page holds, 1 to D | with the data, in one program |
+| H + 2 | n | data | with the byte count |
+| H + 2 + n | 4 | data check: CRC of the frame ID, the page count, the byte count and the data | with the byte count |
 
-H is 14, or 64 on a frame's first page. A page holds D = P − 18 bytes of
-data, or P − 68 on a frame's first page: 238 and 188 on 256-byte pages.
-Every page of a frame holds D bytes of data but the last page written,
-which holds the rest.
+H is 14, or 60 on a frame's first page. A page holds at most D = P − 20
+bytes of data, or P − 66 on a frame's first page: 236 and 190 on 256-byte
+pages. A page holds D bytes when a write or a sync programs it, and fewer
+when a flush or a close leaves it partial; its data is programmed once.
 
 A page's header is **valid** when its header check is right. A page is
 **free** when it reads erased, every byte.
@@ -101,15 +102,14 @@ A page's header is **valid** when its header check is right. A page is
 | 0 | 4 | frame ID | at allocation |
 | 4 | 32 | filename: as an entry's | at allocation; 00h by a delete |
 | 36 | 2 | page count: pages holding data | by a close |
-| 38 | 4 | size: bytes of data | by a close |
-| 42 | 4 | frame checksum: CRC of the data, in order | by a close |
-| 46 | 4 | close check: CRC of bytes 0 to 45 | by a close |
+| 38 | 4 | size: the byte counts' sum | by a close |
+| 42 | 4 | close check: CRC of bytes 0 to 41 | by a close |
 
 The reserved size is not recorded: the list is the reservation, and its end
 is the page whose link is erased. The first 36 bytes are programmed with
-the page's header, in one program.
-The last 14, the **close fields**, are programmed together. A frame is
-**closed** when its close check is right.
+the page's header, in one program. The last 10, the **close fields**, are
+programmed together. A frame is **closed** when its close check is right;
+a closed frame is final.
 
 ---
 
@@ -151,8 +151,10 @@ in the frame's data (section 2), at least one:
 ## 5. Writing
 
 A writer's block holds the data not yet programmed. Each complete page of
-it, when the block is full, at a sync, or at a close, is programmed into
-the next page of the list, with its data check, in one program.
+it, when the block is full or at a sync, is programmed into the next page of
+the list, with its byte count and data check, in one program. A **flush**
+programs the rest too, as a partial page, and the file goes on in the next
+page.
 
 **Without `ALFS_GROW`** a write takes only the bytes the pages left in the
 list hold, counted at open from the links.
@@ -163,32 +165,25 @@ header is programmed, then the link to it in the page before. Without the
 flag, or with no free page, the write returns `ALFS_ENOSPC`. Nothing is
 erased.
 
-**A close** programs the block's rest into the next page; then the close
-fields; then 00h into the last page's link; then erases each sector of the
-list past the last page that holds no live page.
+**A close** programs the block's rest into the next page, partial; then
+the close fields; then 00h into the last page's link; then erases each
+sector of the list past the last page that holds no live page.
 
 **Reopening** a file not closed starts at the first page of its list whose
-data and data check read erased, every byte. The size and checksum so far
-are taken from the pages before it whose data check is right.
-
-**Reopening a closed file**, through a block of at least S bytes, rewrites
-the sector of its first page and the sector of its last page: each in turn
-is read into the block, erased, checked erased, and programmed again, page
-by page, as it was, except the first page's close fields, the last page's
-link, and the last page's data and data check, which are left erased. The
-last page's data goes into the writer's block, and writing goes on in that
-page.
+byte count reads erased and whose bytes all read erased. The size so far is
+the sum of the byte counts before it that are at most D. A closed file is not opened for
+writing.
 
 ---
 
 ## 6. Reading
 
-A file is read along its list. Each page's data is read with its data
-check; a page whose check fails gives nothing, and one failure is counted.
-A closed file ends at its page count, its last page's data being the size
-less the data before it; the read that reaches the end checks the frame
-checksum, and returns `ALFS_ECHECK` when it fails. A file not closed ends
-at the first page whose data and data check read erased, or at the list's
+A file is read along its list. Each page's byte count, data and data
+check are read together; a page whose byte count is over D, or whose check
+fails, gives nothing, and one failure is counted. A closed file ends at its
+page count; the read that reaches the end returns `ALFS_ECHECK` if a page
+gave nothing or the list ended before the page count. A file not closed
+ends at the first page whose byte count reads erased, or at the list's
 end.
 
 ---

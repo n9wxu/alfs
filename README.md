@@ -15,7 +15,7 @@ this branch yet.
   decisions still open.
 - **Format:** `docs/SPEC.md`, every byte.
 - **Interface:** `alfs_fs.h`.
-- **Tests:** 47 in `tests/test_alfs.c`, one or more a requirement. They
+- **Tests:** 46 in `tests/test_alfs.c`, one or more a requirement. They
   compile against the header; they run once `alfs_fs.c` exists.
 - **Evaluation:** `experiments/v6-frames/EVALUATION.md`.
 
@@ -31,28 +31,35 @@ the catalog; every page after them can belong to a file.
 - the next page's address. Erased means no next page yet; zero means the
   file's last page.
 
-Its data follows, then a check of the data, programmed with it.
+Its byte count, data and data check follow, programmed once, together.
 
 **A file's first page** also holds its frame block: the frame ID, the
-filename, and, once the file is closed, its page count, size and checksum,
-with a check of their own.
+filename, and, once the file is closed, its page count and size, with a
+check of their own.
 
 **The catalog** maps each filename to its frame ID and first page. The
 filename converts to the frame ID, the file's descriptor.
+
+**Two kinds of file.** A log is appended to, closed, read and deleted; one
+a reset cut short is opened again and appended to. A configuration file, a
+Lua program among them, is written whole and read whole, and written again
+as a new file. A closed file is final: alfs edits no file.
 
 **A file's life:**
 - **Allocation** reserves the pages a size needs and links them, the last
   link left erased. The list is the reservation.
 - **Writes** gather bytes in a block of RAM the writer brings, and program
   each complete page along the list. A sync programs the complete pages and
-  keeps the rest.
+  keeps the rest; a flush programs the rest too, as a partial page, and the
+  file goes on in the next page.
 - **Growth.** Past the reservation, a file opened with `ALFS_GROW` takes
   pages already erased while there are any; without it, the write stops.
 - **A close** programs the rest, the close fields and a zero link, then
   erases the reservation's sectors that hold no live page.
-- **A reopen.** An unclosed file is reopened at its first page that reads
-  erased. A closed file is reopened by rewriting the sectors of its first
-  and last pages.
+- **A reopen.** A file not closed is reopened at its first page that reads
+  erased.
+- **A file is valid** when its pages are: a read of a closed file reports
+  a damaged page or a short list at its end.
 - **A delete** zeros the filename and leaves the pages.
 - **A cleanup** erases, sector by sector, the sectors that hold no live
   page.

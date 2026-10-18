@@ -22,12 +22,12 @@
 #define SECTOR 4096u
 #define PAGE 256u
 #define PPS (SECTOR / PAGE)  /* pages a sector */
-#define HDR 14u              /* a page header (docs/SPEC.md 2) */
-#define FBLOCK 50u           /* a frame block (SPEC 2.1) */
-#define NAME_AT (HDR + 4u)   /* the filename, on a first page */
-#define CLOSE_AT (HDR + 36u) /* the close fields, on a first page */
-#define D (PAGE - HDR - 4u)  /* data a page holds */
-#define D0 (D - FBLOCK)      /* data a file's first page holds */
+#define HDR 14u                  /* a page header (docs/SPEC.md 2) */
+#define FBLOCK 46u               /* a frame block (SPEC 2.1) */
+#define NAME_AT (HDR + 4u)       /* the filename, on a first page */
+#define CLOSE_AT (HDR + 36u)     /* the close fields, on a first page */
+#define D (PAGE - HDR - 2u - 4u) /* data a page holds: byte count and check apart */
+#define D0 (D - FBLOCK)          /* data a file's first page holds */
 #define CAT_PAGES (2u * PPS) /* the catalog's: no frame page has their addresses */
 #define ENTRY 44u            /* a catalog entry (SPEC 1.2) */
 #define ENTRIES 80u          /* a catalog sector's slots */
@@ -169,11 +169,12 @@ static void put32le(uint8_t *p, uint32_t v) {
         p[i] = (uint8_t)(v >> (8 * i));
 }
 
-/* A page's data check (SPEC 2): the frame ID, the page count, the data. */
+/* A page's data check (SPEC 2): the frame ID, the page count, the byte
+ * count, the data. */
 static uint32_t page_check(uint32_t id, uint32_t count, const uint8_t *data, uint32_t n) {
-    uint8_t h[6] = {(uint8_t)id, (uint8_t)(id >> 8), (uint8_t)(id >> 16), (uint8_t)(id >> 24), (uint8_t)count,
-                    (uint8_t)(count >> 8)};
-    return ~crc32_more(crc32_more(0xFFFFFFFFu, h, 6), data, n);
+    uint8_t h[8] = {(uint8_t)id,    (uint8_t)(id >> 8),    (uint8_t)(id >> 16), (uint8_t)(id >> 24),
+                    (uint8_t)count, (uint8_t)(count >> 8), (uint8_t)n,          (uint8_t)(n >> 8)};
+    return ~crc32_more(crc32_more(0xFFFFFFFFu, h, 8), data, n);
 }
 
 static void fill(uint8_t *p, uint32_t n, uint32_t gen) {
@@ -278,6 +279,10 @@ static int put(rig_t *r, alfs_file_t *f, const uint8_t *d, uint32_t n, uint32_t 
 
 static int fsyncw(rig_t *r, alfs_file_t *f) {
     return (int)CALL(r, alfs_file_sync(&r->fs, f));
+}
+
+static int fflushw(rig_t *r, alfs_file_t *f) {
+    return (int)CALL(r, alfs_file_flush(&r->fs, f));
 }
 
 static int fclosew(rig_t *r, alfs_file_t *f) {
@@ -575,17 +580,19 @@ static void if_endian(void) {
     CHECK_EQ(get32le(p0 + HDR), id);
     CHECK(memcmp(p0 + NAME_AT, "ab", 3) == 0);
     const uint8_t *c = p0 + CLOSE_AT;
-    CHECK_EQ(get16le(c), 2);                     /* page count */
-    CHECK_EQ(get32le(c + 2), 300);               /* size       */
-    CHECK_EQ(get32le(c + 6), crc32_ref(d, 300)); /* checksum   */
-    CHECK_EQ(get32le(c + 10), crc32_ref(p0 + HDR, 46));
-    CHECK(memcmp(p0 + HDR + FBLOCK, d, D0) == 0);
-    CHECK_EQ(get32le(p0 + HDR + FBLOCK + D0), page_check(id, 0, d, D0));
+    CHECK_EQ(get16le(c), 2);       /* page count */
+    CHECK_EQ(get32le(c + 2), 300); /* size       */
+    CHECK_EQ(get32le(c + 6), crc32_ref(p0 + HDR, 42));
+    const uint8_t *b0 = p0 + HDR + FBLOCK, *b1 = p1 + HDR; /* byte counts */
+    CHECK_EQ(get16le(b0), D0);
+    CHECK(memcmp(b0 + 2, d, D0) == 0);
+    CHECK_EQ(get32le(b0 + 2 + D0), page_check(id, 0, d, D0));
     CHECK_EQ(get16le(p1 + 4), 1);
     CHECK_EQ(get32le(p1 + 10), 0); /* the last page */
-    CHECK(memcmp(p1 + HDR, d + D0, 300 - D0) == 0);
-    CHECK_EQ(get32le(p1 + HDR + 300 - D0), page_check(id, 1, d + D0, 300 - D0));
-    CHECK(erased(p1 + HDR + 300 - D0 + 4, PAGE - HDR - (300 - D0) - 4));
+    CHECK_EQ(get16le(b1), 300 - D0);  /* partial: the close's */
+    CHECK(memcmp(b1 + 2, d + D0, 300 - D0) == 0);
+    CHECK_EQ(get32le(b1 + 2 + 300 - D0), page_check(id, 1, d + D0, 300 - D0));
+    CHECK(erased(b1 + 2 + 300 - D0 + 4, PAGE - HDR - 2 - (300 - D0) - 4));
     DONE(&r);
     rig_close(&r);
 }
@@ -622,6 +629,8 @@ static void if_names(void) {
     CHECK_EQ(CALL(&r, alfs_file_open_read(&r.fs, &rd, "lua/main.lua2", r.rblk, PAGE)), ALFS_ENOENT);
     CHECK_EQ(falloc(&r, "a", 10, &id), ALFS_EEXIST); /* one file a filename */
     CHECK_EQ(r.sim.c_ops, 0);
+    CHECK_EQ(fopenw(&r, &f, "a", 0), ALFS_EEXIST); /* closed: final */
+    CHECK_EQ(r.sim.c_ops, 0);
     DONE(&r);
     rig_close(&r);
 }
@@ -645,7 +654,7 @@ static void if_alloc(void) {
             CHECK_EQ(get32le(p + 10), pages[i + 1]);
     }
     CHECK_EQ(get32le(pg(&r, pages[want - 1]) + 10), LINK_NONE); /* the reservation's end */
-    CHECK(erased(pg(&r, pages[0]) + CLOSE_AT, 14));            /* not closed */
+    CHECK(erased(pg(&r, pages[0]) + CLOSE_AT, 10));            /* not closed */
     alfs_file_info_t in;
     CHECK_EQ(finfo(&r, "log", &in), 0);
     CHECK_EQ(in.id, id);
@@ -676,12 +685,12 @@ static void if_alloc(void) {
     rig_close(&r);
 }
 
-/* Each program a write or sync makes is one page's data and its check, at
- * the page's data. */
+/* Each program a write or sync makes is one full page's byte count, data
+ * and check. */
 static bool whole_page_programs(const rig_t *r) {
     for (int i = 0; i < r->nprog && i < MAX_PROGS; i++) {
         uint32_t at = (r->paddr[i] - r->cfg.start) % PAGE, len = r->plen[i];
-        if (!((at == HDR && len == D + 4) || (at == HDR + FBLOCK && len == D0 + 4)))
+        if (!((at == HDR && len == D + 6) || (at == HDR + FBLOCK && len == D0 + 6)))
             return false;
     }
     return true;
@@ -738,7 +747,7 @@ static void if_close(void) {
     const uint8_t *c = pg(&r, pages[0]) + CLOSE_AT;
     CHECK_EQ(get16le(c), used);
     CHECK_EQ(get32le(c + 2), n);
-    CHECK_EQ(get32le(c + 10), crc32_ref(pg(&r, pages[0]) + HDR, 46));
+    CHECK_EQ(get32le(c + 6), crc32_ref(pg(&r, pages[0]) + HDR, 42));
     CHECK_EQ(get32le(pg(&r, pages[used - 1]) + 10), 0); /* the list's end */
     for (uint32_t i = used; i < 40; i++) {
         uint32_t k = pages[i] / PPS; /* its sector */
@@ -852,28 +861,40 @@ static void if_reopen_unclosed(void) {
     rig_close(&r);
 }
 
-static void if_reopen_closed(void) {
+static void if_flush(void) {
     rig_t r;
     rig_open(&r, 8);
     CHECK_EQ(setup(&r), 0);
-    static uint8_t a[1600], b[1000], got[4000];
-    fill(a, sizeof(a), 8);
-    fill(b, sizeof(b), 9);
-    CHECK_EQ(write_file(&r, "a", a, 1000, 1000), 0);
-    CHECK_EQ(write_file(&r, "b", b, 1000, 1000), 0); /* beside a, in its last sector */
+    static uint8_t d[1000], got[1000];
+    fill(d, sizeof(d), 37);
+    CHECK_EQ(falloc(&r, "f", 3000, NULL), 0);
+    uint32_t pages[16];
+    CHECK_EQ(pages_of(&r, "f", pages, 16), pages_for(3000));
     alfs_file_t f;
-    CHECK_EQ(fopenw(&r, &f, "a", 0), ALFS_EINVAL); /* a page's block cannot hold a sector */
-    CHECK_EQ(r.sim.c_ops, 0);
-    r.bsize = SECTOR;
-    CHECK_EQ(ECALL(&r, alfs_file_open(&r.fs, &f, "a", ALFS_GROW, r.wblk, r.bsize)), 0);
-    CHECK_EQ(put(&r, &f, a + 1000, 600, NULL), 0);
+    CHECK_EQ(fopenw(&r, &f, "f", 0), 0);
+    CHECK_EQ(put(&r, &f, d, 100, NULL), 0);
+    CHECK_EQ(fflushw(&r, &f), 0);
+    CHECK_EQ(r.sim.c_programs, 1);                           /* one partial page */
+    CHECK_EQ(get16le(pg(&r, pages[0]) + HDR + FBLOCK), 100); /* its byte count */
+    CHECK_EQ(put(&r, &f, d + 100, 300, NULL), 0);
+    CHECK_EQ(fflushw(&r, &f), 0); /* the file went on in the next page */
+    CHECK_EQ(get16le(pg(&r, pages[1]) + HDR), D);
+    CHECK_EQ(get16le(pg(&r, pages[2]) + HDR), 300 - D);
+    CHECK_EQ(slurp(&r, "f", got, sizeof(got)), 400);
+    CHECK(memcmp(got, d, 400) == 0);
+    CHECK_EQ(remount(&r), 0); /* never closed: every flushed byte stays */
+    CHECK_EQ(slurp(&r, "f", got, sizeof(got)), 400);
+    CHECK(memcmp(got, d, 400) == 0);
+    CHECK_EQ(fopenw(&r, &f, "f", 0), 0);
+    CHECK_EQ(put(&r, &f, d + 400, 50, NULL), 0);
     CHECK_EQ(fclosew(&r, &f), 0);
-    for (int pass = 0; pass < 2; pass++) {
-        CHECK_EQ(slurp(&r, "a", got, sizeof(got)), 1600);
-        CHECK(memcmp(got, a, 1600) == 0);
-        CHECK(reads_as(&r, "b", b, 1000));
-        CHECK_EQ(remount(&r), 0);
-    }
+    CHECK_EQ(get16le(pg(&r, pages[3]) + HDR), 50);
+    CHECK_EQ(slurp(&r, "f", got, sizeof(got)), 450);
+    CHECK(memcmp(got, d, 450) == 0);
+    alfs_file_info_t in;
+    CHECK_EQ(finfo(&r, "f", &in), 0);
+    CHECK_EQ(in.size, 450);
+    CHECK_EQ(in.pages, 4);
     DONE(&r);
     rig_close(&r);
 }
@@ -1111,9 +1132,9 @@ static void if_refusals(void) {
 
 /*
  * A logging run into an open file: rows produced at `rate` a second,
- * written every 200 ms, synced every second, `ms` long, with a cleanup
- * step every 20 ms if asked. Rows go to exp[]; synced is the length the
- * last successful sync covered. Stops early when the power is lost. 0, or
+ * written every 200 ms, synced (or flushed) every second, `ms` long, with a
+ * cleanup step every 20 ms if asked. Rows go to exp[]; synced is the length
+ * the last successful sync or flush covered. Stops early when the power is lost. 0, or
  * the first error that is not a power loss.
  */
 typedef struct {
@@ -1121,6 +1142,7 @@ typedef struct {
     uint32_t len, cap;
     uint32_t synced;
     uint32_t seq;
+    bool flush; /* each second a flush, not a sync */
 } run_t;
 
 static void run_init(run_t *lg, uint32_t cap) {
@@ -1158,7 +1180,7 @@ static int log_run(rig_t *r, alfs_file_t *f, run_t *lg, uint32_t rate, uint32_t 
                 return rc;
         }
         if (t % 1000 == 0) {
-            int rc = fsyncw(r, f);
+            int rc = lg->flush ? fflushw(r, f) : fsyncw(r, f);
             if (r->sim.off)
                 return 0;
             if (rc)
@@ -1338,6 +1360,7 @@ static void spd_open_reads_bounded(void) {
         alfs_file_t f;
         CHECK_EQ(fopenw(&r, &f, "o", 0), 0);
         CHECK(r.sim.c_bytes_read <= SECTOR + PAGE + npages[i] * HDR);
+        uint32_t walk = npages[i] * HDR;
         CHECK_EQ(put(&r, &f, d, bytes, NULL), 0);
         CHECK_EQ(fsyncw(&r, &f), 0);
         alfs_reader_t rd;
@@ -1345,8 +1368,8 @@ static void spd_open_reads_bounded(void) {
         CHECK(r.sim.c_bytes_read <= SECTOR + PAGE);
         CHECK_EQ(CALL(&r, alfs_file_close_read(&r.fs, &rd)), 0);
         CHECK_EQ(remount(&r), 0);
-        CHECK_EQ(fopenw(&r, &f, "o", 0), 0); /* a reopen: every page's data once more */
-        CHECK(r.sim.c_bytes_read <= SECTOR + PAGE + npages[i] * (HDR + PAGE));
+        CHECK_EQ(fopenw(&r, &f, "o", 0), 0); /* a reopen: a byte count a page, and one page */
+        CHECK(r.sim.c_bytes_read <= SECTOR + 2 * PAGE + walk + npages[i] * 2u);
         CHECK_EQ(fclosew(&r, &f), 0);
         DONE(&r);
         rig_close(&r);
@@ -1442,7 +1465,7 @@ static void life_write_amplification(void) {
         uint32_t total = per_sync * syncs, pages = pages_for(total);
         uint64_t b0 = r.sim.bytes_programmed;
         CHECK_EQ(falloc(&r, "a", total, NULL), 0);
-        CHECK_EQ(r.sim.bytes_programmed - b0, ENTRY + pages * HDR + (FBLOCK - 14));
+        CHECK_EQ(r.sim.bytes_programmed - b0, ENTRY + pages * HDR + 36u);
         alfs_file_t f;
         CHECK_EQ(fopenw(&r, &f, "a", 0), 0);
         static uint8_t d[24000];
@@ -1453,11 +1476,11 @@ static void life_write_amplification(void) {
             CHECK_EQ(fsyncw(&r, &f), 0);
         }
         uint32_t full = whole_pages(total), npages = full ? 1u + (full - D0) / D : 0u;
-        CHECK_EQ(r.sim.bytes_programmed - b0, full + 4u * npages);
+        CHECK_EQ(r.sim.bytes_programmed - b0, full + 6u * npages);
         b0 = r.sim.bytes_programmed;
         CHECK_EQ(fclosew(&r, &f), 0);
         uint32_t rest = total - full;
-        CHECK_EQ(r.sim.bytes_programmed - b0, (rest ? rest + 4u : 0u) + 14u + 4u);
+        CHECK_EQ(r.sim.bytes_programmed - b0, (rest ? rest + 6u : 0u) + 10u + 4u);
         DONE(&r);
         rig_close(&r);
     }
@@ -1508,10 +1531,10 @@ static void life_wear_level(void) {
 
 /* ---- SAFE ------------------------------------------------------------- */
 
-/* Power lost at operation k of a W-LOG run into a reserved file, with a
- * closed file beside it; then remounts and reads. Sets *past when k is past
- * the run's last operation. */
-static void powerloss_case(sim_pl_t pl, int64_t k, int *past) {
+/* Power lost at operation k of a W-LOG run into a reserved file, synced or
+ * flushed each second, with a closed file beside it; then remounts and
+ * reads. Sets *past when k is past the run's last operation. */
+static void powerloss_case(sim_pl_t pl, int64_t k, bool flush, int *past) {
     rig_t r;
     rig_open(&r, 12);
     *past = 1;
@@ -1525,6 +1548,7 @@ static void powerloss_case(sim_pl_t pl, int64_t k, int *past) {
     *past = 0;
     run_t lg;
     run_init(&lg, 30000);
+    lg.flush = flush;
     sim_power_after(&r.sim, k, pl);
     int rc = log_run(&r, &f, &lg, 50, 20000, false);
     if (!r.sim.off)
@@ -1541,7 +1565,8 @@ static void powerloss_case(sim_pl_t pl, int64_t k, int *past) {
         CHECK_EQ(remount(&r), 0);
         CHECK(reads_as(&r, "cfg", cfg, sizeof(cfg))); /* SAFE-01 */
         int32_t n = slurp(&r, "log", got, sizeof(got));
-        bool ok = n >= (int32_t)whole_pages(lg.synced) && n <= (int32_t)lg.len && !memcmp(got, lg.exp, (size_t)n);
+        uint32_t kept = flush ? lg.synced : whole_pages(lg.synced); /* SAFE-02 */
+        bool ok = n >= (int32_t)kept && n <= (int32_t)lg.len && !memcmp(got, lg.exp, (size_t)n);
         if (!ok)
             printf("    pl %d k %lld: read %d of %u (synced %u)\n", pl, (long long)k, n, lg.len, lg.synced);
         CHECK(ok); /* SAFE-02 */
@@ -1551,11 +1576,11 @@ static void powerloss_case(sim_pl_t pl, int64_t k, int *past) {
     rig_close(&r);
 }
 
-static void powerloss_all(void) {
+static void powerloss_all(bool flush) {
     for (int pl = 0; pl < PL_COUNT; pl++)
         for (int64_t k = 0;; k++) {
             int past = 0;
-            powerloss_case((sim_pl_t)pl, k, &past);
+            powerloss_case((sim_pl_t)pl, k, flush, &past);
             if (past && !tf_failed)
                 break;
             if (tf_failed) {
@@ -1566,11 +1591,11 @@ static void powerloss_all(void) {
 }
 
 static void safe_powerloss_durable(void) {
-    powerloss_all();
+    powerloss_all(false);
 }
 
 static void safe_powerloss_bound(void) {
-    powerloss_all();
+    powerloss_all(true);
 }
 
 /* SAFE-04: power lost at operation k of writing; reopened, written on,
@@ -1652,7 +1677,7 @@ static void safe_no_false_data(void) {
         uint32_t written = whole_pages(sizeof(d)), full = written <= D0 ? 1u : 1u + (written - D0) / D;
         CHECK(np >= full);
         uint32_t hit = sim_rand(&r.sim) % full, h = hit ? HDR : HDR + FBLOCK, n = hit ? D : D0;
-        uint32_t at = h + sim_rand(&r.sim) % (n + 4); /* its data or its check */
+        uint32_t at = h + sim_rand(&r.sim) % (2 + n + 4); /* its byte count, data or check */
         sim_flip(&r.sim, r.cfg.start + pages[hit] * PAGE + at, (uint8_t)(1u << (sim_rand(&r.sim) % 8)));
         alfs_fs_status_t st = fstatus(&r);
         uint32_t fails = st.n.check_failures;
@@ -1994,8 +2019,9 @@ static void safe_close_atomic(void) {
                 int32_t n = slurp(&r, "c", got, sizeof(got));
                 if (in.closed)
                     CHECK(n == (int32_t)sizeof(d) && !memcmp(got, d, sizeof(d)));
-                else
-                    CHECK(n == (int32_t)whole_pages(sizeof(d)) && !memcmp(got, d, (size_t)n));
+                else /* its pages: the partial one the close wrote, or not yet */
+                    CHECK((n == (int32_t)whole_pages(sizeof(d)) || n == (int32_t)sizeof(d)) &&
+                          !memcmp(got, d, (size_t)n));
             }
             DONE(&r);
             rig_close(&r);
@@ -2042,24 +2068,31 @@ static void safe_delete_atomic(void) {
         }
 }
 
-static void safe_frame_check(void) {
-    rig_t r;
-    rig_open(&r, 8);
-    CHECK_EQ(setup(&r), 0);
-    static uint8_t d[3000], got[3000];
-    fill(d, sizeof(d), 28);
-    CHECK_EQ(write_file(&r, "f", d, sizeof(d), sizeof(d)), 0);
-    uint32_t pages[16];
-    CHECK(pages_of(&r, "f", pages, 16) >= 3);
-    uint32_t id = get32le(pg(&r, pages[0]));
-    uint8_t *p = pg(&r, pages[2]);
-    p[HDR + 5] ^= 0x10; /* the data changed, and its page's check made to match */
-    put32le(p + HDR + D, page_check(id, 2, p + HDR, D));
-    uint32_t n = 0;
-    CHECK_EQ(slurp_n(&r, "f", got, sizeof(got), &n), ALFS_ECHECK);
-    CHECK_EQ(n, sizeof(d));
-    DONE(&r);
-    rig_close(&r);
+static void safe_file_check(void) {
+    for (int kind = 0; kind < 2; kind++) {
+        rig_t r;
+        rig_open(&r, 8);
+        CHECK_EQ(setup(&r), 0);
+        static uint8_t d[3000], got[3000];
+        fill(d, sizeof(d), 28);
+        CHECK_EQ(write_file(&r, "f", d, sizeof(d), sizeof(d)), 0);
+        uint32_t pages[16];
+        CHECK(pages_of(&r, "f", pages, 16) >= 6);
+        uint32_t want;
+        if (kind == 0) {
+            pg(&r, pages[2])[HDR + 2 + 5] ^= 0x10; /* page 2's data damaged */
+            want = sizeof(d) - D;
+        } else {
+            put32le(pg(&r, pages[5]) + 10, 1); /* the list cut short at page 5 */
+            want = D0 + 5 * D;
+        }
+        uint32_t n = 0;
+        CHECK_EQ(slurp_n(&r, "f", got, sizeof(got), &n), ALFS_ECHECK);
+        CHECK_EQ(n, want);
+        CHECK(memcmp(got, d, kind ? want : D0 + D) == 0);
+        DONE(&r);
+        rig_close(&r);
+    }
 }
 
 static void safe_links_checked(void) {
@@ -2124,52 +2157,6 @@ static void safe_catalog_rewrite_atomic(void) {
                 CHECK_EQ(remount(&r), 0);
                 for (int i = 0; i < 3; i++)
                     CHECK(reads_as(&r, keep[i], d, 200u * (uint32_t)(i + 1)));
-            }
-            DONE(&r);
-            rig_close(&r);
-            if (tf_failed) {
-                printf("    behaviour %d, power lost at operation %lld\n", pl, (long long)k);
-                return;
-            }
-        }
-}
-
-static void safe_reopen_closed_cut(void) {
-    for (int pl = 0; pl < PL_COUNT; pl++)
-        for (int64_t k = 0;; k++) {
-            rig_t r;
-            rig_open(&r, 10);
-            CHECK_EQ(setup(&r), 0);
-            static uint8_t a[1600], b[1000], c[3000], got[4000];
-            fill(a, sizeof(a), 32);
-            fill(b, sizeof(b), 33);
-            fill(c, sizeof(c), 34);
-            CHECK_EQ(write_file(&r, "a", a, 1000, 1000), 0);
-            CHECK_EQ(write_file(&r, "b", b, 1000, 1000), 0); /* beside a */
-            CHECK_EQ(write_file(&r, "pad", c, 3000, 3000), 0);
-            CHECK_EQ(write_file(&r, "c", c, 3000, 3000), 0); /* sectors of its own */
-            r.bsize = SECTOR;
-            alfs_file_t f;
-            sim_power_after(&r.sim, k, (sim_pl_t)pl);
-            if (ECALL(&r, alfs_file_open(&r.fs, &f, "a", ALFS_GROW, r.wblk, r.bsize)) == 0 && !r.sim.off) {
-                put(&r, &f, a + 1000, 600, NULL);
-                if (!r.sim.off)
-                    fclosew(&r, &f);
-            }
-            bool past = !r.sim.off;
-            sim_reboot(&r.sim);
-            if (past) {
-                rig_close(&r);
-                break;
-            }
-            for (int m = 0; m < 3; m++) {
-                CHECK_EQ(remount(&r), 0);
-                CHECK(reads_as(&r, "c", c, sizeof(c))); /* no page in the rewritten sectors */
-                uint32_t n = 0;
-                slurp_n(&r, "a", got, sizeof(got), &n);
-                CHECK(runs_cut(got, n, a, sizeof(a))); /* no byte it never held */
-                slurp_n(&r, "b", got, sizeof(got), &n);
-                CHECK(runs_cut(got, n, b, sizeof(b)));
             }
             DONE(&r);
             rig_close(&r);
@@ -2257,7 +2244,7 @@ int main(int argc, char **argv) {
         {"if_close", if_close},
         {"if_grow", if_grow},
         {"if_reopen_unclosed", if_reopen_unclosed},
-        {"if_reopen_closed", if_reopen_closed},
+        {"if_flush", if_flush},
         {"if_read", if_read},
         {"if_delete", if_delete},
         {"if_list", if_list},
@@ -2287,10 +2274,9 @@ int main(int argc, char **argv) {
         {"safe_alloc_atomic", safe_alloc_atomic},
         {"safe_close_atomic", safe_close_atomic},
         {"safe_delete_atomic", safe_delete_atomic},
-        {"safe_frame_check", safe_frame_check},
+        {"safe_file_check", safe_file_check},
         {"safe_links_checked", safe_links_checked},
         {"safe_catalog_rewrite_atomic", safe_catalog_rewrite_atomic},
-        {"safe_reopen_closed_cut", safe_reopen_closed_cut},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},

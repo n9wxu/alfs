@@ -49,10 +49,11 @@ enum {
     ALFS_EPROG = -7,
     /* A file is open that the call would disturb: close it, then retry. */
     ALFS_EOPEN = -8,
-    /* A closed file's frame checksum failed at its end: it is damaged.
-     * Write it again, or fail. */
+    /* A closed file read to its end lacked a page: it is damaged. Write it
+     * again, or fail. */
     ALFS_ECHECK = -9,
-    /* A file of that filename exists: delete it first, or fail. */
+    /* A file of that filename exists, or is closed and so final: delete it
+     * first, or fail. */
     ALFS_EEXIST = -10,
 };
 
