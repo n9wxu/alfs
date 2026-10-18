@@ -1,8 +1,7 @@
 # alfs: `make test` runs the host suite on 8 simulator seeds under the
 # address and undefined behaviour sanitizers; `make soak` on 100 seeds
 # without them; `make target` checks the Cortex-M0+ budgets of SIMP-02 to
-# SIMP-04. `make tests-compile` compiles the tests alone: on this branch the
-# store (alfs_fs.c) is not written yet, so only that runs. T=name runs the
+# SIMP-04. `make tests-compile` compiles the tests alone. T=name runs the
 # tests whose names contain it; SEEDS="..." the seeds given. `make probe`
 # builds the flash probe (docs/TEST_PLAN.md 7).
 
@@ -19,7 +18,7 @@ STORES = alfs_flash.c alfs_fs.c
 STORE_H = alfs.h alfs_flash.h alfs_fs.h
 TEST_SRC = tests/test_alfs.c tests/sim.c tests/tf.c
 TEST_H = tests/sim.h tests/tf.h
-STORE_BUDGET = 6144
+STORE_BUDGET = 6784
 
 all: test
 

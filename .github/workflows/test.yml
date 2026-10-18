@@ -1,7 +1,6 @@
-# What this branch can run: the tests compiled against alfs_fs.h, with GCC
-# and with Clang. The store (alfs_fs.c) is not written yet, so the suite,
-# the soak and the Cortex-M0+ budgets cannot run; a release, which needs
-# every test, is refused until it is. release.yml calls this workflow.
+# Every test alfs has: the suite on simulator seeds under the sanitizers,
+# the suite on 100 seeds, and the Cortex-M0+ size and stack budgets.
+# release.yml runs this before it makes a release.
 name: tests
 
 on:
@@ -14,23 +13,38 @@ permissions:
   contents: read
 
 jobs:
-  tests-compile:
-    name: tests compile against alfs_fs.h, no store code yet (${{ matrix.cc }})
+  core:
+    name: store, 8 seeds, sanitizers (${{ matrix.cc }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
-      - run: make tests-compile CC=${{ matrix.cc }}
+      # The runner's address randomisation is wider than older sanitizers map.
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: make test CC=${{ matrix.cc }} JOBS=4
 
-  release-gate:
-    name: a release needs the store, to run every test
-    if: github.ref_type == 'tag'
+  soak:
+    name: store, 100 seeds
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          test -f alfs_fs.c || { echo "alfs_fs.c is not written, so the tests cannot run"; exit 1; }
+      - run: make soak JOBS=4
+
+  budgets:
+    name: Cortex-M0+ size and stack budgets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The budgets were measured with this release; another moves the sizes.
+      - name: Arm GNU Toolchain 13.2.Rel1
+        run: |
+          curl -sSfL https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-eabi/bin" >> "$GITHUB_PATH"
+      - run: make target
