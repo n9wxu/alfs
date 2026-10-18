@@ -1,7 +1,7 @@
 /*
  * alfs: the append-log flash store, on serial NOR flash: files, each a
- * frame of pages linked in a list, found by filename through a catalog
- * (alfs_fs.h). A file's pages can be reserved ahead of time, so that
+ * frame of pages linked in a list, found by filename through a cache a
+ * mount builds (alfs_fs.h). A file's pages can be reserved ahead of time, so that
  * writing it programs only flash erased already.
  *
  * docs/REQUIREMENTS.md says what alfs must do; docs/SPEC.md how its bytes
@@ -22,21 +22,19 @@
 #include <stdint.h>
 
 /*
- * Return codes. Each error says the state it leaves and what to do:
- * retry, rebuild (format) or fail.
+ * Return codes. Each error says the state it leaves and what to do: retry,
+ * clean up, or fail.
  */
 enum {
     ALFS_OK = 0,
-    /* An erase: nothing is left to erase. */
+    /* A cleanup: nothing is left to erase. */
     ALFS_CLEAN = 2,
     /* A driver read failed. Nothing changed: retry. */
     ALFS_EIO = -1,
     /* No room: no free page for a reservation, or for a write past one,
-     * whose bytes stay in the block (clean up, then retry); or no slot in
-     * the catalog (delete a file, or fail). */
+     * whose bytes stay in the block (clean up, then retry); or no free
+     * record in the cache (delete a file, or fail). */
     ALFS_ENOSPC = -2,
-    /* The area holds no catalog: rebuild with alfs_fs_format, or fail. */
-    ALFS_ENOFS = -3,
     /* The configuration does not fit the chip. Nothing was written: fail. */
     ALFS_EGEOMETRY = -4,
     /* An argument or a handle's state is wrong. Nothing changed: fail (it
