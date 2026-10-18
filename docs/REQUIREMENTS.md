@@ -1,13 +1,14 @@
 # alfs requirements
 
 alfs, the append-log flash store: files on serial NOR flash. Each file is a
-frame of pages linked in a list, found by its filename through a catalog.
-A file's pages can be reserved ahead of time, so that writing it in flight
-programs only flash already erased.
+frame of pages linked in a list; its first page holds its filename, and a
+mount builds a cache of the files from the pages themselves. A file's pages
+can be reserved ahead of time, so that writing it in flight programs only
+flash already erased.
 
-**Status: draft 6, requirements and tests.** Requirements come first, then
-the tests that verify them (`docs/TEST_PLAN.md`), then the code. There is
-no code yet. `experiments/v6-frames/EVALUATION.md` evaluates this option.
+**Status: draft 6.** Requirements come first, then the tests that verify
+them (`docs/TEST_PLAN.md`), then the code. `experiments/v6-frames/EVALUATION.md`
+evaluates this option.
 
 ---
 
@@ -103,6 +104,20 @@ The user, on this design:
 > programs count as configuration. Edits can happen on a host computer and
 > not on this. the file system uses REST so it already works on whole
 > files. We should not support PATCH."
+>
+> "close happens on landing, the unused sectors can be cleaned up."
+>
+> "The web application can check for a completed write before indicating
+> the system is ready for flight. Writing the new configuration first and
+> then erasing the old one is safe. The only issue is the possibility of
+> two copies of the same file with the same file name. Adding a version
+> number to the file record would fix this. 8-bit would be enough. The
+> version id can wrap. so wrap detection is needed."
+>
+> "keep the skip."
+>
+> "drop the filesystem catalog. Build a cache on startup. go with one
+> place erases"
 
 The user's choices in the review of the formats: a page's "page count" is
 its position in its frame; each page's data carries a check, and so does
@@ -113,7 +128,8 @@ writes carry a check.
 - **A log** is allocated, opened, appended to, closed, read and deleted.
   One cut short by a reset, never closed, is opened again and appended to.
 - **A configuration file**, Lua programs among them, is written whole and
-  read whole. Writing it again deletes the old file and writes a new one.
+  read whole. Writing it again writes a new copy of the file, which
+  replaces the old one when it is closed.
 
 A closed file is final: alfs edits no file.
 
@@ -127,7 +143,10 @@ A closed file is final: alfs edits no file.
   is programmed once, with its byte count and its check: a full page, or a
   partial one that a flush or a close leaves, after which the file goes on
   in the next page.
-- **The catalog** maps each filename to its frame ID and first page.
+- **The cache** is built in RAM at each mount, from the pages: each file's
+  frame ID, first page, version and state. Nothing on the flash indexes the
+  files.
+- **The cleanup** is the only thing that erases.
 
 **The order of priority.** Every requirement carries one:
 
@@ -148,7 +167,8 @@ Where two requirements conflict, the higher priority wins. **Simplicity
 **In scope:**
 
 - **Files** on raw serial NOR flash, found by filename: allocate with a
-  reserved size, open, write, sync, flush, close, read, delete, list.
+  reserved size, open, write, sync, flush, close, read, delete, list; a
+  new copy of a file replacing the old when it closes.
 - **Reopening** a log that a reset cut short, never closed.
 - **Growth** past a reservation into pages already erased.
 - **Cleanup:** erasing, sector by sector, the sectors that hold no page of
@@ -203,7 +223,8 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 
 ### 4.1 Terms
 
-- **area:** the sector-aligned range of the chip given to alfs.
+- **area:** the sector-aligned range of the chip given to alfs. Its page 0
+  holds no file.
 - **sector:** the erase unit, a power of two (4,096 bytes on every part
   here).
 - **page:** the most one program writes, and the unit a file's space is
@@ -231,21 +252,25 @@ references are to its `DECISIONS.md` (DD-nnn), its requirements
 - **link:** a page header's next page address. Erased: no next page yet.
   Zero: the frame's last page.
 - **frame block:** the start of a frame's first page, after its page
-  header: the frame ID, the filename, and the **close fields**: the page
-  count and the size in bytes, with a check of their own.
+  header: the frame ID, the filename, the version, and the **close
+  fields**: the page count and the size in bytes, with a check of their
+  own.
 - **data check:** a CRC-32 straight after each page's data, programmed with
   it and its byte count.
 - **reservation:** the pages `alfs_file_alloc` links into a frame before
   any data is written. Its end is the page whose link is erased.
 - **growth:** pages a write links past the reservation, when the file was
   opened with `ALFS_GROW`.
-- **catalog:** the sectors that map filenames to frame IDs and first pages;
-  one is in use, the other its spare.
+- **copy:** a file's first page and its list. Two copies of one filename
+  exist while an update is under way; the **version** in each frame block
+  tells the newer.
+- **cache:** the record of every file a mount builds in RAM, in a table
+  the caller gives.
 - **close:** the call that ends a file: its last data, its close fields,
-  the zero link, and the erase of the reservation's unused sectors. A
+  the zero link, and the blocking out of the older copy it replaces. A
   closed file is final.
-- **live page:** a page of a file that is not deleted: any page of a file
-  not closed, or a page of a closed file within its page count.
+- **live page:** a page of a copy the cache holds: any page of a copy not
+  closed, or a page of a closed copy within its page count.
 - **free page:** a page that reads erased, header and data, and is in no
   file.
 - **dead page:** a page that is neither live nor free: what a cleanup
@@ -376,14 +401,13 @@ The requirement, one sentence where possible.
 
 #### ALFS-SPD-01
 
-Only these erase: `alfs_file_alloc`, when too few pages are free, and
-when it rewrites the catalog; `alfs_file_close`, the sectors of the
-reservation it did not use; `alfs_fs_cleanup`; and `alfs_fs_format`.
-Nothing else erases: not a write, a sync, a flush, a read, a list, a
-mount, or an open.
+Only `alfs_fs_cleanup` erases. Nothing else does: not an allocation, a
+write, a sync, a flush, a close, a read, a delete, a list, a mount, or an
+open.
 
 - Priority: 1.
-- Source: the rulings; UC-1, UC-14; the user: "No new pages will be erased."
+- Source: the rulings; UC-1, UC-14; the user: "No new pages will be
+  erased." and "go with one place erases".
 - Measure: erases the simulator counts during each call, under W-LOG,
   W-HR, W-RING and W-CFG, with power loss at every operation.
 - Pass: zero in every other call. Fail: any.
@@ -441,15 +465,19 @@ holds in the block, and erases nothing, when the file was opened without
 
 #### ALFS-SPD-05
 
-Mounting reads at most the two catalog sectors and performs no flash
-operation.
+Mounting reads each page's header, and the frame block of each page that
+holds one, and performs no flash operation.
 
 - Priority: 1.
-- Source: UC-3: the time from reset to the first sample is flight time
-  lost.
+- Source: the user: "drop the filesystem catalog. Build a cache on
+  startup." UC-3: the time from reset to the first sample is flight time
+  lost. Reading a header takes about 2 µs on pyro's flash at 62.5 MHz
+  (estimated), so 50 to 100 ms for an 8 MB area.
 - Measure: bytes the simulator reads during each mount of an area holding
-  files.
-- Pass: at most two sectors' bytes, no operation. Fail: more, or any.
+  files, some of them deleted.
+- Pass: at most 14 bytes a page, and 51 bytes for each page holding a frame
+  block, a deleted file's among them; no operation. Fail: more, or any
+  operation.
 - Verified by: `spd_mount_reads_bounded`.
 
 #### ALFS-SPD-06
@@ -480,25 +508,23 @@ takes.
 
 #### ALFS-SPD-08
 
-Opening a file for reading reads its catalog entry and its first page.
-Opening it for writing reads its catalog entry and each page header of its
-list once, to know where the reservation ends. Reopening a log not closed,
-after a mount, also reads each page's byte count once, to find where
-writing goes on and the size so far, and the page found there whole.
+Opening a file for reading reads its first page. Opening it for writing
+reads its first page and walks its list twice, reading each page's header
+and byte count: to find the end of its data, which a page whose program
+failed may precede, and where the reservation ends.
 
 - Priority: 1.
 - Source: UC-3, UC-6; SPD-04: without `ALFS_GROW`, a write takes only the
   bytes the reservation holds.
 - Measure: bytes read by opens of files of 1, 10 and 100 pages.
-- Pass: at most the catalog sector and a page for a read; the catalog
-  sector, the frame block and a header for each page for a write; and a
-  byte count for each page and one page more for a reopen. Fail: more.
+- Pass: a page for a read; a page, and two headers and a byte count for
+  each page, for a write or a reopen. Fail: more.
 - Verified by: `spd_open_reads_bounded`.
 
 #### ALFS-SPD-09
 
 Every loop alfs runs ends within a bound set by the area's page count, the
-bytes the call passes, or the catalog's entries, whatever the flash holds.
+bytes the call passes, or the cache's records, whatever the flash holds.
 A list of links that returns to a page already passed ends there.
 
 - Priority: 1.
@@ -510,23 +536,24 @@ A list of links that returns to a page already passed ends there.
 
 #### ALFS-SPD-10
 
-Allocating R pages performs R + 1 programs, the catalog entry and each
-page's header, the first page's with the frame block; and erases only
-sectors holding no live page, only as many as the reservation needs past
-the free pages there are.
+Allocating R pages performs R + 1 programs: each page's header, and the
+first page's frame block, with its link, before its header; and one more
+when it blocks out a copy not closed. It erases nothing. With fewer than R
+free pages it returns `ALFS_ENOSPC` and writes nothing.
 
 - Priority: 1.
-- Source: the user: "the full linked list of pages erased and created."
-- Measure: programs and erases during allocations into an area cleaned,
-  and into one holding dead pages.
-- Pass: as stated. Fail: more.
+- Source: the user: "the full linked list of pages erased and created", and
+  "go with one place erases".
+- Measure: programs and erases during allocations into an area cleaned, and
+  into one holding too few free pages.
+- Pass: as stated. Fail: more, or an erase.
 - Verified by: `if_alloc`.
 
 ### 6.2 Flash life (LIFE)
 
 #### ALFS-LIFE-01
 
-An erase takes only a sector holding no live page; never a sector that
+The cleanup erases only a sector holding no live page; never a sector that
 reads erased.
 
 - Priority: 2.
@@ -541,9 +568,11 @@ reads erased.
 
 The bytes programmed are what the files need: each page of data, its data,
 a 2-byte byte count and a 4-byte check; each page allocated, a 14-byte
-header, and the first page 36 bytes more of its frame block; a close, 10
-bytes of close fields and a 4-byte zero link; a page taken past the
-reservation, its header and a 4-byte link; a catalog entry, 44 bytes.
+header, but the last page 10 bytes, its link left erased; the first page 41
+bytes more of its frame block; a close, 10
+bytes of close fields, a 4-byte zero link, and 32 bytes for each older copy
+it blocks out; a page taken past the reservation, its header and a 4-byte
+link.
 
 - Priority: 2.
 - Source: the brief; `docs/SPEC.md`.
@@ -554,9 +583,9 @@ reservation, its header and a 4-byte link; a catalog entry, 44 bytes.
 
 #### ALFS-LIFE-03
 
-On W-LOG into a file allocated to fit it, the erases of its allocation,
-its close and the cleanup after it is deleted are no more than the sectors
-its pages fill, plus one.
+On W-LOG into a file allocated to fit it, the erases its life costs, those
+of the cleanups after it is deleted, are no more than the sectors its pages
+fill, plus one.
 
 - Priority: 2.
 - Source: the brief; UC-1.
@@ -579,15 +608,16 @@ sectors differ by at most 2.
 
 #### ALFS-LIFE-05
 
-A close erases each sector of the reservation that holds no live page; the
-unused pages of a sector that also holds a live page stay, dead, until a
-cleanup finds the sector holds no live page.
+A close leaves the reservation's unused pages dead; the cleanup erases each
+sector of them that holds no live page, and leaves a sector that also holds
+a live page as it is.
 
 - Priority: 2.
-- Source: the user: "the close will ... erase all the unused pages", and
-  "erase requires a sector or a block and not simply a page."
+- Source: the user: "close happens on landing, the unused sectors can be
+  cleaned up." and "erase requires a sector or a block and not simply a
+  page."
 - Measure: files closed short of their reservations, across sector
-  boundaries and within one.
+  boundaries and within one, then cleaned up.
 - Pass: the sectors holding no live page erased; every other sector's
   bytes as they were. Fail: otherwise.
 - Verified by: `if_close`.
@@ -639,21 +669,23 @@ skipped and counted, and reading goes on at the next page of the list.
 
 #### ALFS-SAFE-04
 
-After a mount, writing a file that was not closed goes on at the first
-page of its list whose byte count, data and data check read erased. A page holding any
-data, whole or torn, stays as it is, and the reader skips it if its check
-fails. A page a power loss tore that reads erased is written as erased; its
-data check then shows any damage.
+After a mount, writing a copy that was not closed goes on past the first
+page of its list whose byte count reads erased: that page is skipped, by
+programming 0000h into its byte count, and writing goes on in the next
+page. alfs programs nothing over bits a power loss may have left half
+programmed, but 00h.
 
 - Priority: 3.
 - Source: the user: "If the page looks erased after a reboot, it can only
-  be treated as erased. ... If there is partial data, then it can be left
-  alone and the next frame in the allocated sequence get the next data."
+  be treated as erased." and, of skipping the page with 0000h in its byte
+  count, "keep the skip." A-3, A-9: a torn data program changes only the
+  page's byte count, data and check, never its header or its link, which
+  were programmed at allocation.
 - Measure: power lost at every operation of writing a file, under every
   behaviour; remount, reopen, write, close, read.
-- Pass: every byte read is one written, in order; what is lost is the
-  bytes of the cut page and those not yet in a complete page. Fail: a byte
-  read that was not written, or out of order.
+- Pass: every byte read is one written, in order; what is lost is the cut
+  page's and those not yet in a page programmed; the simulator flags no
+  program into a torn byte. Fail: otherwise.
 - Verified by: `safe_reopen_after_loss`.
 
 #### ALFS-SAFE-05
@@ -710,11 +742,13 @@ every other state unchanged, so that a retry reads the same bytes.
 #### ALFS-SAFE-09
 
 alfs programs and erases only inside its area. A configuration whose area
-does not lie inside the chip is refused before any operation. An area
-holding no catalog fails to mount with `ALFS_ENOFS` and is not written.
+does not lie inside the chip is refused before any operation. A mount
+writes nothing; an area holding anything else mounts with no file, its
+pages dead, for a cleanup to erase.
 
 - Priority: 3.
-- Source: UC-8.
+- Source: UC-8. Section 8, D-1: nothing on the flash marks the area as
+  alfs's.
 - Measure: areas holding random data, blank areas, an area past the chip's
   end.
 - Pass: as stated. Fail: any write outside the area, or any write at
@@ -724,7 +758,7 @@ holding no catalog fails to mount with `ALFS_ENOFS` and is not written.
 #### ALFS-SAFE-10
 
 Every call finishes, without a crash, on any content of the area: links out
-of the area, into the catalog, back to a page already passed, or to a page
+of the area, to page 0, back to a page already passed, or to a page
 of another frame.
 
 - Priority: 3.
@@ -736,16 +770,16 @@ of another frame.
 #### ALFS-SAFE-11
 
 An allocation is atomic: after a power loss during it, the filename names
-no file, or a file whose every reserved page is in its list.
+no new copy, or a copy whose every reserved page is in its list.
 
 - Priority: 3.
-- Source: UC-14. The catalog entry is programmed first, then the pages from
-  the last to the first: the file exists once its first page's header and
-  frame block are on the flash.
+- Source: UC-14. The pages are programmed from the last to the first, and
+  the first page's header after the rest of that page: the copy exists once
+  that header is on the flash.
 - Measure: power lost at every operation of allocations, under every
   behaviour; remount eight times; open, write, close, read.
-- Pass: as stated, and the frame ID never given to another file. Fail:
-  otherwise.
+- Pass: as stated, the frame ID never given to another file, and no file
+  under another filename. Fail: otherwise.
 - Verified by: `safe_alloc_atomic`.
 
 #### ALFS-SAFE-12
@@ -758,23 +792,26 @@ not closed, every page it holds, or as closed, whole.
   after the last data and before the zero link.
 - Measure: power lost at every operation of a close, under every
   behaviour; eight remounts reading the file.
-- Pass: as stated each time. Fail: a closed file that does not read whole.
+- Pass: as stated each time, and no file under another filename. Fail: a
+  closed file that does not read whole, or a file under another filename.
 - Verified by: `safe_close_atomic`.
 
 #### ALFS-SAFE-13
 
-A delete programs 00h over the filename, in the catalog entry and in the
-frame block, and leaves the pages as they are. Once it returns, the file
-never reads again after any power loss; until then it reads whole or not
-at all.
+A delete programs 00h over the filename of every copy, and leaves the pages
+as they are. Once it returns, the file never reads again after any power
+loss; until then it reads whole or not at all, and no file reads under
+another filename.
 
 - Priority: 3.
 - Source: the user: "Erasing a file is simply writing 0's over the
   filename. The rest of the data can be left alone unless we need to scrub
-  the file system."
+  the file system." The open check covers the filename, so one that a power
+  loss left zeroed in part reads as blocked out, not as another filename.
 - Measure: power lost at every operation of a delete, under every
   behaviour; eight remounts.
-- Pass: as stated. Fail: a file that comes back, or reads in part.
+- Pass: as stated. Fail: a file that comes back, reads in part, or appears
+  under another filename.
 - Verified by: `safe_delete_atomic`.
 
 #### ALFS-SAFE-14
@@ -795,31 +832,36 @@ skipped a page, or found its list ending before its page count, returns
 
 #### ALFS-SAFE-15
 
-A link is followed only to a page inside the area, past the catalog, whose
+A link is followed only to a page inside the area, past page 0, whose
 header check passes and which names the same frame and the next position;
 otherwise the list ends there, and the failure is counted.
 
 - Priority: 3.
 - Source: UC-10: a damaged link must not lead a read into another file.
 - Measure: links bent to another frame's page, a wrong position, the
-  catalog, and past the area.
+  page 0, and past the area.
 - Pass: the list ends at the bent link; no byte of another page returned.
   Fail: otherwise.
 - Verified by: `safe_links_checked`.
 
 #### ALFS-SAFE-16
 
-Rewriting the catalog is atomic: the spare catalog sector takes the live
-entries and becomes the catalog only when complete; after a power loss at
-any point, every file reads as before.
+An update is atomic: a new copy of a filename is read only once it is
+closed, and its close blocks out the copy it replaces. After a power loss
+at any point of an update, the filename reads the old copy whole or the new
+copy whole; once the close returns, the new one.
 
 - Priority: 3.
-- Source: UC-10. Section 8, D-3: the user named "a catalog sector"; one
-  sector cannot be rewritten without a moment when it holds nothing.
-- Measure: power lost at every operation of a rewrite, under every
-  behaviour; remount; read every file.
-- Pass: every file whole. Fail: any missing.
-- Verified by: `safe_catalog_rewrite_atomic`.
+- Source: the user: "Writing the new configuration first and then erasing
+  the old one is safe. ... Adding a version number to the file record would
+  fix this. 8-bit would be enough. The version id can wrap. so wrap
+  detection is needed." UC-11, UC-12.
+- Measure: power lost at every operation of an update, under every
+  behaviour; eight remounts reading the file; and 300 updates in a row,
+  wrapping the version.
+- Pass: as stated, and no file under another filename. Fail: a file
+  missing, mixed, an older copy read, or a file under another filename.
+- Verified by: `safe_update_atomic`, `if_update`.
 
 ### 6.4 Simplicity (SIMP)
 
@@ -836,18 +878,21 @@ and no library beyond `<stdint.h>`, `<stddef.h>`, `<stdbool.h>` and
 
 #### ALFS-SIMP-02
 
-The store is at most 6 KiB on a Cortex-M0+ (Thumb, `-Os`).
+The store is at most 6.625 KiB on a Cortex-M0+ (Thumb, `-Os`).
 
 - Priority: S.
-- Source: the brief. An estimate, until there is code to measure.
+- Source: the brief. Built with Arm GNU Toolchain 13.2.Rel1 it measures
+  6,664 bytes (`alfs_fs.o` 5,968, `alfs_flash.o` 696). The budget is the
+  measurement plus about 1.5%, rounded up to a multiple of 128 bytes, so
+  that Arm GNU 14.2 builds (6,680 bytes) fit too.
 - Verified by: `make target`.
 
 #### ALFS-SIMP-03
 
 RAM does not grow with the area, and all of it is the caller's: the
-instance at most 96 bytes and a scratch page; a writer at most 48 bytes and
-its block, of at least one page; a reader at most 40 bytes and its block, of
-at least one page.
+instance at most 96 bytes and a scratch page; a cache record 12 bytes; a
+writer at most 48 bytes and its block, of at least one page; a reader at
+most 40 bytes and its block, of at least one page.
 
 - Priority: S.
 - Source: the user: "Applications bring their ram so ram allocations in
@@ -859,7 +904,8 @@ at least one page.
 No call uses more than 320 bytes of stack, the driver's own frames apart.
 
 - Priority: S.
-- Source: pyro's smallest task stack is 2 kB.
+- Source: pyro's smallest task stack is 2 kB. Measured: 308 bytes under
+  `alfs_file_close`.
 - Verified by: `make target`.
 
 #### ALFS-SIMP-05
@@ -885,9 +931,10 @@ sees every program and erase before it.
 
 The area is configured: the sector and page size (powers of two, page at
 least 128 bytes, sector at least four pages), its start and length
-(sector-aligned, at least four sectors, at most 65,535 pages), and the
+(sector-aligned, at least two sectors, at most 65,535 pages), and the
 chip's size. alfs programs a byte at most once between erases, except with
-00h: a link a close ends, a filename a delete blocks out.
+00h: a link a close ends, a filename blocked out, the byte count of a page
+skipped.
 
 - Priority: S.
 - Verified by: `if_geometry`; every test (the simulator refuses a second
@@ -912,37 +959,43 @@ The driver programs exactly the bytes alfs passes it, and no others.
 #### ALFS-IF-05
 
 A file is found by its filename: 1 to 31 bytes, none 00h, compared byte
-for byte. A filename names at most one file; it converts to the file's
-frame ID, its descriptor, which every later call on the open file uses.
+for byte. The filename converts to the file's frame ID, its descriptor,
+which every later call on the open file uses. A filename names one file;
+while an update is under way it has two copies, and the 8-bit version in
+each frame block tells the newer, across the version's wrap.
 
 - Priority: S.
 - Source: the user: "Files are opened/closed/allocd by filename. The
   filename converts to a frame id which is essentially the file
-  descripter."
-- Verified by: `if_names`.
+  descripter." and "Adding a version number to the file record would fix
+  this."
+- Verified by: `if_names`, `if_update`.
 
 #### ALFS-IF-06
 
 `alfs_file_alloc` takes a filename and a reserved size in bytes, and
-returns the frame ID. It reserves the pages the size needs and links them
-in a list, the last page's link left erased; it writes the frame block with
-the page count and size left erased. The reserved size is not
-recorded: the list is the reservation. A filename that names a file is
-refused with `ALFS_EEXIST`.
+returns the frame ID. It reserves the pages the size needs from the free
+pages and links them in a list, the last page's link left erased; it writes
+the frame block with the page count and size left erased, and a version one
+more than the filename's newest copy. A copy of the filename not closed is
+blocked out. The reserved size is not recorded: the list is the
+reservation.
 
 - Priority: S.
 - Source: the user: "The file_alloc will accept the file name, and reserved
   file size." and "The linked list is assembled and that is sufficient."
-- Verified by: `if_alloc`.
+- Verified by: `if_alloc`, `if_update`.
 
 #### ALFS-IF-07
 
 `alfs_file_open` opens a file by filename for writing: one writer a file.
 `ALFS_GROW` lets writes go on past the reservation into free pages
 (IF-08); without it they stop there (SPD-04). A file not closed is written
-from the first page of its list whose byte count, data and data check read
-erased (SAFE-04). A closed file is final: opening it for writing is refused
-with `ALFS_EEXIST`.
+from the page after the last one holding data, past one more skipped after
+a mount (SAFE-04): a file reopened after a mount holds a page less than its
+reservation, so one written to its reservation's end after a reset needs a
+page more, or `ALFS_GROW`. A closed file is final: opening it for writing
+is refused with `ALFS_EEXIST`.
 
 - Priority: S.
 - Source: the user: "If the file has not been closed, it can be opened."
@@ -975,20 +1028,21 @@ in the block until more bytes complete its page, a flush, or the close.
 #### ALFS-IF-10
 
 A close programs what the block holds, the last page partial, then the
-close fields, then 00h into the last page's link, and then erases the
-sectors of the reservation that hold no live page.
+close fields, then 00h into the last page's link, and then blocks out the
+copy it replaces.
 
 - Priority: S.
 - Source: the user: "the close will update the page-count value mark the
-  last page address link with 0's, and erase all the unused pages."
-- Verified by: `if_close`.
+  last page address link with 0's" and "Writing the new configuration first
+  and then erasing the old one is safe."
+- Verified by: `if_close`, `if_update`.
 
 #### ALFS-IF-11
 
-A file is read from its start, by filename, closed or not, page by page,
-each page's byte count giving its data: a closed file to its page count;
-one not closed to the first page of its list whose byte count reads
-erased, or the list's end.
+A file is read from its start, by filename, page by page, each page's byte
+count giving its data: the filename's newest closed copy to its page count,
+or, with none closed, its newest copy to the first page of its list whose
+byte count reads erased, or the list's end.
 
 - Priority: S.
 - Source: UC-6: a log is read back, and may be read while it is written or
@@ -997,30 +1051,33 @@ erased, or the list's end.
 
 #### ALFS-IF-12
 
-`alfs_file_delete` removes a file by filename (SAFE-13). A file open for
-writing or reading is refused with `ALFS_EOPEN`. A configuration file, a
-Lua program among them, is written again by deleting its file and writing
-a new one of the same filename.
+`alfs_file_delete` removes a file by filename, every copy (SAFE-13). A file
+open for writing or reading is refused with `ALFS_EOPEN`. A configuration
+file, a Lua program among them, is written again by allocating, writing and
+closing a new copy of the same filename (SAFE-16).
 
 - Priority: S.
 - Source: the user: "A simple LUA update will block out the filename and
   write a new file." and "configuration (open, close, read whole file,
   write whole file)."
-- Verified by: `if_delete`.
+- Verified by: `if_delete`, `if_update`.
 
 #### ALFS-IF-13
 
-Listing the files reports each one's frame ID, filename, whether it is
-closed, and, once closed, its page count and size, in growing frame ID.
+Listing the files reports, for each filename, the copy it names: its frame
+ID, filename, version, whether it is closed, and, once closed, its page
+count and size, in growing frame ID.
 
 - Priority: S.
 - Verified by: `if_list`.
 
 #### ALFS-IF-14
 
-A frame ID is unique for the life of the area, grows with each file
+A frame ID is unique for the life of the area, grows with each copy
 allocated, and is never given again, even after a delete or a power loss
-during an allocation.
+during an allocation. A mount takes two more than the largest frame ID in a
+valid header, three more when it finds a header that reads neither erased
+nor valid.
 
 - Priority: S.
 - Source: the frame ID is the file's descriptor (IF-05): a stale one must
@@ -1030,21 +1087,23 @@ during an allocation.
 #### ALFS-IF-15
 
 `alfs_fs_cleanup` erases up to a given number of sectors, one a step, each
-one holding no live page and not reading erased, and checks each erased;
-it returns `ALFS_CLEAN` when none is left.
+one holding no live page and not reading erased, and reads each back as all
+1s; it returns `ALFS_CLEAN` when none is left.
 
 - Priority: S.
 - Source: the user: "A filesystem 'cleanup' operation is available to
-  pre-erase all unused pages sector by sector."
+  pre-erase all unused pages sector by sector." and "Erases are finshed when
+  a read returns 1's for all pages."
 - Verified by: `if_cleanup`.
 
 #### ALFS-IF-16
 
-`alfs_fs_format` erases the catalog sectors and writes an empty catalog;
-every other sector then holds no file, for a cleanup to erase.
+A mount builds the cache in a table the caller gives: a record of each live
+copy. A table too small for them fails the mount with `ALFS_ENOSPC`.
 
 - Priority: S.
-- Verified by: `if_format_mount`.
+- Source: the user: "Build a cache on startup."
+- Verified by: `if_mount`.
 
 #### ALFS-IF-17
 
@@ -1069,7 +1128,7 @@ the next page of the list.
 
 #### ALFS-OBS-01
 
-alfs reports the area's live, free and dead pages, the catalog's entries
+alfs reports the area's live, free and dead pages, the cache's records
 used and its capacity, and its counts of programs, erases, failed
 programs, failed erases, failed checks and bytes lost. The report reads
 every page header, and counts no failure of its own.
@@ -1081,7 +1140,7 @@ every page header, and counts no failure of its own.
 #### ALFS-OBS-02
 
 Every error a call can return is documented with the state it leaves and
-what the caller should do: retry, rebuild (format), or fail.
+what the caller should do: retry, clean up, or fail.
 
 - Priority: 3.
 - Verified by: review of `alfs.h` and `alfs_fs.h`.
@@ -1103,18 +1162,18 @@ can hold a launch until all unused flash is erased.
 |---|---|
 | UC-1 flight log | SPD-01, SPD-02, SPD-06, SPD-07, LIFE-02, LIFE-03, IF-08, IF-09, IF-18 |
 | UC-2 high-rate log | SPD-02, SPD-06, LIFE-02 |
-| UC-3 restart after a reset | SPD-05, SPD-08, SAFE-04, IF-07 |
+| UC-3 restart after a reset | SPD-05, SPD-08, SAFE-04, IF-07, IF-16 |
 | UC-4 newest flights | IF-12, IF-13, IF-15, SAFE-13 |
 | UC-5 erase before flight | IF-15, LIFE-01, OBS-03 |
 | UC-6 read back | SAFE-03, SAFE-08, SAFE-15, IF-11 |
 | UC-7 power cut | SAFE-01, SAFE-02, SAFE-04, SAFE-12, IF-18 |
 | UC-8 wrong geometry | SAFE-09, IF-02 |
 | UC-9 write failures | SAFE-06, OBS-01 |
-| UC-10 unattended flash | LIFE-04, SAFE-07, SAFE-10, SAFE-16, SPD-09, OBS-01, OBS-02 |
-| UC-11 configuration | SAFE-01, SAFE-13, IF-12 |
-| UC-12 Lua programs | SAFE-01, SAFE-13, SAFE-14, IF-12 |
+| UC-10 unattended flash | LIFE-04, SAFE-07, SAFE-10, SPD-09, OBS-01, OBS-02 |
+| UC-11 configuration | SAFE-01, SAFE-13, SAFE-16, IF-12 |
+| UC-12 Lua programs | SAFE-01, SAFE-13, SAFE-14, SAFE-16, IF-12 |
 | UC-13 many tasks | out of scope until the interface settles (section 2) |
-| UC-14 allocate before flight | SPD-01, SPD-10, SAFE-11, IF-06 |
+| UC-14 allocate before flight | SPD-01, SPD-10, SAFE-11, IF-06, IF-15 |
 
 ---
 
@@ -1123,16 +1182,10 @@ can hold a launch until all unused flash is erased.
 Each is the user's to make. `experiments/v6-frames/EVALUATION.md` gives
 the reasons and the options.
 
-- **D-1. A close erases.** Each erase stalls 35 to 800 ms (4.3). A close on
-  the pad, or in flight, stalls the flight loop for every unused sector.
-- **D-2. A page that reads erased after a reboot is written as erased.** A
-  page a power loss tore that reads erased is written over; its data check
-  catches the damage, and the page is lost.
-- **D-3. The catalog is two sectors.** The user named one; one sector
-  cannot be rewritten, when its entries run out, without a moment when it
-  holds no catalog.
-- **D-4. A configuration update deletes, then writes.** Between the two,
-  the file exists under no filename; after a power loss there, it is gone.
+- **D-1. Nothing on the flash marks the area as alfs's.** An area
+  configured over something else mounts with no file, and a cleanup erases
+  what it holds. One sector holding a stamp, written by a format and never
+  erased by a cleanup, would make a mount refuse such an area.
 
 ---
 

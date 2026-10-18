@@ -1,73 +1,68 @@
 # Evaluation: files as frames of linked pages (format 6)
 
-The option the user set out on 2026-10-17, as captured in
-`docs/REQUIREMENTS.md` draft 6 and `docs/SPEC.md` format 6, weighed against
-the brief's priorities: speed, then flash life, then safety, with
-simplicity as the means. There is no code, so every figure here is computed
-from the format, or estimated where marked. The option it is set against is
-`experiment/v5-rows`, whose figures are measured.
+The option the user set out on 2026-10-17, as built: `docs/REQUIREMENTS.md`
+draft 6, `docs/SPEC.md` format 6, `alfs_fs.c`. Figures marked measured come
+from the simulator or the Cortex-M0+ build; the rest are computed from the
+format, or estimated where marked. The option it is set against is
+`experiment/v5-rows`, measured the same way.
 
 ---
 
 ## 1. Bottom line
 
-- **Speed:** as good as any option so far. In flight a write is one program
-  per page, about 0.4 ms, and nothing erases in a file allocated before
-  flight. Reopening a log after a reset reads a header and a byte count per
-  page, about 45 KB for a 10-minute log.
-- **Flash life:** 236 data bytes in a 256-byte page. A 10-minute log fills
-  175 sectors, against 189 for the rows option: about 7% fewer erases.
-  Flushing costs a page per flush, so the application sets durability
-  against wear.
-- **Safety:** close to the rows option. Two places stay weaker:
-  - A damaged page cuts the rows that cross it, because rows do not align
-    with pages; the rows option loses whole rows.
-  - A configuration update deletes before it writes (D-4).
-
-  The reboot rule (D-2) is the user's choice, and its damage is detected.
-- **Simplicity:** one store for logs, configuration and Lua programs.
-  Estimated at 5.5 to 6.8 KB, against 6.6 KB measured for the rows option's
-  two stores.
-
-**Recommendation:** pursue it. Make the close leave its erases to the
-cleanup (D-1), and write a configuration file's new copy before blocking
-out the old (D-4).
+- **Speed.** In flight, a write is one program per page, about 0.4 ms, and
+  nothing erases: the cleanup is the only call that does. A mount reads
+  every page's header: about 2 µs a page on pyro's flash (estimated), 50 to
+  100 ms for an 8 MB area.
+- **Flash life.** 236 data bytes in a 256-byte page. A 10-minute flight log
+  costs 175 erases over its life (measured), against 189 for the rows
+  option.
+- **Safety.** Every power-loss sweep passes, on 100 seeds: allocation,
+  writing, reopening, closing, updating and deleting. A damaged page cuts
+  the rows that cross it, since rows do not align with pages.
+- **Simplicity.** One store for logs, configuration and Lua programs:
+  6,664 bytes (measured), against 6,642 for the rows option's two stores.
 
 ---
 
-## 2. The option in brief
+## 2. What the design settled
 
-- **Two kinds of file.**
-  - A **log** is allocated, opened, appended to, closed, read and deleted.
-    One cut short by a reset, never closed, is opened again and appended
-    to.
-  - A **configuration file**, Lua programs among them, is written whole and
-    read whole, as the web interface's GET and PUT do. Writing it again
-    makes a new file. A closed file is final; no file is edited.
-- **Two layers.**
-  - A file is a frame. Its first page carries the frame block: frame ID,
-    filename, and at close the page count and size, with their check.
-  - Every page carries a header (frame ID, position, a header check, the
-    next page's address), then its byte count, data and data check, all
-    programmed once.
-- **The catalog** maps filenames to frame IDs and first pages.
-- **Writes and syncs** program full pages. A **flush** programs a partial
-  page and the file goes on in the next. A **close** writes the close
-  fields, ends the list with a zero link, and erases the reservation's
-  unused whole sectors.
-- **A delete** zeros the filename. **A cleanup** erases the sectors that
-  hold no live page.
-- **A file is valid when its pages are.** There is no whole-file checksum;
-  a read of a closed file that met a damaged page, or a list cut short,
-  ends with `ALFS_ECHECK`.
-- **An erase is finished** when the sector reads back all 1s.
+**The user's rulings:**
+- Pages linked in a list, the list being the reservation.
+- A page's data programmed once, with a byte count; a flush leaves a
+  partial page.
+- A frame block with the filename and a version.
+- No catalog: a cache built at mount from the pages.
+- The cleanup the only eraser, an erase finished when the sector reads all
+  1s.
+- No whole-file checksum: a file is valid when its pages are.
+- Logs and whole-file configuration only: no edits, closed files final.
+- An update writes the new copy first; its close blocks out the old.
+- After a reset, the page after the file's data is skipped (0000h in its
+  byte count).
 
-**My additions, marked in the requirements:**
-- the catalog as two sectors (D-3);
-- one file per filename;
-- the order of allocation and close (SAFE-11, SAFE-12);
-- the count of the reservation at open, so that a writer without
-  `ALFS_GROW` takes only bytes it can program.
+**Mine, marked in the requirements:**
+- **Page 0 holds no file**, since its address marks a list's end.
+- **One file per filename**, or two copies during an update.
+- **Allocation order:** the pages are programmed from the last to the
+  first, and the first page's header after the rest of it, so the copy
+  exists only once whole.
+- **The open check:** the frame block's frame ID, filename and version
+  carry a check, so a filename a power loss left zeroed in part reads as
+  blocked out, not as another filename.
+- **Close order:** the close fields are written before the zero link.
+- **Bytes that must stay erased:** no program covers them, so a
+  reservation's last page is programmed without its link.
+- **A page taken by an allocation** must read erased on 16 reads of the
+  bytes an allocation programs. A header a power cut tore can read erased
+  but for one bit, and nothing records where an allocation stood before a
+  reset.
+- **Stale copies:** a copy a power cut left behind its replacement is
+  recorded stale at mount, and blocked out by the next cleanup, allocation
+  or delete.
+- **Frame IDs:** the next frame ID adds the count of torn headers to the
+  largest seen.
+- **The cleanup waits** while any file is open for reading.
 
 ---
 
@@ -78,141 +73,82 @@ out the old (D-4).
 | | Format 6 | Rows option (v5) |
 |---|---|---|
 | A write in flight | one program a full page: about 0.4 ms | one program a chunk, up to a page: about 0.4 ms |
-| A flush | one program, of the partial page | one program, of the chunk |
-| Erases in the write path | none, for a file allocated before flight | none |
-| Erases outside it | allocation (when short of free pages), close, cleanup, catalog rewrite | only when the application asks |
-| Mount | at most two sectors, 8 KB, whatever the area | 30 bytes a sector: 61 KB on an 8 MB area |
-| Open for writing | a header for each page of the list: 39 KB for the 10-minute log | none beyond the first sector |
-| Reopen after a reset | a header and a byte count for each page, and one page: about 45 KB | a new log: one sector |
+| Erases outside the cleanup | none | none outside the erase call |
+| Mount | a header a page, and each first page's frame block: 50 to 100 ms on 8 MB (estimated) | 30 bytes a sector: under 1 ms on 8 MB |
+| Open for writing | two walks of the list, a header and a byte count a page: about 84 KB for a 10-minute log | none beyond the first sector |
+| Allocation of a 10-minute log | 2,797 pages checked free on 16 reads of their first 65 bytes, twice, and 2,798 programs: about 6 MB read and 0.2 s of programs (estimated) | none: a log takes sectors as it goes |
 
-The one speed cost left in flight is **a close that erases** (D-1). If the
-flight log is closed while the flight loop runs, on the pad or in flight,
-each unused sector stalls it 35 to 800 ms.
+The slowest calls are on the ground: allocation, mount, and the cleanup's
+final lap, which reads the area once. The mount also runs after a reset in
+flight, where its time delays the first sample.
 
 ### 3.2 Flash life
 
-| On W-LOG, 10 minutes at 50 rows a second (660,000 bytes) | Format 6 | Rows option (v5) |
+| On W-LOG, 10 minutes at 50 rows a second | Format 6 | Rows option (v5) |
 |---|---|---|
 | Data in a 256-byte page | 236 bytes (92.2%) | ten 22-byte rows, 220 bytes (85.9%) |
-| Sectors the log fills, synced each second | 175 (computed) | 189 (measured) |
+| Erases over the log's life | 175 (measured) | 189 (measured) |
 | Programs into each page | two: the header at allocation, the data later | one, plus a claim per sector |
 
-- **Not aligning rows with pages is where the gain comes from.** No page
-  end goes unused, except where a flush leaves one.
-- **A flush costs the rest of a page.** At 1 row a second, flushed each
-  second, a 10-minute log takes 600 pages (38 sectors), where synced it
-  takes 57. At 50 rows a second, flushed each second, it takes about 3,000
-  pages (188 sectors), where synced it takes 2,797 (175).
-- **Unused reservation costs erases.** Each whole sector reserved and not
-  used is:
-  1. erased by a cleanup;
-  2. programmed with headers at allocation;
-  3. erased again at close, with no data ever in it.
-
-  Over-reserving a flight log by a minute costs about 17 erases a flight.
-- **Every page takes two programs per erase.** A-2 allows at least 16.
+- **A flush costs the rest of its page.** At 1 row a second, a flush each
+  second, a 10-minute log takes 600 pages instead of 57.
+- **A reopen after a reset costs a page,** the skipped one.
+- **Unused reservation costs erases.** It is erased again by the cleanup,
+  with no data ever in it.
 
 ### 3.3 Safety
 
-What holds:
-- **Allocation is atomic** (SAFE-11): the entry goes first, then the pages
-  from last to first, so the file exists once its first page is written.
-- **A close is atomic** (SAFE-12): the close fields carry their own check
-  and are written after the last data and before the zero link.
-- **What was flushed survives** any later power loss (SAFE-02). A flush
-  each second meets FLT-LOG-06.
-- **Damage is detected and reported.** Every page's data and header carry
-  checks (SAFE-03, SAFE-15). A closed file read to its end reports a
-  damaged page or a short list (SAFE-14), so a configuration file or a Lua
-  program partly lost is never taken as whole.
-- **A delete holds** (SAFE-13). The filename is zeroed in both places, so
-  neither the catalog nor the frames name the file again.
+Tested under every power-loss behaviour at every operation, on 100 seeds:
+- **Allocation** is atomic: the file exists only with every reserved page
+  in its list.
+- **A close** is atomic.
+- **An update** reads the old copy or the new one, whole; once the close
+  returns, the new.
+- **A delete** is permanent once it returns.
+- **No file appears** under a filename no one wrote.
+- **A reopen after a loss** writes nothing over a torn page, and keeps
+  every synced byte.
+- **A flushed byte** survives any later power loss.
 
 Where it differs from the rows option:
-
-| | Format 6 | Rows option (v5) |
-|---|---|---|
-| Lost at a power cut | after a flush, nothing; after a sync, under a page | nothing synced |
-| A failed or damaged page | its bytes; the rows that cross it are cut, and the application must find where rows start again | whole rows; the rows after it read in step |
-| A configuration or Lua update | delete, then write: a power cut between leaves no file (D-4) | atomic: the old object reads until the new one commits |
-| An erase cut short that reads erased | used as erased, by the user's ruling | refused: the stamp shows an erase completed |
-| A page torn so that it reads erased, after a reset | written over; its check shows damage and the page is lost (D-2) | never written again |
+- **Damaged pages and rows.** A damaged or lost page loses its bytes, and
+  the rows that cross it are cut; the rows option loses whole rows.
+- **Erase completion.** An erase cut short that reads erased counts as
+  finished, by the user's ruling. The probe found such erases (P9); the
+  rows option's stamp refused them.
+- **A torn header in a free page** is found with high probability, not
+  certainty (16 reads, each with a half chance of showing the torn bit).
+- **Nothing marks the area as alfs's** (D-1): an area configured over
+  something else mounts with no file, and a cleanup erases it.
 
 ### 3.4 Simplicity
 
-- **One store for everything.** Logs, configuration and Lua programs are
-  all files. The rows option needs a log store, an object store and an
-  application for settings.
-- **Code, estimated.** By function, from the rows option's measured parts:
+| Part | Bytes (measured) |
+|---|---|
+| mount, with its scan | 588 |
+| allocation: finding free pages and linking them | 938 |
+| opening for writing, writing, growth, syncs and flushes | 928 |
+| the end of a file's data at open | 404 |
+| close | 272 |
+| reading: opening, reading, closing | 816 |
+| listing, delete, cleanup, status | 944 |
+| the cache, headers and links, shared by the rest | 1,078 |
+| the shared flash layer | 696 |
+| **total** | **6,664** |
 
-  | Part | Estimate |
-  |---|---|
-  | catalog | 1.2 to 1.5 KB |
-  | allocation | 0.8 to 1.0 KB |
-  | writes, growth, flush and close | 1.3 to 1.6 KB |
-  | reads | 0.5 to 0.6 KB |
-  | cleanup and liveness | 0.6 to 0.9 KB |
-  | delete, list, status | 0.4 to 0.5 KB |
-  | the shared flash layer | 0.7 KB |
-  | **total** | **5.5 to 6.8 KB** |
-
-  SIMP-02's 6 KiB sits within that range.
-- **RAM:** an instance of about 80 bytes and a writer of 32, plus a page
-  each.
-- **The cost of liveness.** A cleanup must know, for every page header,
-  whether its file is live. That is a catalog search and a read of the
-  file's close fields, per file met in a sector. It is slow, but it runs
-  on the ground.
+- **No part is large:** the largest single function is the mount's, 588
+  bytes.
+- **RAM:** an instance of 84 bytes, a writer of 36 and a reader of 28, plus
+  a page each, and 12 bytes a cached file.
 
 ---
 
-## 4. The decisions still open, and their alternatives
+## 4. The decision still open
 
-**D-1. A close erases.**
-- (a) As written.
-- (b) A close only ends the list; the unused sectors are dead until a
-  cleanup, which the application runs on the ground anyway (UC-5).
-
-Recommended: (b). It removes the only erase a flight-time call makes.
-
-**D-2. A page that reads erased after a reset is erased.**
-- (a) As written: the cost is at most the page written over, which its
-  check catches.
-- (b) Skip one page past the last written one after a reset: one page a
-  reset, and nothing written over torn bits.
-
-Both are tested; (b) is the stricter.
-
-**D-3. The catalog is two sectors.** One sector cannot be rewritten when
-full without a moment holding no catalog.
-- (a) Two sectors, as captured.
-- (b) One sector, rebuilt from the frames' first pages when it fills or is
-  lost. The filename is in the frame, so this is possible; a deleted file's
-  zeroed filename keeps it out. The cost is a scan of every page header,
-  about 460 KB on an 8 MB area, at each rebuild.
-
-**D-4. A configuration update deletes, then writes.**
-- (a) As written.
-- (b) Write the new file first. Let a filename name its newest closed
-  frame, then block out the old one. The update becomes atomic, and the
-  old file reads until the new one is whole. It needs one change to IF-05:
-  a filename names one closed file, or two only while an update is under
-  way.
-
-Recommended: (b).
-
----
-
-## 5. What exists
-
-- **`docs/REQUIREMENTS.md` draft 6:** 10 speed, 5 flash-life, 16 safety,
-  5 simplicity, 18 interface and 3 observability requirements, the open
-  decisions in its section 8.
-- **`docs/SPEC.md` format 6:** every byte.
-- **`alfs_fs.h`:** the interface.
-- **`tests/test_alfs.c`:** 46 tests, one or more a requirement, with
-  power-loss sweeps over every operation of a write run, synced and
-  flushed, an allocation, a close, a delete and a catalog rewrite. They
-  compile with `-Werror` under Clang and GCC. They cannot run until
-  `alfs_fs.c` is written.
-- **Not specified:** the flash task, until this interface settles.
+**D-1. Nothing on the flash marks the area as alfs's.**
+- (a) As built: any area mounts. Its foreign contents are dead pages, and
+  the cleanup erases them. The area's configured bounds are the only
+  guard, as they are for the chip's end.
+- (b) One sector holding a stamp, written by a format and never erased by a
+  cleanup. A mount refuses an area without it, at the cost of a sector and
+  a format call.
