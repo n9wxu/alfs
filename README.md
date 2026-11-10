@@ -11,16 +11,16 @@ Priorities, in order: speed, then flash life, then safety. A corrupted data
 block is less important than a broken exec loop.
 
 **Status:** format version 6. Requirements, tests and code.
-- **Store:** 47 tests, run on 8 simulator seeds under the sanitizers
-  (`make test`) and on 100 seeds (`make soak`). 6,664 bytes of code on a
-  Cortex-M0+ (`alfs_fs.c` 5,968, `alfs_flash.c` 696); 308 bytes of stack at
+- **Store:** 49 tests, run on 8 simulator seeds under the sanitizers
+  (`make test`) and on 100 seeds (`make soak`). 6,744 bytes of code on a
+  Cortex-M0+ (`alfs_fs.c` 6,048, `alfs_flash.c` 696); 284 bytes of stack at
   most.
 - **Erases:** a 10-minute flight log (W-LOG: 22-byte rows at 50 a second,
   synced every second) costs 175 sector erases over its life, all of them
   the cleanup's.
 - **Hardware:** the flash assumptions alfs rests on are measured on the
-  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs itself runs in the
-  simulator only so far.
+  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs holds the files and
+  flight logs of pyro_fw's boards.
 - **Evaluation:** `experiments/v6-frames/EVALUATION.md`.
 
 ## How it works
@@ -56,7 +56,9 @@ file is final: alfs edits no file.
 - **Growth.** Past the reservation, a file opened with `ALFS_GROW` takes
   free pages while there are any; without it, the write stops.
 - **A close** programs the rest, the close fields and a zero link, and
-  blocks out the older copy it replaces.
+  blocks out the older copy it replaces. A new copy that lost a page to a
+  failed program replaces nothing: the close reports it and the old copy
+  stays the file.
 - **A reopen** after a reset goes on past the end of the file's data, one
   page skipped, so nothing is written over a page a power cut may have torn.
 - **A delete** zeros the filename and leaves the pages.

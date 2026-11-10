@@ -170,6 +170,8 @@ CRC-32, so a test can tell good data from bad without alfs's help.
 | `safe_file_check` | SAFE-14 | A closed file with a page's data damaged, and one with its list cut short: every good byte read, then `ALFS_ECHECK`. |
 | `safe_links_checked` | SAFE-15 | A link bent to another file's page, a free page, past the area, or the file's own start: the read ends there with the bytes before it, a failure is counted, and the other file reads whole. |
 | `safe_update_atomic` | SAFE-16 | Each behaviour, power lost at every operation of an update of a Lua program: through eight remounts it reads the old copy whole or the new one whole, and no file under another filename; once the close returns, the new one. |
+| `safe_update_prog_failure` | SAFE-16 | An update whose new copy's sector goes PROGERROR, PROGNOOP or PROGFLIP before its close: the close returns `ALFS_EPROG`; the filename reads the old copy whole, before a remount and after; the next update goes through. |
+| `safe_alloc_failure_keeps_open_copy` | SAFE-11 | A log not closed, and every other sector PROGERROR: an allocation under its filename returns `ALFS_EPROG`, and the log reads as it was, before a remount and after. |
 | `obs_status` | OBS-01 | Live, free and dead pages, cache records and counts against the simulator's, after files are written and one deleted, and after a remount. |
 | `obs_clean` | OBS-03 | Not clean after a first mount of a used chip and after a delete; clean after a cleanup, a file filling its reservation, and a remount. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |

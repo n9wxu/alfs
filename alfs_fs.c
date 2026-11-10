@@ -28,6 +28,8 @@
 
 enum { F_CLOSED = 1, F_WRITER = 2, F_STALE = 4, F_MOUNTED = 8, F_READER = 16 };
 
+#define W_LOST 0x80u /* in a writer's flags: a page of its data failed to program */
+
 /* A record's readers count in its flags' high bits; a writer or a reader
  * makes a copy busy. */
 #define READERS(r) ((uint32_t)(r)->flags >> 4)
@@ -435,12 +437,13 @@ int alfs_file_alloc(alfs_fs_t *fs, const char *name, uint32_t bytes, uint32_t *i
     uint8_t v = (uint8_t)((c ? c->version : 0u) + 1u);
     if (o && newer(o->version, (uint8_t)(v - 1u)))
         v = (uint8_t)(o->version + 1u);
-    /* the copy not closed and the stale ones give way, and their records */
-    if ((rc = block_others(fs, nm, n, c, true)) != 0)
-        return rc;
     alfs_rec_t *rec = free_rec(fs);
-    if (!rec)
-        return ALFS_ENOSPC;
+    if (!rec) { /* a record only the copy not closed, or a stale one, can give */
+        if ((rc = block_others(fs, nm, n, NULL, true)) != 0)
+            return rc;
+        if (!(rec = free_rec(fs)))
+            return ALFS_ENOSPC;
+    }
     uint32_t first = 0, fid = 0;
     for (uint32_t t = 0; t < TRIES; t++) {
         fid = fs->next_id++;
@@ -461,6 +464,8 @@ int alfs_file_alloc(alfs_fs_t *fs, const char *name, uint32_t bytes, uint32_t *i
     rec->version = v;
     rec->flags = 0;
     *id = fid;
+    /* the copy not closed and the stale ones give way, now that this one stands */
+    block_others(fs, nm, n, rec, true);
     return ALFS_OK;
 }
 
@@ -563,7 +568,7 @@ int alfs_file_open(alfs_fs_t *fs, alfs_file_t *f, const char *name, unsigned fla
     f->block = block;
     f->cap = (uint16_t)size;
     f->id = o->id;
-    f->flags = (uint8_t)flags;
+    f->flags = (uint8_t)(flags & ALFS_GROW);
     f->open = 1;
     o->flags |= F_WRITER;
     fs->writers++;
@@ -610,8 +615,10 @@ static void put_page(alfs_fs_t *fs, alfs_file_t *f, uint32_t n) {
     alfs_put16(b, n);
     memcpy(b + 2, f->block, n);
     alfs_put32(b + 2 + n, page_check(f->id, f->count, f->block, n));
-    if (alfs_prog(&fs->d, paddr(fs, f->page) + data_at(f->count), b, 2u + n + CHK))
+    if (alfs_prog(&fs->d, paddr(fs, f->page) + data_at(f->count), b, 2u + n + CHK)) {
         fs->d.n.bytes_lost += n;
+        f->flags |= W_LOST;
+    }
 }
 
 /* Programs the block's complete pages; with all, the rest as a partial
@@ -687,22 +694,29 @@ int alfs_file_close(alfs_fs_t *fs, alfs_file_t *f) {
         return rc;
     uint8_t *b = fs->d.scratch, z[4] = {0, 0, 0, 0};
     uint32_t pages = f->count ? f->count : 1u;
-    if (alfs_read(&fs->d, paddr(fs, f->first) + HDR, b, FB_CLOSE))
+    alfs_rec_t *c, *o;
+    if (alfs_read(&fs->d, paddr(fs, f->first) + HDR, b, FB_CLOSE) ||
+        pick(fs, b + FB_NAME, fb_name_len(b + FB_NAME), &c, &o))
         return ALFS_EIO;
-    alfs_put16(b + FB_CLOSE, pages);
-    alfs_put32(b + FB_CLOSE + 2, f->size);
-    alfs_put32(b + FB_CHECKED, ~alfs_crc(ALFS_CRC_INIT, b, FB_CHECKED));
-    alfs_prog(&fs->d, paddr(fs, f->first) + HDR + FB_CLOSE, b + FB_CLOSE, FB - FB_CLOSE);
-    alfs_prog(&fs->d, paddr(fs, f->prev != NONE ? f->prev : f->first) + O_NEXT, z, 4);
-    /* the older copy gives way (SAFE-16) */
-    uint8_t nm[NAME_LEN];
-    if (!alfs_read(&fs->d, paddr(fs, f->first) + HDR + FB_NAME, nm, NAME_LEN))
-        block_others(fs, nm, fb_name_len(nm), r, false);
-    r->flags = (uint8_t)((r->flags & ~(F_WRITER | F_MOUNTED)) | F_CLOSED);
-    r->pages = (uint16_t)pages;
+    /* a copy that lost a page replaces no other (SAFE-16) */
+    rc = c && (f->flags & W_LOST) ? ALFS_EPROG : ALFS_OK;
+    if (!rc) {
+        alfs_put16(b + FB_CLOSE, pages);
+        alfs_put32(b + FB_CLOSE + 2, f->size);
+        alfs_put32(b + FB_CHECKED, ~alfs_crc(ALFS_CRC_INIT, b, FB_CHECKED));
+        rc = alfs_prog(&fs->d, paddr(fs, f->first) + HDR + FB_CLOSE, b + FB_CLOSE, FB - FB_CLOSE);
+    }
+    r->flags &= (uint8_t)~F_WRITER;
+    if (!rc) {
+        /* the page count bounds a closed list: the zero link goes unchecked */
+        alfs_prog(&fs->d, paddr(fs, f->prev != NONE ? f->prev : f->first) + O_NEXT, z, 4);
+        block_others(fs, b + FB_NAME, fb_name_len(b + FB_NAME), r, false);
+        r->flags |= F_CLOSED;
+        r->pages = (uint16_t)pages;
+    }
     f->open = 0;
     fs->writers--;
-    return ALFS_OK;
+    return rc;
 }
 
 /* ---- reading -------------------------------------------------------- */

@@ -93,7 +93,9 @@ typedef struct alfs_file_info {
 } alfs_file_info_t;
 
 /* alfs_file_open's flags. */
-#define ALFS_GROW 1u /* writes past the reservation take free pages */
+/* Writes past the reservation take free pages. A file whose last link a
+ * power loss tore grows no more: ALFS_ENOSPC. */
+#define ALFS_GROW 1u
 
 typedef struct alfs_fs_status {
     uint32_t pages;               /* pages that can hold a file */
@@ -109,7 +111,8 @@ typedef struct alfs_fs_status {
  * Mounts the area: reads every page's header, and the frame block of each
  * file's first page, and builds the cache in `cache`, n records, the
  * instance's from now on, with `scratch`, one page. Writes nothing. An area
- * holding anything else mounts with no file. ALFS_ENOSPC: more files than n.
+ * holding anything else mounts with no file. ALFS_ENOSPC: more copies on the
+ * flash than n, a file under update counting twice; no file is mounted.
  * ALFS_EOPEN: a file is open. ALFS_EGEOMETRY, ALFS_EINVAL: nothing read.
  * ALFS_EIO: retry.
  */
@@ -120,9 +123,10 @@ int alfs_fs_mount(alfs_fs_t *fs, const alfs_area_t *cfg, const alfs_driver_t *dr
  * Reserves a copy of `bytes` under filename name, links its pages, and
  * returns its frame ID in *id. A filename that names a closed file gets a
  * new copy, which replaces it when closed; a copy not closed is blocked
- * out. ALFS_ENOSPC: fewer free pages than the reservation needs, or no free
- * record; nothing written: clean up, then retry. ALFS_EINVAL; ALFS_EOPEN: the
- * file is open; ALFS_EPROG, ALFS_EIO: nothing reserved.
+ * out once the new one is reserved. ALFS_ENOSPC: fewer free pages than the
+ * reservation needs, or no free record; clean up, then retry. ALFS_EINVAL;
+ * ALFS_EOPEN: the file is open; ALFS_EPROG, ALFS_EIO: nothing reserved. With
+ * a free record in the cache, a call that fails leaves every copy as it was.
  */
 int alfs_file_alloc(alfs_fs_t *fs, const char *name, uint32_t bytes, uint32_t *id);
 
@@ -159,7 +163,11 @@ int alfs_file_flush(alfs_fs_t *fs, alfs_file_t *f);
  * Programs the rest as a partial page, the close fields and the zero link,
  * blocks out the older copy, and releases the writer; the file is final.
  * When the program of the rest fails for want of a page it stays open:
- * ALFS_ENOSPC. ALFS_EINVAL, ALFS_EIO.
+ * ALFS_ENOSPC. ALFS_EIO: it stays open; retry. ALFS_EPROG: the writer is
+ * released and the copy is not closed, because its close fields failed to
+ * program, or because a page of its data did and the filename has a closed
+ * copy; that copy, if any, stays the file. A log that lost a page closes:
+ * ALFS_OK, and its loss is in bytes_lost. ALFS_EINVAL.
  */
 int alfs_file_close(alfs_fs_t *fs, alfs_file_t *f);
 

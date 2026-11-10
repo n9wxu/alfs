@@ -89,6 +89,12 @@ a copy newer than it that is not closed: up to the page count if the copy
 is closed, to the list's end if not. A page in no such list that is not
 free is **dead**.
 
+The cleanup and the status tell a live page by its header alone: of a
+closed copy, a page with its frame ID and a page count below the copy's; of
+a copy not closed, any page with its frame ID. A page a growth programmed
+and a power loss left unlinked therefore counts live until its copy is
+deleted.
+
 ---
 
 ## 3. Mounting
@@ -99,7 +105,7 @@ that is live: its frame ID, first page, version, page count, whether it is
 closed, and a hash of its filename. It writes nothing.
 
 The next frame ID is two more than the largest frame ID in a valid header,
-and three more when a header reads neither erased nor valid.
+and one more again for each header that reads neither erased nor valid.
 
 ---
 
@@ -114,7 +120,9 @@ page's link left erased. On the first page, the frame block, with the next
 frame ID and a version one more than the filename's newest copy, and the
 link are programmed first, and the header last: a copy exists only once
 every page of it is on the flash. A copy of the filename that is not closed
-is then blocked out (section 6).
+is then blocked out (section 6); an allocation that fails leaves it as it
+was. Only with no free record in the cache is it blocked out first, for its
+record.
 
 A writer's block holds the data not yet programmed. Each complete page of
 it, when the block is full or at a sync, is programmed into the next page of
@@ -128,11 +136,19 @@ list hold, counted at open from the links.
 **Past the reservation**, a writer opened with `ALFS_GROW` takes the next
 page from the free pages, forward from where the last search stopped: its
 header is programmed, then the link to it in the page before. Without the
-flag, or with no free page, the write returns `ALFS_ENOSPC`.
+flag, or with no free page, the write returns `ALFS_ENOSPC`. So does a
+growth from a last page whose link does not read erased: a power loss
+during a link's program ends that file's growth, and it is read as it is.
 
 **A close** programs the block's rest into the next page, partial; then
 the close fields; then 00h into the last page's link; then blocks out every
-older copy of the filename (section 6).
+older copy of the filename (section 6). Each program is read back. When the
+close fields fail, the copy stays not closed and no copy is blocked out.
+When a page of the copy's data failed, since its open, and the filename has
+a closed copy, the close fields are not programmed: a copy that lost data
+replaces no other. With no closed copy to keep, as for a log, the copy is
+closed with its loss, which a read reports (section 5). The zero link is
+not checked: a closed copy's page count bounds its list.
 
 **Opening** a copy not closed for writing finds the page after the last
 page of its list holding data; a page whose program failed reads erased,

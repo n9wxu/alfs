@@ -770,7 +770,8 @@ of another frame.
 #### ALFS-SAFE-11
 
 An allocation is atomic: after a power loss during it, the filename names
-no new copy, or a copy whose every reserved page is in its list.
+no new copy, or a copy whose every reserved page is in its list. An
+allocation that fails for a program leaves a copy not closed as it was.
 
 - Priority: 3.
 - Source: UC-14. The pages are programmed from the last to the first, and
@@ -780,7 +781,7 @@ no new copy, or a copy whose every reserved page is in its list.
   behaviour; remount eight times; open, write, close, read.
 - Pass: as stated, the frame ID never given to another file, and no file
   under another filename. Fail: otherwise.
-- Verified by: `safe_alloc_atomic`.
+- Verified by: `safe_alloc_atomic`, `safe_alloc_failure_keeps_open_copy`.
 
 #### ALFS-SAFE-12
 
@@ -849,7 +850,9 @@ otherwise the list ends there, and the failure is counted.
 An update is atomic: a new copy of a filename is read only once it is
 closed, and its close blocks out the copy it replaces. After a power loss
 at any point of an update, the filename reads the old copy whole or the new
-copy whole; once the close returns, the new one.
+copy whole; once the close returns `ALFS_OK`, the new one. A program that
+fails during an update leaves the old copy the file: the close returns
+`ALFS_EPROG` and blocks nothing out.
 
 - Priority: 3.
 - Source: the user: "Writing the new configuration first and then erasing
@@ -857,11 +860,12 @@ copy whole; once the close returns, the new one.
   fix this. 8-bit would be enough. The version id can wrap. so wrap
   detection is needed." UC-11, UC-12.
 - Measure: power lost at every operation of an update, under every
-  behaviour; eight remounts reading the file; and 300 updates in a row,
-  wrapping the version.
+  behaviour; eight remounts reading the file; 300 updates in a row,
+  wrapping the version; and the new copy's sector gone PROGERROR, PROGNOOP
+  and PROGFLIP before the close.
 - Pass: as stated, and no file under another filename. Fail: a file
   missing, mixed, an older copy read, or a file under another filename.
-- Verified by: `safe_update_atomic`, `if_update`.
+- Verified by: `safe_update_atomic`, `safe_update_prog_failure`, `if_update`.
 
 ### 6.4 Simplicity (SIMP)
 
@@ -882,9 +886,8 @@ The store is at most 6.625 KiB on a Cortex-M0+ (Thumb, `-Os`).
 
 - Priority: S.
 - Source: the brief. Built with Arm GNU Toolchain 13.2.Rel1 it measures
-  6,664 bytes (`alfs_fs.o` 5,968, `alfs_flash.o` 696). The budget is the
-  measurement plus about 1.5%, rounded up to a multiple of 128 bytes, so
-  that Arm GNU 14.2 builds (6,680 bytes) fit too.
+  6,744 bytes (`alfs_fs.o` 6,048, `alfs_flash.o` 696), and with Arm GNU
+  14.2, 6,764 bytes. The budget is a multiple of 128 bytes that holds both.
 - Verified by: `make target`.
 
 #### ALFS-SIMP-03
@@ -904,7 +907,7 @@ most 40 bytes and its block, of at least one page.
 No call uses more than 320 bytes of stack, the driver's own frames apart.
 
 - Priority: S.
-- Source: pyro's smallest task stack is 2 kB. Measured: 308 bytes under
+- Source: pyro's smallest task stack is 2 kB. Measured: 284 bytes under
   `alfs_file_close`.
 - Verified by: `make target`.
 

@@ -2185,6 +2185,63 @@ static void safe_links_checked(void) {
     }
 }
 
+/* An allocation that fails leaves the copy not closed as it was. */
+static void safe_alloc_failure_keeps_open_copy(void) {
+    rig_t r;
+    rig_open(&r, 16);
+    CHECK_EQ(setup(&r), 0);
+    static uint8_t a[400];
+    fill(a, sizeof(a), 7);
+    alfs_file_t f;
+    CHECK_EQ(falloc(&r, "log", D0 + (PPS - 2) * D, NULL), 0); /* the first sector, whole */
+    CHECK_EQ(fopenw(&r, &f, "log", 0), 0);
+    CHECK_EQ(put(&r, &f, a, sizeof(a), NULL), 0);
+    CHECK_EQ(fflushw(&r, &f), 0);
+    CHECK_EQ(remount(&r), 0); /* a reset: no writer holds it */
+    for (uint32_t k = 1; k < 16; k++)
+        sim_mkbad(&r.sim, r.cfg.start / SECTOR + k, BAD_PROGERROR);
+    CHECK_EQ(falloc(&r, "log", 100, NULL), ALFS_EPROG);
+    CHECK(reads_as(&r, "log", a, sizeof(a)));
+    CHECK_EQ(remount(&r), 0);
+    CHECK(reads_as(&r, "log", a, sizeof(a)));
+    rig_close(&r);
+}
+
+/* A program that fails at the close of an update. */
+static void safe_update_prog_failure(void) {
+    static const sim_bad_t modes[] = {BAD_PROGERROR, BAD_PROGNOOP, BAD_PROGFLIP};
+    for (int m = 0; m < 3; m++) {
+        rig_t r;
+        rig_open(&r, 16);
+        CHECK_EQ(setup(&r), 0);
+        static uint8_t a[150], b[150], rest[3600];
+        fill(a, sizeof(a), 1);
+        fill(b, sizeof(b), 2);
+        fill(rest, sizeof(rest), 3);
+        CHECK_EQ(write_file(&r, "cfg", a, sizeof(a), sizeof(a)), 0);
+        CHECK_EQ(write_file(&r, "rest", rest, sizeof(rest), sizeof(rest)), 0); /* fills the old copy's sector */
+        static uint8_t blk[PAGE];
+        alfs_file_t f;
+        CHECK_EQ(falloc(&r, "cfg", sizeof(b), NULL), 0);
+        CHECK_EQ((int)CALL(&r, alfs_file_open(&r.fs, &f, "cfg", 0, blk, sizeof(blk))), 0);
+        CHECK_EQ(put(&r, &f, b, sizeof(b), NULL), 0);
+        uint32_t sec = f.first / PPS;
+        CHECK(sec != 0);
+        sim_mkbad(&r.sim, r.cfg.start / SECTOR + sec, modes[m]); /* the new copy's sector */
+        int rc = fclosew(&r, &f);
+        sim_mkbad(&r.sim, r.cfg.start / SECTOR + sec, BAD_NONE);
+        CHECK_EQ(rc, ALFS_EPROG);
+        CHECK(reads_as(&r, "cfg", a, sizeof(a))); /* before a remount too */
+        CHECK_EQ(remount(&r), 0);
+        CHECK(reads_as(&r, "cfg", a, sizeof(a)));
+        /* the writer is released: the next update goes through */
+        CHECK_EQ(write_file(&r, "cfg", b, sizeof(b), sizeof(b)), 0);
+        CHECK(reads_as(&r, "cfg", b, sizeof(b)));
+        DONE(&r);
+        rig_close(&r);
+    }
+}
+
 static void safe_update_atomic(void) {
     for (int pl = 0; pl < PL_COUNT; pl++)
         for (int64_t k = 0;; k++) {
@@ -2333,6 +2390,8 @@ int main(int argc, char **argv) {
         {"safe_file_check", safe_file_check},
         {"safe_links_checked", safe_links_checked},
         {"safe_update_atomic", safe_update_atomic},
+        {"safe_update_prog_failure", safe_update_prog_failure},
+        {"safe_alloc_failure_keeps_open_copy", safe_alloc_failure_keeps_open_copy},
         {"obs_status", obs_status},
         {"obs_clean", obs_clean},
         {"simp_ram", simp_ram},
