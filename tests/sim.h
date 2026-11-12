@@ -54,7 +54,7 @@ typedef enum {
 
 typedef struct sim {
     /* geometry */
-    uint32_t chip_size, sector_size, page_size, large_size;
+    uint32_t chip_size, sector_size, page_size;
     uint8_t erase_value;
 
     /* state */
@@ -90,7 +90,7 @@ typedef struct sim {
     bool cut_prog;
 
     /* totals */
-    uint64_t ops, programs, erases, large_erases;
+    uint64_t ops, programs, erases;
     uint64_t bytes_read, bytes_programmed;
     uint64_t time_us;
     unsigned max_page_progs;
@@ -108,10 +108,9 @@ typedef struct sim {
 /* Typical times (docs/datasheets/README.md, W25Q128JV). */
 #define SIM_T_PROG_US 400u
 #define SIM_T_ERASE_US 45000u
-#define SIM_T_LARGE_US 150000u
 
-void sim_init(sim_t *s, uint32_t chip_size, uint32_t sector_size, uint32_t page_size,
-              uint32_t large_size, uint8_t erase_value, uint32_t seed);
+void sim_init(sim_t *s, uint32_t chip_size, uint32_t sector_size, uint32_t page_size, uint8_t erase_value,
+              uint32_t seed);
 void sim_free(sim_t *s);
 alfs_driver_t sim_driver(sim_t *s);
 

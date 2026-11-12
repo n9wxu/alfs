@@ -1,300 +1,192 @@
-# alfs on-disk format, version 3
+# alfs on-disk format, version 6
 
 Every byte alfs writes, and how it reads them back. Little-endian
 throughout; every check is CRC-32 (reflected, polynomial 0xEDB88320,
-initial value and final XOR 0xFFFFFFFF: the CRC of zlib and Ethernet).
+initial value and final XOR 0xFFFFFFFF: the CRC of zlib and Ethernet). S
+is the sector size and P the page size, both from the configuration. The
+erase value is 0xFF; "erased" means every byte reads 0xFF.
 
-Terms are those of `docs/REQUIREMENTS.md` section 4.1. S is the sector
-size, P the page size. "Erased" means every byte equals the configured
-erase value E; "zero" means every byte equals its complement, ~E. The
-prog unit is one byte (requirements A-8, A-9).
-
-A stamp is valid only with version 3 (section 1.1), so a region whose
-stamps carry another format version holds no valid stamp, and a mount of
-it returns `ALFS_ENOFS`.
+Pages are numbered from the area's start: page n lies at byte n × P of the
+area. That number is a page's **address**. Page 0 holds no file: its
+address marks a file's last page. Every other page can belong to a file.
+Nothing else is on the flash: no catalog, no stamp. A mount finds the files
+by reading every page's header.
 
 ---
 
-## 1. A sector
+## 1. A page
 
 | Offset | Size | Field | Written |
 |---|---|---|---|
-| 0 | 26 | stamp | by an erase, after the erase and a check that every byte is erased |
-| 26 | 1 | dead mark | by `alfs_delete`, in a file's first sector only |
-| 27 | 16 | claim | by the file that takes the sector |
-| D = 43 | | chunks | in a sector that is not a file's first |
+| 0 | 4 | frame ID | at allocation, or when a write takes the page past the reservation |
+| 4 | 2 | page count: the page's position in its file, from 0 | as the frame ID |
+| 6 | 4 | header check: CRC of bytes 0 to 5 | as the frame ID |
+| 10 | 4 | next page: FFFFFFFFh none yet, 0 the file's last page, else an address | at allocation; by a write past the reservation; 0 by a close |
+| 14 | | the frame block, on a file's first page | section 1.1 |
+| H | 2 | byte count: n | with the data, in one program |
+| H + 2 | n | data | with the byte count |
+| H + 2 + n | 4 | data check: CRC of the frame ID, the page count, the byte count and the data | with the byte count |
 
-A file's first sector has more in its first page, and its chunks start at
-its second:
+H is 14, or 65 on a file's first page. A page holds at most D = P − 20
+bytes of data, or P − 71 on a file's first page: 236 and 185 on 256-byte
+pages. A page holds D bytes when a write or a sync programs it, and fewer
+when a flush or a close leaves it partial; its data is programmed once.
+
+The byte count reads:
+- **FFFFh:** the page holds no data yet.
+- **0:** the page was skipped after a reset (section 4); it holds no data,
+  and a reader goes on to the next page.
+- **1 to D:** the page holds that much data.
+
+A page's header is **valid** when its header check is right. A page is
+**free** when it reads erased, every byte. Before an allocation or a
+growth takes a page, its first 65 bytes, all an allocation programs, must
+read erased on 16 reads: a header a power loss cut early can read erased
+but for a bit that reads either way.
+
+No program covers a byte that must stay erased: a reservation's last page
+is programmed without its link.
+
+### 1.1 The frame block
 
 | Offset | Size | Field | Written |
 |---|---|---|---|
-| 43 | 32 | name | by `alfs_create`, in one program with the stamp, dead mark and claim |
-| 75 | 4 | name check | the same program |
-| 79 | 8 | close record | by `alfs_close` |
-| P | | chunks | by writes and syncs |
+| 0 | 4 | frame ID | at allocation |
+| 4 | 32 | filename: 1 to 31 bytes, none 00h, then 00h to fill | at allocation; 00h when deleted or replaced |
+| 36 | 1 | version | at allocation |
+| 37 | 4 | open check: CRC of bytes 0 to 36 | at allocation |
+| 41 | 2 | page count: the pages of the file | by a close |
+| 43 | 4 | size: the byte counts' sum | by a close |
+| 47 | 4 | close check: CRC of bytes 0 to 46 | by a close |
 
-P must be at least 128 bytes and S at least four pages (`ALFS_EGEOMETRY`
-otherwise).
+The first 41 bytes are programmed together, with the page's link, before
+the page's header (section 4). The last 10, the **close fields**, are
+programmed together. A file is **closed** when its close check is right; a
+closed file is final.
 
-### 1.1 The stamp
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | magic, "alfs" |
-| 4 | 1 | version, 3 |
-| 5 | 1 | log2 S |
-| 6 | 1 | log2 P |
-| 7 | 1 | 0 |
-| 8 | 2 | sectors in the region |
-| 10 | 4 | generation: the format that wrote it |
-| 14 | 4 | erase count: this sector's erases, this one included |
-| 18 | 4 | sequence floor: the next sequence when the stamp was written |
-| 22 | 4 | CRC of bytes 0 to 21 |
-
-A stamp is **valid** when its magic, version and CRC are right. It
-**matches** when its geometry (bytes 5 to 9) equals the configuration. A
-stamp that is valid but does not match makes a mount fail with
-`ALFS_EGEOMETRY`, unless a matching one exists.
-
-The **current generation** is the largest generation among the matching
-stamps. `alfs_format` writes one greater than any it finds.
-
-The **erase count** written is the sector's previous stamp's count plus one
-when that stamp was valid. Otherwise, after a power loss between an erase
-and its stamp, or on a chip alfs never formatted, it is the largest count
-known in the region, or 1 if none is. A large erase stamps each of its
-sectors with one more than the largest valid count among them.
-
-The **next sequence** at mount is two more than the largest of every valid
-claim's sequence and every valid stamp's floor, and three more when the
-mount finds a torn claim.
-- **Why:** a power loss can tear a claim so that it reads invalid at one
-  mount and valid at a later one. Its sequence must never be given again.
-- **The bound:** a torn claim's sequence is at most two more than the
-  largest known. Either it is the first sequence its mount gave, two more
-  than the largest then, or it follows a claim that is still valid. The
-  floors keep the largest sequence known after its sector is erased.
-- **So** three more than the largest known is past any sequence a torn
-  claim holds. Two more is not: a create torn straight after a mount holds
-  exactly two more than the largest that mount knew, which is also the
-  largest the next mount knows.
-
-### 1.2 The dead mark
-
-Erased: the file whose first sector this is lives. Any other value: the
-file is deleted. alfs writes ~E, in one program, so a delete is atomic. Only a
-file's first sector's mark is read.
-
-### 1.3 The claim
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | identity: the sequence of the file's first claim, and its version |
-| 4 | 4 | sequence: unique in the region, growing, never reused |
-| 8 | 2 | the file's first sector, an index into the region |
-| 10 | 2 | sector number: 0 in the file's first sector, one more in each next |
-| 12 | 4 | CRC of bytes 0 to 11 |
-
-A sector k is a file's **first** when its claim is valid, its sequence
-equals its identity, its first sector is k, and its sector number is 0.
-
-### 1.4 The name
-
-The name's 1 to 31 bytes, none 00h, then 00h to fill 32 bytes. The **name
-check** is the CRC of the claim's identity (4 bytes, little-endian) and the
-32 name bytes.
-
-A first sector whose name check is wrong, or whose name bytes break the
-rule, holds a **nameless** file: a create a power loss tore (requirements
-SAFE-13). It lists with an empty name and is deleted by its version.
-
-### 1.5 The close record
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | size: the bytes written to the file |
-| 4 | 4 | CRC of the claim's identity (4 bytes) and the size |
-
-Erased, or with a wrong CRC: the file is **unclosed**. With a right CRC it
-is **closed**, and its size is known.
-
-A file's first page holds no data. It takes the stamp, the create, the
-close record and the dead mark, and in each mount at most once each the
-dead mark again (section 6) and the close record again (section 5).
-
-### 1.6 A chunk
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 2 | length of the payload, 1 or more |
-| 2 | 4 | CRC of the two length bytes and the payload |
-| 6 | length | payload |
-
-A chunk never crosses a page. A sector's first chunk starts at D, or at P
-in a file's first sector; each later chunk at the end of the one before,
-or at the start of a later page.
+The reserved size is not recorded: the list is the reservation, and its end
+is the page whose link is erased.
 
 ---
 
-## 2. What a sector is
+## 2. What a file is
 
-Decided from at most 60 bytes: the stamp, the dead mark and the claim, and
-for a sector that is not its file's first, the first sector's dead mark
-and claim.
+A **copy** of a file is a page with a valid header and page count 0 whose
+frame block has the same frame ID, a right open check, and a filename.
 
-| State | When |
-|---|---|
-| **ready** | the stamp matches, has the current generation, and the dead mark and the claim are erased |
-| **live** | the stamp matches, has the current generation, the claim is valid, and the file's first sector has a valid first claim with the same identity and an erased dead mark |
-| **dirty** | anything else: no valid stamp, an old generation, a claim neither erased nor valid (**torn**), a zero claim, a deleted or vanished file, or anything not alfs's |
-| **bad** | an erase or the check after it failed, during this mount; kept in RAM, at most eight |
+**Versions.** Two copies may share a filename while an update is under
+way. Copy A is newer than copy B when the version of A less the version of
+B, taken as a signed 8-bit number, is above 0. A filename names its newest
+closed copy, or, with none closed, its newest copy.
 
-A bit error in a claim makes its sector dirty. In a file's first sector it
-makes the whole file dirty, and the next erases reclaim it. Chunks are
-protected one by one (section 3); claims are not repaired.
+A copy's **list** starts at its first page. From each page, the next is the
+one its link names, if that page lies in the area past page 0, has a valid
+header, the same frame ID and the next page count, and has not already been
+passed. Otherwise the list ends at the page.
 
-Before a file takes a ready sector, the rest of its first page, from the
-dead mark on, is read and must be erased. Otherwise the sector is counted
-dirty and the next ready one is tried.
+A page is **live** when it is in the list of a copy a filename names, or of
+a copy newer than it that is not closed: up to the page count if the copy
+is closed, to the list's end if not. A page in no such list that is not
+free is **dead**.
 
----
-
-## 3. Reading
-
-**Finding a file.**
-- By version: the live first sector whose identity is that version. If the
-  caller also gives a name, the name must match.
-- With version 0: the closed file of that name whose identity is
-  greatest. Every live first sector's name and close record are read to
-  find it.
-
-**A sector's chunks**, from where its chunks start, at position x:
-
-1. Read the six header bytes at x.
-2. If they are erased: go to the next page start and continue. The writer
-   moves to the next page when a chunk does not fit, or when the page has
-   had its programs.
-3. If the length is 0, or the chunk would cross its page, or its CRC fails:
-   count one failed check, go to the next page start, and continue. The
-   length cannot be trusted, so nothing else in that page is either.
-4. Otherwise the chunk is good: deliver it, and continue at x + 6 + length.
-
-**A file's sectors, in order.**
-- First the file's first sector.
-- Then, repeatedly, the live sector whose claim has the same identity and
-  the next sector number. alfs finds it by scanning forward, circularly,
-  from the sector just read. Allocation moves forward, so it is usually a
-  few sectors on, and the scan stops there.
-- When no sector has the next number, the one with the smallest larger
-  number follows, and the gap counts one failed check.
-- When none has a larger number, the file ends.
-
-**Listing** visits every live first sector in growing identity. For each
-it reports the name, or none for a nameless file; the identity, as the
-version; whether it is closed; and its size if it is.
+The cleanup and the status tell a live page by its header alone: of a
+closed copy, a page with its frame ID and a page count below the copy's; of
+a copy not closed, any page with its frame ID. A page a growth programmed
+and a power loss left unlinked therefore counts live until its copy is
+deleted.
 
 ---
 
-## 4. Writing
+## 3. Mounting
 
-**Taking a sector.** alfs scans forward, circularly, from the sector after
-the one taken last, for a ready sector that passes section 2's check. With
-one exception, the fresh sector:
-- What it is: the first sector, as the mount found them, after the sector
-  of the newest valid claim of any file, wrapping round, whose stamp is
-  current and whose claim is not valid and not zero. Its claim is erased or
-  torn, however its bits happen to read.
-- Why: that is where the allocation cursor stood when the power was lost,
-  so it is the sector a torn claim program would have taken. Such a
-  program, torn at its start, leaves a sector that reads ready but holds a
-  bit that reads either way (the probe's FLICKER).
-- What alfs does: when an allocation reaches it, alfs programs zero over
-  its claim, which makes it dirty, and takes the next.
+A mount reads every page's header, and the frame block of every page that
+holds one. It builds, in a table the caller gives, a record of each copy
+that is live: its frame ID, first page, version, page count, whether it is
+closed, and a hash of its filename. It writes nothing.
 
-**Creating a file.**
-- alfs takes a sector k and gives the file the next sequence as its
-  identity.
-- One program from byte 0 writes the stamp again, with the bytes it reads;
-  the dead mark, erased; the claim (identity, identity, k, 0); the name;
-  and the name check.
-- Programming the stamp again completes one that an erase left half
-  programmed (A-9).
-- If the program fails, the sector is counted dirty, the file takes a new
-  identity (the failed sector may hold a first claim), and alfs tries the
-  next ready sector, up to the configured number of times.
-
-**The next chunk.**
-- Where it goes: straight after the last chunk, in the same page while at
-  least seven bytes are left in it and the page has had fewer than
-  `max_page_programs` programs. Otherwise it goes at the next page's start.
-- Past the sector's end, it goes in a new sector, taken as above. One
-  program from byte 0 then writes the stamp again (as read), the dead mark
-  erased, the claim (identity, next sequence, first sector, number + 1),
-  and the chunk.
-- How big it is: at most the room left in its page. A write programs the
-  block's bytes when the block is full, all but what is left after the last
-  whole page's room (requirements IF-12); a sync programs them all.
-
-**A failed program.** The file leaves the sector and programs the same
-bytes in a new sector, in the same call, up to the configured number of
-times in a row. Then the bytes are dropped and counted. A sector whose
-claim program failed is counted dirty.
-
-**Closing.** One program writes the close record: the bytes written to the
-file over its life, and the check. A close record that will not program
-cannot move, since its place is fixed: the file is released unclosed, and
-reads as one a reset cut short.
-
-**After a mount.** No file found unclosed is written again; a new version
-takes its place. The power loss that preceded the mount interrupted at most
-one program, and every byte that program touched is in the unclosed file's
-last page, a sector no file holds yet, or a stamp.
+The next frame ID is two more than the largest frame ID in a valid header,
+and one more again for each header that reads neither erased nor valid.
 
 ---
 
-## 5. Deleting
+## 4. Allocating and writing
 
-1. alfs finds the version's first sector, and refuses if any handle has it
-   open.
-2. If the file has a whole name, alfs finds the file of the same name with
-   the greatest identity above this version whose close record is not
-   erased. Names are matched by the CRC of their 32 bytes; a chance match
-   only completes another file's close record, which it was writing anyway.
-3. If there is such a file, and it has not had this already in this mount,
-   alfs programs that file's close record again (A-9). It uses the bytes it
-   reads if they are whole. Otherwise it uses the record that close was
-   writing: the bytes the file's chunks hold, since a close programs its
-   record only after its last chunk.
-4. One program writes ~E to the dead mark.
+An allocation of a filename and a size takes R free pages, enough for the
+size in the file's data (section 1), at least one, found forward,
+circularly, from where the last search stopped. With fewer than R free, it
+writes nothing. The pages are programmed from the last to the first: each
+one's header, with its page count and the next page's address, the last
+page's link left erased. On the first page, the frame block, with the next
+frame ID and a version one more than the filename's newest copy, and the
+link are programmed first, and the header last: a copy exists only once
+every page of it is on the flash. A copy of the filename that is not closed
+is then blocked out (section 6); an allocation that fails leaves it as it
+was. Only with no free record in the cache is it blocked out first, for its
+record.
 
-Step 3 means a close a power loss left half programmed cannot read unclosed
-once this version is gone. It completes any close record that is not
-erased, not only one that reads whole: the application may have seen it
-whole in a listing a moment before, and a second read can differ.
+A writer's block holds the data not yet programmed. Each complete page of
+it, when the block is full or at a sync, is programmed into the next page of
+the list, with its byte count and data check, in one program. A **flush**
+programs the rest too, as a partial page, and the file goes on in the next
+page.
+
+**Without `ALFS_GROW`** a write takes only the bytes the pages left in the
+list hold, counted at open from the links.
+
+**Past the reservation**, a writer opened with `ALFS_GROW` takes the next
+page from the free pages, forward from where the last search stopped: its
+header is programmed, then the link to it in the page before. Without the
+flag, or with no free page, the write returns `ALFS_ENOSPC`. So does a
+growth from a last page whose link does not read erased: a power loss
+during a link's program ends that file's growth, and it is read as it is.
+
+**A close** programs the block's rest into the next page, partial; then
+the close fields; then 00h into the last page's link; then blocks out every
+older copy of the filename (section 6). Each program is read back. When the
+close fields fail, the copy stays not closed and no copy is blocked out.
+When a page of the copy's data failed, since its open, and the filename has
+a closed copy, the close fields are not programmed: a copy that lost data
+replaces no other. With no closed copy to keep, as for a log, the copy is
+closed with its loss, which a read reports (section 5). The zero link is
+not checked: a closed copy's page count bounds its list.
+
+**Opening** a copy not closed for writing finds the page after the last
+page of its list holding data; a page whose program failed reads erased,
+and may come before it. After a mount, that page is skipped: 0000h is
+programmed into its byte count, and writing goes on in the next page. The
+size so far is the sum of the byte counts that are at most D.
 
 ---
 
-## 6. Erasing
+## 5. Reading
 
-Erasing happens only when the application asks, one step at a time. A
-step scans forward, circularly, from where the last one stopped, for a
-dirty sector that is not bad. With a driver that has `erase_large` and a
-whole aligned block of dirty sectors, the step takes the block.
+A file is read along its list. Each page's byte count, data and data check
+are read together. A byte count of 0 gives nothing. A byte count over D, or
+a check that fails, gives nothing, and one failure is counted; so does an
+erased byte count in a closed copy holding data. A closed copy ends at its
+page count; the read that reaches the end returns `ALFS_ECHECK` if a page
+gave nothing for a failure, or the list ended before the page count. A
+copy not closed ends at a page whose byte count reads erased, unless a
+later page of the same sector, or the first page after it, holds data; or
+at the list's end.
 
-**Before erasing,** the step reads each sector to be erased again, and
-decides from one read of its file's dead mark:
-- A sector that now reads live is left for later. A bit that reads either
-  way can make a sector read dirty when chosen and live a moment after.
-- A sector that belongs to a deleted file, and is not that file's first,
-  has the file's dead mark programmed with ~E again. That is done once per
-  file per mount. A dead mark a power loss left half programmed then cannot
-  read erased once some of its file's sectors are gone.
+---
 
-**Then** the step erases the sector or block, reads every byte back as
-erased, programs the stamp and reads the stamp back. Any failure makes the
-sector bad for the rest of the mount.
+## 6. Deleting and replacing
 
-The stamp, not the blank check, is what shows an erase completed: an erase
-aborted at a tenth of its time can already read blank
-(`docs/FLASH_PROBE.md` section 4).
+A copy is blocked out by programming 00h over its filename: its open check
+then fails, as it does for a filename a power loss left zeroed in part. A
+delete blocks out every copy of the filename. The pages are left as they are; they are
+dead once no live copy holds them, and a cleanup erases their sectors.
+
+---
+
+## 7. Cleaning up
+
+The cleanup is the only thing that erases. A step takes one sector, the
+next after the last step's, around the area: if it holds no live page and
+does not read erased, the step erases it and reads it back; the erase is
+finished when every byte reads FFh. So a step reads one sector's headers
+and its bytes, and erases one sector at most, whatever the area's size.
+Once every sector has been passed with no program since, `ALFS_CLEAN`, and
+further steps read nothing until the next program.

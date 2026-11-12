@@ -17,13 +17,12 @@ uint32_t sim_rand(sim_t *s) {
     return x;
 }
 
-void sim_init(sim_t *s, uint32_t chip_size, uint32_t sector_size, uint32_t page_size,
-              uint32_t large_size, uint8_t erase_value, uint32_t seed) {
+void sim_init(sim_t *s, uint32_t chip_size, uint32_t sector_size, uint32_t page_size, uint8_t erase_value,
+              uint32_t seed) {
     memset(s, 0, sizeof(*s));
     s->chip_size = chip_size;
     s->sector_size = sector_size;
     s->page_size = page_size;
-    s->large_size = large_size;
     s->erase_value = erase_value;
     s->mem = malloc(chip_size);
     s->meant = malloc(chip_size);
@@ -381,15 +380,7 @@ static int sim_erase(void *ctx, uint32_t addr) {
     return erase_any(s, addr, s->sector_size, SIM_T_ERASE_US);
 }
 
-static int sim_erase_large(void *ctx, uint32_t addr) {
-    sim_t *s = ctx;
-    int rc = erase_any(s, addr, s->large_size, SIM_T_LARGE_US);
-    if (rc == 0)
-        s->large_erases++;
-    return rc;
-}
-
 alfs_driver_t sim_driver(sim_t *s) {
-    alfs_driver_t d = {s, sim_read, sim_prog, sim_erase, s->large_size ? sim_erase_large : NULL};
+    alfs_driver_t d = {s, sim_read, sim_prog, sim_erase};
     return d;
 }

@@ -1,52 +1,71 @@
 # alfs
 
-The append-log flash store: a small filesystem of named, versioned files
-on serial NOR flash, built for append-only logs and for systems that run
-code from the same chip and cannot afford to stall.
+The append-log flash store: files on serial NOR flash, each a frame of
+pages linked in a list. A file's first page holds its filename; a mount
+builds a cache of the files from the pages themselves. A file's pages can
+be reserved ahead of time, so that writing it in flight programs only flash
+already erased. Built for systems that run code from the same chip and
+cannot afford to stall.
 
 Priorities, in order: speed, then flash life, then safety. A corrupted data
-block is less important than a broken exec loop. Nothing erases unless the
-application asks: every write programs flash erased ahead of time.
+block is less important than a broken exec loop.
 
-**Status:** format version 3. Requirements, tests and code.
-- **Core:** 44 tests, run on 8 simulator seeds under the sanitizers
-  (`make test`) and on 100 seeds (`make soak`). 7,101 bytes of code on a
-  Cortex-M0+.
-- **Flash task:** 7 tests on the FreeRTOS POSIX port (`make test-rt`).
-  1,153 bytes of code.
-- **Erases:** on the W-LOG workload (22-byte rows at 50 a second, synced
-  every second, for 10 minutes), 168 sector erases, all of them asked for.
+**Status:** format version 6. Requirements, tests and code.
+- **Store:** 50 tests, run on 8 simulator seeds under the sanitizers
+  (`make test`) and on 100 seeds (`make soak`). 6,772 bytes of code on a
+  Cortex-M0+ (`alfs_fs.c` 6,076, `alfs_flash.c` 696); 284 bytes of stack at
+  most.
+- **Erases:** a 10-minute flight log (W-LOG: 22-byte rows at 50 a second,
+  synced every second) costs 175 sector erases over its life, all of them
+  the cleanup's.
 - **Hardware:** the flash assumptions alfs rests on are measured on the
-  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs itself runs in the
-  simulator and on the POSIX port only; it is untested on hardware.
+  chips of pyro's boards (`docs/FLASH_PROBE.md`). alfs holds the files and
+  flight logs of pyro_fw's boards.
+- **Evaluation:** `experiments/v6-frames/EVALUATION.md`.
 
 ## How it works
 
-**The region is a ring of sectors, each describing itself.**
-- Every sector starts with a stamp, written when it is erased: its format,
-  generation, erase count and a sequence floor.
-- A sector a file takes carries a claim: the file's identity, a sequence,
-  the file's first sector, and the sector's number within the file.
-- A file's first sector also holds its name and, once it is closed, a close
-  record with its size. Its data starts on the next page.
+The application gives alfs one area of the chip. Page 0 of the area holds
+no file; every other page can.
 
-There is no directory and no index. A mount reads every sector's header
-once; a lookup by name scans the first sectors.
+**A page** starts with a header: the frame ID of its file, its position in
+the file, a check, and the next page's address (erased: no next page yet;
+zero: the file's last page). Its byte count, data and data check follow,
+programmed once, together.
 
-**Files** are created by name and written once, from their start, through a
-block of RAM the caller supplies. A write fills the block and, when it is
-full, programs it in chunks that fill their pages. A sync programs the
-rest. A close records the size.
+**A file's first page** also holds its frame block: the frame ID, the
+filename and a version, with a check; and, once the file is closed, its
+page count and size, with a check of their own.
 
-Each create gives a new version, alfs's identity for the file, which is
-never used again. Version 0 opens the newest closed version of a name.
-Deletes are by name and version. After a reset, the application starts a
-new version; the one cut short stays readable.
+**Two kinds of file.** A log is appended to, closed, read and deleted; one
+a reset cut short is opened again and appended to. A configuration file, a
+Lua program among them, is written whole and read whole; it is written
+again as a new copy, which replaces the old one when it closes. A closed
+file is final: alfs edits no file.
 
-**The flash task** (`alfs_rtos.c`) serves an instance from one FreeRTOS
-task. The application's tasks send requests and wait on them, so the core
-runs each operation as a plain loop, with nothing else touching the flash.
-A write that fits in its block never leaves the caller's task.
+**A file's life:**
+- **A mount** reads every page's header and builds the cache of files in a
+  table the application gives: about 12 bytes a file.
+- **Allocation** reserves the pages a size needs from the free pages and
+  links them, the last link left erased, the first page's header last. The
+  list is the reservation.
+- **Writes** gather bytes in a block of RAM the writer brings, and program
+  each complete page along the list. A sync programs the complete pages and
+  keeps the rest; a flush programs the rest too, as a partial page, and the
+  file goes on in the next page.
+- **Growth.** Past the reservation, a file opened with `ALFS_GROW` takes
+  free pages while there are any; without it, the write stops.
+- **A close** programs the rest, the close fields and a zero link, and
+  blocks out the older copy it replaces. A new copy that lost a page to a
+  failed program replaces nothing: the close reports it and the old copy
+  stays the file.
+- **A reopen** after a reset goes on past the end of the file's data, one
+  page skipped, so nothing is written over a page a power cut may have torn.
+- **A delete** zeros the filename and leaves the pages.
+- **The cleanup** is the only thing that erases: sector by sector, the
+  sectors that hold no live page.
+- **A file is valid** when its pages are: a read of a closed file reports a
+  damaged page or a short list at its end.
 
 ## Files
 
@@ -55,9 +74,11 @@ A write that fits in its block never leaves the caller's task.
 | `docs/REQUIREMENTS.md` | what alfs must do, each requirement testable |
 | `docs/TEST_PLAN.md` | how each requirement is tested |
 | `docs/SPEC.md` | every byte on the flash |
-| `alfs.h`, `alfs.c` | the core: no RTOS, one caller at a time |
-| `alfs_rtos.h`, `alfs_rtos.c` | the flash task, on FreeRTOS |
-| `tests/` | the simulated flash, the harness and both test suites |
+| `alfs.h` | the types the store and its driver share |
+| `alfs_fs.h`, `alfs_fs.c` | the file store |
+| `alfs_flash.h`, `alfs_flash.c` | the checked flash operations the store uses |
+| `tests/` | the simulated flash, the harness and the test suite |
+| `experiments/v6-frames/EVALUATION.md` | this option weighed against the priorities |
 | `docs/datasheets/` | the flash parts the figures come from |
 | `probe/`, `docs/FLASH_PROBE.md` | the flash probe, which measures the chips themselves, and its measurements |
 
@@ -69,21 +90,20 @@ The use cases come from the pyro flight computer
 
 | Branch | What it holds |
 |---|---|
-| `main` | format version 3 and the flash task |
+| `main` | format version 3: named, versioned files, and the flash task |
+| `experiment/v6-frames` | format version 6: files as frames of linked pages, a cache built at mount, the cleanup the only eraser |
+| `experiment/v5-rows` | format version 5: log areas of rows, the configuration area one of them, the object area, and the flash task |
+| `experiment/v4-object-store` | format version 4: a key-value configuration store, the object area, the log ring, and the flash task |
 | `experiment/format-1` | format 1: streams found by an identity and a tag, one flash operation a call; 5.3 KB |
 | `experiment/format-2` | format 2: streams with sector numbers, exact programs, and resuming a stream after a reset; 6.8 KB |
 | `experiment/v2-safety-rule-cost` | the code each of format 2's safety rules takes, measured by building format 2 without it |
 | `experiment/v3-requirement-cost` | the code each requirement takes in format 3, and which tests fail without it |
 
-Each experiment branch holds its method and results in
-`experiments/<name>/RESULTS.md`.
-
 ## Tests and releases
 
 Every push runs every test (`.github/workflows/test.yml`):
-- the core and the flash task on 8 seeds under the sanitizers, built with
-  GCC and with Clang;
-- the core on 100 seeds;
+- the store on 8 seeds under the sanitizers, built with GCC and with Clang;
+- the store on 100 seeds;
 - the Cortex-M0+ size and stack budgets, built with Arm GNU Toolchain
   13.2.Rel1, the release the budgets are set for.
 

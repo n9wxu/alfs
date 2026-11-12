@@ -1,6 +1,6 @@
 # alfs test plan
 
-**Status: draft 3.** Every requirement in `docs/REQUIREMENTS.md` names its
+**Status: draft 6.** Every requirement in `docs/REQUIREMENTS.md` names its
 test; this document says how the tests work and what each one does.
 
 ---
@@ -9,14 +9,12 @@ test; this document says how the tests work and what each one does.
 
 | Command | What |
 |---|---|
-| `make test` | the core's host suite on 8 simulator seeds, under the address and undefined-behaviour sanitizers |
+| `make tests-compile` | the tests compiled alone, against the header |
+| `make test` | the host suite on 8 simulator seeds, under the address and undefined-behaviour sanitizers |
 | `make test T=safe_` | the tests whose names contain `safe_` |
 | `make test SEEDS="7"` | on the seeds given |
-| `make soak` | the core's suite on 100 seeds, without the sanitizers |
-| `make test-rt` | the flash task's suite on the FreeRTOS POSIX port; fetches FreeRTOS-Kernel V11.3.1 into `build/_deps` the first time |
-| `make target` | the core's Cortex-M0+ budgets: code size (SIMP-02), structure sizes (SIMP-03), stack frames (SIMP-04) |
-| `make target-rt` | the task layer's code size and stack, built against the kernel's generic Cortex-M0 port |
-| `make tests-compile` | the tests compiled alone, before the code exists |
+| `make soak` | the suite on 100 seeds, without the sanitizers |
+| `make target` | the Cortex-M0+ budgets: code size (SIMP-02), structure sizes (SIMP-03), stack frames (SIMP-04) |
 | `make probe` | the flash probe, an RP2040 program that runs from RAM (section 7) |
 | `probe/run_probe.py` | runs the probe on attached boards and saves what it measured |
 
@@ -24,22 +22,17 @@ A run passes when every test passes on every seed, no sanitizer reports,
 and the target checks pass.
 
 **Seeds.** Every random choice the simulator makes comes from one seed:
-- the chip's starting contents;
-- which bit a torn operation tears;
-- what a bit that reads either way reads.
-
-One seed reaches only some of the ways a torn bit can read, so every test
-runs on several. The test binary takes its seed from `ALFS_SEED`. `make
-test` runs seeds 1 to 8 and `make soak` 1 to 100. A failure prints its
-seed, so it can be run again alone.
+the chip's starting contents, which bit a torn operation tears, and what a
+bit that reads either way reads. The test binary takes its seed from
+`ALFS_SEED`. `make test` runs seeds 1 to 8 and `make soak` 1 to 100.
 
 ---
 
 ## 2. The simulated flash (`tests/sim.c`)
 
 A serial NOR chip held in RAM, with the geometry of the W25Q128JV by
-default: 4,096-byte sectors, 256-byte pages, an optional 64 KB large erase,
-erase value 0xFF. Its contents start random, as a used chip's are.
+default: 4,096-byte sectors, 256-byte pages, erase value 0xFF. Its
+contents start random, as a used chip's are.
 
 **It enforces the rules alfs lives by.** Each break is counted as a
 violation, and every test fails on any:
@@ -47,9 +40,9 @@ violation, and every test fails on any:
 - a program that crosses a page (SPD-03);
 - a byte programmed again between erases (IF-02, the rulings), unless it is
   given the value the programs before it meant, or 00h (settling, A-9);
-- a program of a byte that an interrupted operation touched (SAFE-04),
-  with the same exception. A torn program touches only the bytes it was
-  given (A-3; in the probe's P4 no neighbouring byte changes).
+- a program of a byte that an interrupted operation touched, with the
+  same exception. A torn program touches only the bytes it was given (A-3;
+  in the probe's P4 no neighbouring byte changes).
 
 **It injects the faults of requirements section 4.4:**
 
@@ -77,155 +70,133 @@ program gives it 0 (A-9), and stays unsettled when given 1.
 - totals and per-call counts of operations, programs, erases and bytes
   read;
 - the simulated time of each operation at the typical times of
-  requirements 4.3 (0.4 ms a program, 45 ms an erase, 150 ms a large
-  erase), and the longest single operation in each call;
-- programs per page, erases per sector and programs per sector;
-- erases of a sector that held only its stamp (LIFE-01).
+  requirements 4.3 (0.4 ms a program, 45 ms an erase), and the longest
+  single operation in each call;
+- programs per page, erases per sector and programs per sector.
 
 ---
 
 ## 3. The rig (`tests/test_alfs.c`)
 
-Every alfs call goes through one of two wrappers, which hold it to the
-speed requirements as it runs:
+**The chip** holds a gap sector, the area, and another gap sector. The gaps
+hold random bytes that every test checks are unchanged at its end
+(SAFE-09).
+
+**The driver alfs gets** is the simulator's, wrapped. The wrapper records
+each program of the current call, its address and length, and counts every
+erase of a sector that already read erased (LIFE-01).
+
+**Every call goes through a wrapper,** which holds it to the requirements
+as it runs:
 
 | Wrapper | For | Holds it to |
 |---|---|---|
-| `CALL` | every call but an erase or a format | no erase (SPD-01); records the longest single operation (SPD-08) |
-| `ERASE`, `FORMAT` | `alfs_erase`, `alfs_format` | none; the erase count is the test's to check |
+| `CALL` | every call but the cleanup | no erase (SPD-01); records the longest single operation (SPD-06) |
+| `ECALL` | the cleanup | none; the erases are the test's to check |
 
-`DONE` ends every test: it fails the test on any flash violation or any
-call that broke its bound. So SPD-01, SPD-03 and IF-02 are checked by every
-test, not only the ones named for them.
+`DONE` ends every test: it fails the test on any flash violation, any call
+that broke its bound, any erase of a sector that read erased, or any
+change to a gap sector. So SPD-01, SPD-03, IF-02, LIFE-01 and SAFE-09 are
+checked by every test.
 
-The region starts one sector into the chip (one large block, where large
-erases are tested), so that no address is ever taken as an offset.
+**Byte checks** read the simulator's flash as `docs/SPEC.md` lays it out:
+the copy a filename names, found from the pages' bytes, and its list by its
+links. The rig's cache has 64 records.
 
-**Rows.** A 22-byte row carries its sequence number and a CRC-32, so a
-test can tell good data from bad without alfs's help.
+**Rows.** A W-LOG row is 22 bytes and carries its sequence number and a
+CRC-32, so a test can tell good data from bad without alfs's help.
 
 **Workloads** (requirements 4.5):
 
-- `log_run`: W-LOG. Rows at 1 or 50 a second, written every 200 ms, synced
-  every second, and an erase step every 20 ms when asked. It records every
-  byte alfs took and how many a successful sync covered.
-- W-HR: 480 bytes every 20 ms, synced every second.
-- `ring`: W-RING. W-LOG at 50 rows a second, a new version every `every`
-  rows, the oldest deleted while fewer than two logs' worth of sectors are
-  ready, an erase step every 20 ms, until every sector has been erased a
-  number of times. Run on a 32-sector region so it cycles quickly.
-- `cfg_save`: W-CFG. A 300-byte configuration, each byte a function of a
-  generation number, created as a new version of `config`, closed, and
-  then every older version deleted.
+- `log_run`: W-LOG into a file opened for writing: rows at 1 or 50 a
+  second, written every 200 ms, synced or flushed every second, and a
+  cleanup step every 20 ms when asked. It records every byte alfs took and
+  how many a successful sync or flush covered.
+- W-HR: 480 bytes every 20 ms, synced every second, into a reserved file.
+- `ring`: W-RING. A file of its own each `every` rows, the oldest deleted
+  while fewer than two files' worth of pages are free, a cleanup step every
+  20 ms; each file read back whole after its close.
+- `cfg_step`: W-CFG. Updates of a settings file and two Lua programs, each
+  a new copy that replaces the old at its close, with a cleanup first when
+  free pages run short.
 
 ---
 
-## 4. The core's tests
+## 4. The tests
 
 | Test | Requirement | What it does |
 |---|---|---|
 | `sim_torn_obeys_a9` | 4.4 | Each power-loss behaviour, 500 torn programs of random data into erased bytes and over programmed ones: no bit the data left 1 ever reads 0, on any of 16 reads. |
-| `if_geometry` | IF-02 | Formats and mounts; refuses seven bad geometries (a page under 128 bytes among them) and a bad erase value with no operation; refuses to mount with another sector or region size. |
-| `if_endian` | IF-03, SIMP-05 | Checks a stamp's, a first claim's, a name's, a close record's and a chunk's bytes against `docs/SPEC.md`: the magic, version 3, the geometry, the words little-endian, the checks. |
-| `if_names` | IF-04, IF-06 | Names of 1 and 31 bytes, and one with `/`, created, listed and opened, before and after a remount; 0 and 32 bytes, and none, refused with no operation; a name that is a prefix of another is not opened by it, nor is a version under another name. A C string cannot hold 00h, so that rule needs no test. |
-| `if_list_files` | IF-08 | Three names, two versions of one, one deleted: listed in growing version, with names, closed flags and sizes; an unclosed file's size unknown; the same after a remount. |
-| `if_version_never_reused` | IF-07 | Versions grow across names; deleting the newest version of a name and creating it again gives a new number; a create torn by FLICKER, METASTABLE or SOMEBITS, then eight remounts and a new create: no two files share a version. |
-| `if_open_version0` | IF-09 | Versions 1 to 3 of a name, the newest left unclosed: version 0 opens the second; an explicit version opens the unclosed one. |
-| `if_closed_read_only` | IF-11 | A write through a closed handle, or a read handle, is refused; there is no call that reopens a file for writing. |
-| `if_delete_open_refused` | IF-10 | Delete refused while a reader or the writer has the version open; mount and format refused while any handle is open; all allowed once closed. |
-| `if_empty_file` | IF-08, SAFE-13 | A file created and closed with no bytes lists closed with size 0 and reads 0 bytes, before and after a remount. |
-| `basic_round_trip` | IF-12 | Seven sizes, 1 byte to 20,000, with blocks of one page and of 4,096 bytes: written, read, remounted, read. |
-| `spd_no_erase_outside_erase` | SPD-01 | W-LOG at both rates, two minutes, with erase steps. |
-| `spd_write_burst_bounded` | SPD-02, IF-12 | 30 seconds of 480-byte writes (W-HR) and of 22-byte writes, with blocks of one page and of 4,096 bytes: every write, sync and close within its program bound for the bytes it programmed. |
-| `spd_enospc_without_erase` | SPD-04 | Fills the ready sectors: `ALFS_ENOSPC` with no erase, from write and sync; one erase step later the held bytes are written and read back. |
-| `spd_mount_reads_bounded` | SPD-06 | Four files on 128 sectors: a mount reads at most 60 bytes a sector and does no operation. |
-| `spd_wlog_longest_stall` | SPD-08 | Ten minutes of W-LOG at 50 rows a second: no operation longer than one program. |
-| `spd_cpu_linear` | SPD-09 | The same writes and syncs on 32 and 2,048 sectors: the same reads, and about the same processor time. |
-| `spd_read_next_bounded` | SPD-10 | Two files of 200 sectors written together on 512 sectors, and one alone: reading one of the pair reads at most one header more a sector than reading the one alone. |
-| `life_erase_only_dirty` | LIFE-01 | W-RING for three cycles: no erase of a sector that held only its stamp. |
-| `life_write_amplification` | LIFE-02 | Ten minutes of W-LOG at both rates, and W-HR, against the bound computed from the simulator's own counts. |
-| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second, deleted and erased: erases at most the sectors the log filled, plus one. Prints the count. |
-| `life_wear_level` | LIFE-04 | W-RING until every sector is erased ten times: counts within 2. |
-| `life_erase_count_persists` | LIFE-05 | W-RING, a remount: the least and greatest counts alfs reports equal the simulator's. |
-| `life_partial_program_cap` | LIFE-06 | 1,000 three-byte syncs: at most 16 programs a page, and at most 4 when configured so. |
-| `life_large_erase` | LIFE-07 | Four 64 KB blocks, all dirty but the formatted sector: three large erases and 16 sector erases. |
-| `safe_powerloss_durable` | SAFE-01 | Each behaviour, power lost at every operation of a 20-second W-LOG with erase steps. Then the rest of the case runs as below. |
-| `safe_powerloss_bound` | SAFE-02 | The same, with a second power loss after the restart in every third case. |
-| `safe_no_program_after_torn` | SAFE-04 | The same runs, for the simulator's check that nothing programs a page a power loss touched. |
-| `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a chunk: what reads back is the file with at most one run cut out, and one failure counted when one was. |
-| `safe_write_only_verified_ready` | SAFE-05 | An ERASENOOP sector is found out by its erase and never programmed. Power lost in erases is covered by the power-loss runs. |
-| `safe_prog_failure` | SAFE-06 | The sector being written goes PROGERROR, PROGNOOP or PROGFLIP: every row reads back once, none lost, in one call each. With no sector that programs: `ALFS_ELOST` after three tries, and the bytes counted. |
-| `safe_bad_sector` | SAFE-07 | ERASEERROR and ERASENOOP sectors are counted bad, found bad again after a remount, never programmed. Wear-out under W-RING: logging goes on until the flash is worn. |
-| `safe_read_retry` | SAFE-08 | Reads that fail once, in mount, open and read: each retried call gets the right bytes. |
-| `safe_foreign_region` | SAFE-09 | Random and blank regions: `ALFS_ENOFS`. Another sector size, and a region past the chip: `ALFS_EGEOMETRY`. No operation in any. |
-| `safe_fuzz_mount_read` | SAFE-10, SPD-11 | 400 images with bits flipped, headers randomised, headers copied, or everything random but one stamp: mount, list, open and read every file, create, write, close, delete one, erase until clean, under the sanitizers. |
-| `safe_delete_atomic` | SAFE-11 | Power lost in a delete, each behaviour: the version whole or gone. A delete that returned survives a remount; its sectors are dirty. |
-| `safe_delete_reclaim` | SAFE-11 | Power lost in a delete under FLICKER, remounts until it reads deleted, then power lost at every operation of the erases that reclaim it: the version whole or gone through eight remounts. |
-| `safe_missing_sector` | SAFE-12 | The third of five sectors of a file made dirty: the other four read in order, one failure counted. |
-| `safe_create_atomic` | SAFE-13 | Power lost in a create's program, each behaviour: after eight remounts, the version is absent, or empty and named as created, or nameless; a nameless one is deleted by its version. |
-| `safe_close_atomic` | SAFE-14 | Power lost in a close's program, each behaviour: through eight remounts the file reads every byte written, and lists unclosed, or closed with its true size. |
-| `safe_config_replace` | SAFE-14 | W-CFG with power lost at every operation of three saves, each behaviour. After each loss, eight remounts. Whenever a closed version existed before the loss, version 0 opens a whole configuration of a generation saved. |
-| `obs_status` | OBS-01 | Counts against the simulator's, before and after logging and a remount. |
-| `obs_clean` | OBS-03 | Not clean after a format, clean after erasing, not after a delete, clean again after erasing. |
+| `if_geometry` | IF-02 | Refuses eight bad geometries at mount, area under two sectors among them, with no operation and nothing read. |
+| `if_mount` | IF-16 | A used chip's bytes mount with no file and nothing written; the cleanup frees every page but page 0; three files read after a remount; a cache of two records fails the mount with `ALFS_ENOSPC`, with no operation. |
+| `if_endian` | IF-03, SIMP-05 | A closed 300-byte file: both pages' headers and links, the frame block, its version and close fields, each page's byte count, data and check (the second page partial, the close's), page 0 erased, against `docs/SPEC.md`. |
+| `if_names` | IF-05, IF-07 | Filenames of 1 and 31 bytes, and one with `/`, written and read, before and after a remount; 0 and 32 bytes, and none, refused with no operation; a prefix of a filename does not open it; opening a closed file for writing refused with `ALFS_EEXIST`. |
+| `if_alloc` | IF-06, SPD-10 | An allocation into free pages: one program a page and one more for the first page's frame block, no erase; R pages linked, each with no data, the last link erased, the close fields erased. An allocation needing more pages than are free: `ALFS_ENOSPC`, nothing written; after a cleanup, room. |
+| `if_write_pages` | IF-08, IF-09, SPD-02 | 50-byte writes with blocks of one page and of a sector: every program a full page's byte count, data and check; none while the block has room; after each sync, the file reads its complete pages and the block holds less than a page. |
+| `if_close` | IF-10, LIFE-05 | A 40-page reservation closed after 20, no erase: the close fields and the zero link; the unused pages kept; then the cleanup erases the sectors of unused pages that hold no live page and keeps the one that also holds live pages; the file reads, before and after a remount. |
+| `if_grow` | SPD-04, IF-08 | Without `ALFS_GROW`: the reservation's bytes taken, then `ALFS_ENOSPC`, no erase, no page taken. With it: the list grows into free pages; and, when none is left, `ALFS_ENOSPC` with no erase, the bytes taken written after a cleanup frees a sector. |
+| `if_reopen_unclosed` | IF-07, SAFE-04 | Three pages synced and 100 bytes in the block, then a remount: the reopen skips the next page (0000h in its byte count) and goes on after it; the file reads the synced pages and the new bytes. |
+| `if_flush` | IF-18, IF-11, SPD-02 | A flush of 100 bytes: one program, a partial page with its byte count; 300 more and a flush: a full page and a partial one; the file reads 400 bytes, and after a remount too; a reopen goes on in the next page; closed, it reads 450 bytes in 4 pages. |
+| `if_read` | IF-11 | Eight sizes, 0 to 20,000 bytes, written, read, remounted, read; a file not closed reads its complete pages. |
+| `if_delete` | IF-12, SAFE-13 | A delete zeros the filename in the frame block, erases nothing; the file is gone after a remount; deletes of a file open for writing or reading refused; a delete during an update blocks out both copies. |
+| `if_update` | IF-05, IF-06, IF-10, IF-12, SAFE-16 | A new copy of a closed file: the old reads until the new one closes, then the new, the old blocked out, the version one more; an update a remount cuts short: the old reads, and the next update blocks out the cut copy; 300 updates, the version wrapping, the newest read each time. |
+| `if_list` | IF-13 | Three files, one not closed: frame IDs growing, filenames, versions, closed flags, sizes and page counts, the same after a remount. |
+| `if_ids_never_reused` | IF-14 | Allocations and deletes across remounts; an allocation's header torn by FLICKER, METASTABLE and SOMEBITS, each followed by eight remounts and allocations: no frame ID twice, and no header programmed over the torn one. |
+| `if_cleanup` | IF-15, LIFE-01 | A deleted file beside a live one: cleanup erases the sectors holding no live page, keeps the shared one, reads the live file whole, then `ALFS_CLEAN` with no erase. |
+| `if_cleanup_steps` | IF-15 | Steps of one: each erases one sector at most and reads no more than a sector's headers and bytes; `ALFS_CLEAN` after as many steps as the area has sectors, then a step that reads nothing; a pass a program interrupts takes a whole pass again. |
+| `if_refusals` | IF-17 | A second open of a file and a mount refused while it is open; an allocation, a delete and a cleanup meanwhile leave it to be written on and closed whole. |
+| `spd_no_erase_outside_erase` | SPD-01 | Two minutes of W-LOG at both rates into a reserved file, a remount, a reopen and more, a close; W-CFG; reads and status: no erase in any call but the cleanup. |
+| `spd_write_programs_bounded` | SPD-02 | 30 seconds of W-HR with blocks of a page and a sector: every program a full page; none when the block did not fill; at most the complete pages held; after a sync less than a page held. |
+| `spd_mount_reads_bounded` | SPD-05 | A mount of a 128-sector area holding twenty files, some deleted: at most 14 bytes a page and 51 a frame block read, no operation. |
+| `spd_wlog_longest_stall` | SPD-06 | Ten minutes of W-LOG at 50 rows a second: no operation longer than one program. |
+| `spd_cpu_linear` | SPD-07 | The same writes and syncs into a reserved file on 34 and 2,048 sectors read the same bytes. |
+| `spd_open_reads_bounded` | SPD-08 | Files of 1, 10 and 100 pages: an open for reading reads at most a page; for writing, a page and two headers and a byte count a page; a reopen after a remount, a page more. |
+| `life_erase_only_unused` | LIFE-01 | W-RING for three cycles and W-CFG: every file read back whole after its close; no erase of a sector that read erased. |
+| `life_write_amplification` | LIFE-02 | W-LOG at both rates and W-HR into reserved files: the bytes an allocation, the writes and syncs, and the close program equal the figures of LIFE-02. |
+| `life_wlog_erases` | LIFE-03 | Ten minutes of W-LOG at 50 rows a second into a file allocated to fit; then deleted and cleaned up: the cleanup erases at most the sectors its pages fill, plus one. Prints the count. |
+| `life_wear_level` | LIFE-04 | W-RING until every frame sector is erased ten times: counts within 2. |
+| `safe_powerloss_durable` | SAFE-01 | Each behaviour, power lost at every operation of a 20-second W-LOG synced each second and its close, beside a closed settings file: through three remounts the settings file reads whole, and the log at least its synced complete pages. |
+| `safe_powerloss_bound` | SAFE-02 | The same runs flushed each second: the log reads a prefix of what was written, at least every byte flushed. |
+| `safe_reopen_after_loss` | SAFE-04 | Each behaviour, power lost at every operation of writing a file; reopened, written on, closed: what reads is the old bytes to some page's end, at least the synced complete pages, then the new bytes, whole; the simulator sees no program into a torn byte. |
+| `safe_no_false_data` | SAFE-03 | 200 trials of one bit flipped in a page's byte count, data or check: that page's bytes not returned, the rest in order, one failure counted. |
+| `safe_write_only_verified_erased` | SAFE-05 | An ERASENOOP sector is found out by the cleanup's check and never given to a file, nor programmed. |
+| `safe_prog_failure` | SAFE-06 | The sector being written goes PROGERROR, PROGNOOP or PROGFLIP: the bytes read and the bytes counted lost add up to those synced, the reader going on past the failed pages; what reads is what was written with runs cut out. A PROGERROR sector met by an allocation's headers: the file is written and read whole. |
+| `safe_bad_sector` | SAFE-07 | ERASEERROR and ERASENOOP sectors counted bad, never programmed, a file filling the rest; wear-out under W-RING: the area shrinks and writing goes on until it holds no file. |
+| `safe_read_retry` | SAFE-08 | Reads that fail once, in the mount, the open and the reads: each retried call gets the right bytes. |
+| `safe_foreign_area` | SAFE-09 | Random and blank areas mount with no file and nothing written, random bytes as dead pages. An area past the chip: `ALFS_EGEOMETRY`. |
+| `safe_fuzz` | SAFE-10, SPD-09 | 300 images with bits flipped, headers with valid checks and links to themselves, the end, past the area or back to the start, pages copied, or every page random: every call returns, under the sanitizers. |
+| `safe_alloc_atomic` | SAFE-11 | Each behaviour, power lost at every operation of an allocation: through eight remounts the filename names no new copy or one whose every page is in its list, and one frame ID at most, and no file under another filename; then the file is written, with `ALFS_GROW` for the page a reopen skips, and read whole. |
+| `safe_close_atomic` | SAFE-12 | Each behaviour, power lost at every operation of a close that erases: through eight remounts the file reads as not closed, every page it holds, or closed, whole, and no file under another filename. |
+| `safe_delete_atomic` | SAFE-13 | Each behaviour, power lost at every operation of a delete: before it returns the file reads whole or not at all; once it returns, never again; the other file whole throughout, and no file under any other filename. |
+| `safe_file_check` | SAFE-14 | A closed file with a page's data damaged, and one with its list cut short: every good byte read, then `ALFS_ECHECK`. |
+| `safe_links_checked` | SAFE-15 | A link bent to another file's page, a free page, past the area, or the file's own start: the read ends there with the bytes before it, a failure is counted, and the other file reads whole. |
+| `safe_update_atomic` | SAFE-16 | Each behaviour, power lost at every operation of an update of a Lua program: through eight remounts it reads the old copy whole or the new one whole, and no file under another filename; once the close returns, the new one. |
+| `safe_update_prog_failure` | SAFE-16 | An update whose new copy's sector goes PROGERROR, PROGNOOP or PROGFLIP before its close: the close returns `ALFS_EPROG`; the filename reads the old copy whole, before a remount and after; the next update goes through. |
+| `safe_alloc_failure_keeps_open_copy` | SAFE-11 | A log not closed, and every other sector PROGERROR: an allocation under its filename returns `ALFS_EPROG`, and the log reads as it was, before a remount and after. |
+| `obs_status` | OBS-01 | Live, free and dead pages, cache records and counts against the simulator's, after files are written and one deleted, and after a remount. |
+| `obs_clean` | OBS-03 | Not clean after a first mount of a used chip and after a delete; clean after a cleanup, a file filling its reservation, and a remount. |
 | `simp_ram` | SIMP-03 | Structure sizes on the host, allowing for wider pointers; `make target` checks them exactly. |
-| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds `alfs.c` alone with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most 7,168 bytes; no chain of stack frames under a public call over 320 bytes, from GCC's call graph. |
+| `make target` | SIMP-01, SIMP-02, SIMP-04 | Builds the store with `-std=c99 -Wall -Wextra -Werror -pedantic` for the Cortex-M0+; code at most the budget; no chain of stack frames under a public call over 320 bytes. |
 
-**The power-loss runs, after the loss.**
-1. Remount; every synced byte of the log reads back, nothing beyond what
-   was written.
-2. A new version of the log is created and written, perhaps with a second
-   loss.
-3. Remount, erase and read both versions, twice. The old version must read
-   a prefix of what was written before the loss, at least what was synced.
-   The new one must read a prefix of what was written after the restart,
-   at least what was synced since.
-
-**By review:** SPD-11 (each loop's bound), SIMP-01 (the libraries used),
+**By review:** SPD-09 (each loop's bound), SIMP-01 (the libraries used),
 SIMP-05 (the spec covers every field), OBS-02 (every error documented in
-`alfs.h` and `alfs_rtos.h`), RT-04 and RT-05.
-
-**Deferred until a target build exists:** SPD-09's 100 us on an RP2040
-(`target_write_256`), and IF-03's big-endian build.
+the headers), IF-01, IF-04.
 
 ---
 
-## 5. The flash task's tests (`tests/test_rtos.c`)
+## 5. The flash task
 
-They run on FreeRTOS-Kernel V11.3.1's POSIX port, single-core, with
-`configSUPPORT_DYNAMIC_ALLOCATION` 0 as pyro builds it. The kernel is not
-in this repository. `make test-rt` clones its tag into `build/_deps` under
-the Makefile variable `ALFS_RT_KERNEL`. It deliberately does not read
-`FREERTOS_KERNEL_PATH`, which may name another copy.
-
-The driver they give alfs is the simulator's, wrapped. The wrapper records
-which task each operation runs in and fails the test if two overlap or if
-one runs outside the flash task once the scheduler is up.
-
-| Test | Requirement | What it does |
-|---|---|---|
-| `rt_round_trip` | RT-02, RT-05 | Mount, create, write, close, open, read, delete, list, through requests; the flash task runs at the priority given. |
-| `rt_serialises` | RT-01 | Three writer tasks and a reader on four files at once, with erase steps between: every file reads back whole; no operation outside the flash task, none overlapping. |
-| `rt_fast_path` | RT-03 | Writes smaller than the block's room, and reads from what the block holds, send no request; the write that fills the block sends one. |
-| `rt_before_scheduler` | RT-06 | Format, mount, create and write before the scheduler starts run directly, and the file reads back after it starts. |
-| `rt_reentry_refused` | RT-06 | A driver that calls alfs from inside an operation is refused with no effect; a handle used from another task is refused. |
-| `rt_erase_interleaves` | RT-07 | An erase of the whole region requested by one task; a write and sync requested by another meanwhile complete before the erase does. |
-| `rt_read_while_writing` | RT-02 | One task writes and syncs a file while another reads it: the reader gets a prefix of what was synced, in order. |
-
-**Not tested here:** priorities and core affinity under SMP. The POSIX port
-has one core, so pyro's two-core scheduling is not reproduced.
+Out of scope until the interface settles (requirements, section 2).
 
 ---
 
 ## 6. Known limits of the tests
 
-- SIMP-04 sums frames along GCC's static call graph. alfs has no
-  recursion and calls nothing through a pointer but the driver, whose
-  frames the caller adds.
-- The power-loss runs are linear: one loss at each operation, and a second
-  in a third of them. Schedules of three or more losses are not run.
+- The power-loss runs are linear: one loss at each operation. Schedules of
+  two or more losses are not run.
 - Timing is simulated at typical figures. The worst-case figures of
-  requirements 4.3 scale every stall by the same factor and change no
-  pass or fail.
+  requirements 4.3 scale every stall by the same factor and change no pass
+  or fail.
 
 ---
 
