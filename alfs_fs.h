@@ -46,14 +46,16 @@ typedef struct alfs_fs {
     uint32_t next_id;  /* the next frame ID */
     uint32_t pages;    /* pages in the area */
     uint32_t search;   /* where the search for a free page goes on */
-    uint32_t sweep;    /* where the next cleanup step looks */
+    uint32_t clean_progs; /* the programs counted when the cleanup's pass began */
+    uint16_t sweep;       /* the sector the next cleanup step looks at */
+    uint16_t clean_run;   /* sectors the cleanup has passed since a program */
     uint16_t ncache;   /* records in the table */
     uint8_t writers, readers, nbad;
     uint16_t bad[ALFS_BAD_MAX]; /* sectors found bad this mount */
 } alfs_fs_t;
 
 /* A file open for writing. The caller's, with its block, until closed.
- * Opaque but for `id`, its descriptor. */
+ * Opaque but for `id`, its descriptor, and `size`. */
 typedef struct alfs_file {
     uint8_t *block;
     uint32_t id;

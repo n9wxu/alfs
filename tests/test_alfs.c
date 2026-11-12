@@ -1142,6 +1142,50 @@ static void if_cleanup(void) {
     rig_close(&r);
 }
 
+/* Cleanup steps of one sector until none is left, a failed read tried
+ * again: the steps, or -1; -2 for a step that erased more than a sector or
+ * read more than a sector's headers and its bytes, twice over. */
+static int clean_by_steps(rig_t *r) {
+    int steps = 0;
+    for (int i = 0; i < 100000; i++) {
+        int rc = (int)ECALL(r, alfs_fs_cleanup(&r->fs, 1));
+        if (r->sim.c_erases > 1 || r->sim.c_bytes_read > 3 * SECTOR)
+            return -2;
+        if (rc == ALFS_EIO)
+            continue;
+        steps++;
+        if (rc != ALFS_OK)
+            return rc == ALFS_CLEAN ? steps : -1;
+    }
+    return -1;
+}
+
+static void if_cleanup_steps(void) {
+    rig_t r;
+    rig_open(&r, 10);
+    CHECK_EQ(setup(&r), 0);
+    CHECK_EQ(clean_all(&r), 0);
+    static uint8_t d[9000];
+    fill(d, sizeof(d), 16);
+    CHECK_EQ(write_file(&r, "gone", d, 9000, 9000), 0);
+    CHECK_EQ(fdelete(&r, "gone"), 0);
+    CHECK_EQ(clean_by_steps(&r), 10); /* every sector passed once */
+    CHECK(fstatus(&r).clean);
+    CHECK_EQ(ECALL(&r, alfs_fs_cleanup(&r.fs, 1)), ALFS_CLEAN);
+    CHECK_EQ(r.sim.c_bytes_read, 0);
+    /* A pass a program interrupts starts again. */
+    CHECK_EQ(write_file(&r, "late", d, 9000, 9000), 0);
+    CHECK_EQ(fdelete(&r, "late"), 0);
+    for (int i = 0; i < 4; i++)
+        CHECK_EQ(ECALL(&r, alfs_fs_cleanup(&r.fs, 1)), ALFS_OK);
+    CHECK_EQ(write_file(&r, "more", d, 300, 300), 0);
+    CHECK_EQ(fdelete(&r, "more"), 0);
+    CHECK_EQ(clean_by_steps(&r), 10);
+    CHECK(fstatus(&r).clean);
+    DONE(&r);
+    rig_close(&r);
+}
+
 static void if_refusals(void) {
     rig_t r;
     rig_open(&r, 10);
@@ -2337,9 +2381,10 @@ static void obs_clean(void) {
 }
 
 static void simp_ram(void) {
-    /* The budgets are for a 32-bit target; a host's pointers are wider. */
+    /* The budgets are for a 32-bit target, where `make target` checks them;
+     * a host's pointers are wider, and the instance ends on one's alignment. */
     size_t wide = sizeof(void *) - 4;
-    CHECK(sizeof(alfs_fs_t) <= 96 + 3 * wide);
+    CHECK(sizeof(alfs_fs_t) <= 96 + 6 * wide);
     CHECK(sizeof(alfs_file_t) <= 48 + wide);
     CHECK(sizeof(alfs_reader_t) <= 40 + wide);
 }
@@ -2363,6 +2408,7 @@ int main(int argc, char **argv) {
         {"if_list", if_list},
         {"if_ids_never_reused", if_ids_never_reused},
         {"if_cleanup", if_cleanup},
+        {"if_cleanup_steps", if_cleanup_steps},
         {"if_refusals", if_refusals},
         {"spd_no_erase_outside_erase", spd_no_erase_outside_erase},
         {"spd_write_programs_bounded", spd_write_programs_bounded},

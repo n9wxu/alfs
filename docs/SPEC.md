@@ -183,7 +183,10 @@ dead once no live copy holds them, and a cleanup erases their sectors.
 
 ## 7. Cleaning up
 
-The cleanup is the only thing that erases. A step finds, forward from where
-the last one stopped, a sector that holds no live page and does not read
-erased, erases it, and reads it back: the erase is finished when every
-byte reads FFh. With none left, `ALFS_CLEAN`.
+The cleanup is the only thing that erases. A step takes one sector, the
+next after the last step's, around the area: if it holds no live page and
+does not read erased, the step erases it and reads it back; the erase is
+finished when every byte reads FFh. So a step reads one sector's headers
+and its bytes, and erases one sector at most, whatever the area's size.
+Once every sector has been passed with no program since, `ALFS_CLEAN`, and
+further steps read nothing until the next program.

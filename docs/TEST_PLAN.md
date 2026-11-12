@@ -143,6 +143,7 @@ CRC-32, so a test can tell good data from bad without alfs's help.
 | `if_list` | IF-13 | Three files, one not closed: frame IDs growing, filenames, versions, closed flags, sizes and page counts, the same after a remount. |
 | `if_ids_never_reused` | IF-14 | Allocations and deletes across remounts; an allocation's header torn by FLICKER, METASTABLE and SOMEBITS, each followed by eight remounts and allocations: no frame ID twice, and no header programmed over the torn one. |
 | `if_cleanup` | IF-15, LIFE-01 | A deleted file beside a live one: cleanup erases the sectors holding no live page, keeps the shared one, reads the live file whole, then `ALFS_CLEAN` with no erase. |
+| `if_cleanup_steps` | IF-15 | Steps of one: each erases one sector at most and reads no more than a sector's headers and bytes; `ALFS_CLEAN` after as many steps as the area has sectors, then a step that reads nothing; a pass a program interrupts takes a whole pass again. |
 | `if_refusals` | IF-17 | A second open of a file and a mount refused while it is open; an allocation, a delete and a cleanup meanwhile leave it to be written on and closed whole. |
 | `spd_no_erase_outside_erase` | SPD-01 | Two minutes of W-LOG at both rates into a reserved file, a remount, a reopen and more, a close; W-CFG; reads and status: no erase in any call but the cleanup. |
 | `spd_write_programs_bounded` | SPD-02 | 30 seconds of W-HR with blocks of a page and a sector: every program a full page; none when the block did not fill; at most the complete pages held; after a sync less than a page held. |

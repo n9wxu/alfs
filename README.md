@@ -11,9 +11,9 @@ Priorities, in order: speed, then flash life, then safety. A corrupted data
 block is less important than a broken exec loop.
 
 **Status:** format version 6. Requirements, tests and code.
-- **Store:** 49 tests, run on 8 simulator seeds under the sanitizers
-  (`make test`) and on 100 seeds (`make soak`). 6,744 bytes of code on a
-  Cortex-M0+ (`alfs_fs.c` 6,048, `alfs_flash.c` 696); 284 bytes of stack at
+- **Store:** 50 tests, run on 8 simulator seeds under the sanitizers
+  (`make test`) and on 100 seeds (`make soak`). 6,772 bytes of code on a
+  Cortex-M0+ (`alfs_fs.c` 6,076, `alfs_flash.c` 696); 284 bytes of stack at
   most.
 - **Erases:** a 10-minute flight log (W-LOG: 22-byte rows at 50 a second,
   synced every second) costs 175 sector erases over its life, all of them

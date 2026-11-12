@@ -901,40 +901,39 @@ int alfs_file_list(alfs_fs_t *fs, uint32_t after, alfs_file_info_t *info) {
 
 /* ---- cleaning up ---------------------------------------------------- */
 
-/* SPEC 7: the next sector holding no live page that does not read erased,
- * erased and read back. */
+/* SPEC 7: one sector, the next after the last step's: erased and read back
+ * if it holds no live page and does not read erased. ALFS_CLEAN once every
+ * sector has been passed with no program since. */
 static ALFS_NOINLINE int clean_step(alfs_fs_t *fs) {
-    uint32_t sectors = fs->d.sectors, per = pps(fs);
-    for (uint32_t i = 0; i < sectors; i++) {
-        uint32_t k = (fs->sweep + i) % sectors;
-        bool live = false, erased = true;
-        if (is_bad(fs, k))
-            continue;
-        for (uint32_t j = 0; j < per && !live; j++) {
-            hdr_t h;
-            if (read_hdr(fs, k * per + j, &h))
-                return ALFS_EIO;
-            erased &= h.erased;
-            live = k * per + j && is_live(fs, &h);
-        }
-        if (live)
-            continue;
-        if (erased) {
-            bool blank;
-            if (alfs_blank(&fs->d, alfs_addr(&fs->d, k), fs->d.cfg->sector_size, &blank))
-                return ALFS_EIO;
-            if (blank)
-                continue;
-        }
-        fs->sweep = (k + 1u) % sectors;
-        int rc = alfs_wipe(&fs->d, k);
-        if (rc == ALFS_EIO)
-            return rc;
-        if (rc)
-            mark_bad(fs, k);
-        return ALFS_OK;
+    uint32_t sectors = fs->d.sectors, per = pps(fs), k = fs->sweep;
+    bool live = false, erased = true;
+    if (fs->clean_progs != fs->d.n.programs) {
+        fs->clean_progs = fs->d.n.programs;
+        fs->clean_run = 0;
     }
-    return ALFS_CLEAN;
+    if (fs->clean_run >= sectors)
+        return ALFS_CLEAN;
+    for (uint32_t j = 0; j < per && !live && !is_bad(fs, k); j++) {
+        hdr_t h;
+        if (read_hdr(fs, k * per + j, &h))
+            return ALFS_EIO;
+        erased &= h.erased;
+        live = k * per + j && is_live(fs, &h);
+    }
+    if (!live && !is_bad(fs, k)) {
+        bool blank = false;
+        if (erased && alfs_blank(&fs->d, alfs_addr(&fs->d, k), fs->d.cfg->sector_size, &blank))
+            return ALFS_EIO;
+        if (!blank) {
+            int rc = alfs_wipe(&fs->d, k);
+            if (rc == ALFS_EIO)
+                return rc;
+            if (rc)
+                mark_bad(fs, k);
+        }
+    }
+    fs->sweep = (uint16_t)((k + 1u) % sectors);
+    return ++fs->clean_run >= sectors ? ALFS_CLEAN : ALFS_OK;
 }
 
 int alfs_fs_cleanup(alfs_fs_t *fs, uint32_t steps) {

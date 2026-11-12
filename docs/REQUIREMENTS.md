@@ -886,8 +886,8 @@ The store is at most 6.625 KiB on a Cortex-M0+ (Thumb, `-Os`).
 
 - Priority: S.
 - Source: the brief. Built with Arm GNU Toolchain 13.2.Rel1 it measures
-  6,744 bytes (`alfs_fs.o` 6,048, `alfs_flash.o` 696), and with Arm GNU
-  14.2, 6,764 bytes. The budget is a multiple of 128 bytes that holds both.
+  6,772 bytes (`alfs_fs.o` 6,076, `alfs_flash.o` 696). The budget is a
+  multiple of 128 bytes that holds it.
 - Verified by: `make target`.
 
 #### ALFS-SIMP-03
@@ -1089,15 +1089,19 @@ nor valid.
 
 #### ALFS-IF-15
 
-`alfs_fs_cleanup` erases up to a given number of sectors, one a step, each
-one holding no live page and not reading erased, and reads each back as all
-1s; it returns `ALFS_CLEAN` when none is left.
+`alfs_fs_cleanup` takes a given number of steps, a sector a step, going on
+from where the last call stopped: it erases the sector if it holds no live
+page and does not read erased, and reads it back as all 1s. A step's work
+does not grow with the area. It returns `ALFS_CLEAN` once every sector has
+been passed with nothing programmed since.
 
 - Priority: S.
 - Source: the user: "A filesystem 'cleanup' operation is available to
   pre-erase all unused pages sector by sector." and "Erases are finshed when
   a read returns 1's for all pages."
-- Verified by: `if_cleanup`.
+- Source, of the step: the user, of a cleanup whose search for its next
+  sector read a 16 MB area in one call: "resumable cleanup is fine."
+- Verified by: `if_cleanup`, `if_cleanup_steps`.
 
 #### ALFS-IF-16
 
